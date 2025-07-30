@@ -323,6 +323,12 @@ pub fn calc_next_close_long(
             calc_grid_close_long(&exchange_params, &state_params, &bot_params, &position_mod)
         }
     } else {
+        // se il prezzo in ask dell'order book è superiore al prezzo della posizione, chiudiamo il 100% in modalità grid
+        if state_params.order_book.ask > position.price {
+            // return grid order, closing whole position
+            calc_grid_close_long(&exchange_params, &state_params, &bot_params, &position)
+        } else {
+            // logica attuale:
         // grid first
         if wallet_exposure_ratio < 1.0 + bot_params.close_trailing_grid_ratio {
             // return grid order, closing whole position
@@ -357,6 +363,7 @@ pub fn calc_next_close_long(
             )
         }
     }
+}
 }
 
 pub fn calc_grid_close_short(
@@ -644,6 +651,13 @@ pub fn calc_next_close_short(
             calc_grid_close_short(&exchange_params, &state_params, &bot_params, &position_mod)
         }
     } else {
+        // se il prezzo in bid dell'order book è inferiore al prezzo della posizione, chiudiamo il 100% in modalità grid
+        if state_params.order_book.bid < position.price {
+            // return grid order, closing whole position
+            return calc_grid_close_short(&exchange_params, &state_params, &bot_params, &position);
+        // logica attuale:
+        } else {
+
         if wallet_exposure_ratio < 1.0 + bot_params.close_trailing_grid_ratio {
             // return grid order, closing whole position
             return calc_grid_close_short(&exchange_params, &state_params, &bot_params, &position);
@@ -680,6 +694,7 @@ pub fn calc_next_close_short(
             )
         }
     }
+}
 }
 
 pub fn calc_closes_long(
