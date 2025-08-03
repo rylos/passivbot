@@ -1,0 +1,9 @@
+session_name: pb3
+windows:
+- window_name: hype
+  layout: tiled
+  shell_command_before:
+    - cd /opt/pb && source venv/bin/activate
+  panes:
+    - shell_command:
+      - python src/main.py configs/live/config_hype_only.json
