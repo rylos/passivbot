@@ -137,17 +137,7 @@ Coins selected for trading are filtered by volume and noisiness. First, filter c
   - Noisiness is normalized relative range of 1m OHLCVs: `mean((high - low) / close)`.
   - In forager mode, the bot selects coins with the highest noisiness for opening positions.
 
-## Live Trading Settings
-
-- **approved_coins**:
-  - List of coins approved for trading. If empty, see `live.empty_means_all_approved`.
-    - Backtester and optimizer use `live.approved_coins` minus `live.ignored_coins`.
-  - May be given as a path to an external file, read continuously by Passivbot.
-  - May be split into long and short:
-    - Example: `{"long": ["COIN1", "COIN2"], "short": ["COIN2", "COIN3"]}`
-- **auto_gs**: Automatically enable graceful stop for positions on disapproved coins.
-  - Graceful stop: The bot continues trading as normal but does not open a new position after the current position is fully closed.
-  - If `auto_gs=false`, positions on disapproved coins are put on manual mode.
+## Coin Overrides
 - **coin_overrides**:
   - Specify full or partial configs for individual coins, overriding values from master config.
   - Format: {"COIN1": overrides1, "COIN2": overrides2}
@@ -173,12 +163,24 @@ Coins selected for trading are filtered by volume and noisiness. First, filter c
     - `{"COIN2": {"override_config_path": "path/to/other_override_config.json", {"bot": {"long": {"close_grid_markup_start": 0.005}}}}}` -- Will attempt to load `"path/to/other_override_config.json"` first, and apply `{"bot": {"long": {"close_grid_markup_start": 0.005}}}` after.
     - `{"COIN3": {"bot": {"short": {"entry_initial_qty_pct": 0.01}}, "live": {"forced_mode_long": "panic"}}}` -- Will apply given overrides for COIN3.
 - **forced_modes**:
-  - Choices: `[n (normal), m (manual), gs (graceful_stop), p (panic), t (take_profit_only)]`.
+  - Choices: `[n (normal), m (manual), gs (graceful_stop), t (tp_only), p (panic)]`.
     - **Normal mode**: Passivbot manages the position as normal.
     - **Manual mode**: Passivbot ignores the position.
     - **Graceful stop**: If there is a position, Passivbot manages it; otherwise, no new positions are opened.
-    - **Take profit only mode**: Passivbot only manages closing orders.
+    - **Take Profit Only mode**: Passivbot only manages closing orders.
     - **Panic mode**: Passivbot closes the position immediately.
+
+## Live Trading Settings
+
+- **approved_coins**:
+  - List of coins approved for trading. If empty, see `live.empty_means_all_approved`.
+    - Backtester and optimizer use `live.approved_coins` minus `live.ignored_coins`.
+  - May be given as a path to an external file, read continuously by Passivbot.
+  - May be split into long and short:
+    - Example: `{"long": ["COIN1", "COIN2"], "short": ["COIN2", "COIN3"]}`
+- **auto_gs**: Automatically enable graceful stop for positions on disapproved coins.
+  - Graceful stop: The bot continues trading as normal but does not open a new position after the current position is fully closed.
+  - If `auto_gs=false`, positions on disapproved coins are put on manual mode.
 - **empty_means_all_approved**:
   - If `true`, `approved_coins=[]` means all coins are approved.
   - If `false`, `approved_coins=[]` means no coins are approved.
