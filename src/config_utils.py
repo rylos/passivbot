@@ -6,7 +6,7 @@ import argparse
 import pprint
 from typing import Union
 import traceback
-from pure_funcs import remove_OD, sort_dict_keys, str2bool
+from pure_funcs import remove_OD, sort_dict_keys, str2bool, symbol_to_coin
 from procedures import format_end_date, dump_pretty_json
 import hjson
 
@@ -25,7 +25,9 @@ def load_config(filepath: str, live_only=False, verbose=True) -> dict:
     # loads hjson or json v7 config
     try:
         config = load_hjson_config(filepath)
-        config = format_config(config, live_only=live_only, verbose=verbose)
+        config = format_config(
+            config, live_only=live_only, verbose=verbose, base_config_path=filepath
+        )
         return config
     except Exception as e:
         traceback.print_exc()
@@ -291,6 +293,17 @@ def parse_overrides(config, verbose=True):
                     f"Converted old coin_flags to coin_overrides: {config['live']['coin_flags']} -> {result['coin_overrides']}"
                 )
     result["live"].pop("coin_flags", None) if "live" in result else None
+    for coin in sorted(result["coin_overrides"]):
+        coinf = symbol_to_coin(coin)
+        if coinf != coin:
+            if coinf:
+                result["coin_overrides"][coinf] = deepcopy(result["coin_overrides"][coin])
+                if verbose:
+                    print(f"Renamed {coin} -> {coinf} for coin_overrides")
+            else:
+                if verbose:
+                    print(f"Failed to format {coin}; removed from coin_overrides")
+            del result["coin_overrides"][coin]
     for coin, overrides in result["coin_overrides"].items():
         parsed_overrides = {}
         if loaded := load_override_config(result, coin):
@@ -317,11 +330,15 @@ def load_override_config(config, coin):
             return load_config(path, verbose=False)
         else:
             base_config_path = config.get("live", {}).get("base_config_path")
-            if base_config_path and os.path.exists(
-                (
-                    npath := os.path.join(
-                        os.path.dirname(base_config_path),
-                        path,
+            if (
+                path
+                and base_config_path
+                and os.path.exists(
+                    (
+                        npath := os.path.join(
+                            os.path.dirname(base_config_path),
+                            path,
+                        )
                     )
                 )
             ):
@@ -381,7 +398,7 @@ def _build_flag_argparser() -> argparse.ArgumentParser:
     return p
 
 
-def format_config(config: dict, verbose=True, live_only=False) -> dict:
+def format_config(config: dict, verbose=True, live_only=False, base_config_path: str = "") -> dict:
     # attempts to format a config to v7 config
     template = get_template_live_config("v7")
     # renamings
@@ -546,6 +563,7 @@ def format_config(config: dict, verbose=True, live_only=False) -> dict:
         del result["backtest"]["exchange"]
 
     add_missing_keys_recursively(template, result, verbose=verbose)
+    result["live"]["base_config_path"] = base_config_path
     result = parse_overrides(result, verbose=verbose)
     remove_unused_keys_recursively(template["bot"], result["bot"], verbose=verbose)
     remove_unused_keys_recursively(
