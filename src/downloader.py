@@ -73,6 +73,39 @@ def get_function_name():
     return inspect.currentframe().f_back.f_code.co_name
 
 
+def normalize_exchange_name(exchange: str) -> str:
+    """
+    Normalize an exchange id to its USD-margined perpetual futures id when available.
+
+    Examples:
+    - "binance" -> "binanceusdm"
+    - "kucoin"  -> "kucoinfutures"
+    - "kraken"  -> "krakenfutures"
+
+    If no specific futures id exists (e.g. "okx", "bybit", "mexc"), the input is returned unchanged.
+    The function uses ccxt.exchanges to detect available ids, so it will automatically catch
+    new exchanges that follow common suffix patterns like 'usdm' or 'futures'.
+    """
+    ex = (exchange or "").lower()
+    valid = set(getattr(ccxt, "exchanges", []))
+
+    # Explicit mapping for known special case
+    if ex == "binance":
+        return "binanceusdm"
+
+    # If already a futures/perp id, keep as-is
+    if ex.endswith("usdm") or ex.endswith("futures"):
+        return ex
+
+    # Heuristic: prefer '{exchange}usdm' then '{exchange}futures' if available in ccxt
+    for suffix in ("usdm", "futures"):
+        cand = f"{ex}{suffix}"
+        if cand in valid:
+            return cand
+
+    return ex
+
+
 def dump_ohlcv_data(data, filepath):
     columns = ["timestamp", "open", "high", "low", "close", "volume"]
     if isinstance(data, pd.DataFrame):
@@ -144,7 +177,7 @@ def fill_gaps_in_ohlcvs(df):
     return new_df.reset_index().rename(columns={"index": "timestamp"})
 
 
-def attempt_gap_fix_ohlcvs(df, symbol=None):
+def attempt_gap_fix_ohlcvs(df, symbol=None, verbose=True):
     interval = 60_000
     max_hours = 12
     max_gap = interval * 60 * max_hours
@@ -153,7 +186,7 @@ def attempt_gap_fix_ohlcvs(df, symbol=None):
         return df
     if greatest_gap > max_gap:
         raise Exception(f"Huge gap in data for {symbol}: {greatest_gap/(1000*60*60)} hours.")
-    if self.verbose:
+    if verbose:
         logging.info(
             f"Filling small gaps in {symbol}. Largest gap: {greatest_gap/(1000*60*60):.3f} hours."
         )
@@ -227,15 +260,126 @@ async def get_zip_bitget(url):
 
 
 def ensure_millis(df):
+    """
+    Normalize a DataFrame's 'timestamp' column to milliseconds.
+
+    Heuristic:
+    - If no valid (non-zero, finite) timestamps exist, assume timestamps are already ms.
+    - If there are multiple unique timestamps, use the median difference between unique timestamps:
+      if the median difference is a multiple of 1000 (within a small tolerance), treat timestamps as ms.
+      Otherwise treat them as seconds and multiply by 1000.
+    - If only one non-zero timestamp exists, fall back to magnitude-based detection using epoch-scale
+      thresholds:
+        - >= 1e15 -> microseconds
+        - >= 1e12 -> milliseconds
+        - >= 1e9  -> seconds
+        - <  1e9  -> assume milliseconds (likely small ms values)
+    This avoids mis-detecting when the first timestamp is 0 (which previously caused incorrect scaling).
+    """
     if "timestamp" not in df.columns:
         return df
-    if df.timestamp.iloc[0] > 1e14:  # is microseconds
-        df.timestamp /= 1000
-    elif df.timestamp.iloc[0] > 1e11:  # is milliseconds
+
+    # Work with a float copy for robust numeric checks
+    try:
+        ts = df["timestamp"].astype("float64").values
+    except Exception:
+        # If casting fails, leave unchanged
+        return df
+
+    # Identify finite, non-zero timestamps to base heuristics on
+    finite_mask = np.isfinite(ts) & (ts != 0)
+    if not finite_mask.any():
+        # All timestamps are zero or invalid — assume already in milliseconds
+        return df
+
+    non_zero_ts = ts[finite_mask]
+    uniq = np.unique(non_zero_ts)
+
+    if uniq.size > 1:
+        # Use median diff between unique timestamps to determine units.
+        diffs = np.diff(uniq)
+        median_diff = float(np.median(diffs))
+
+        # If median_diff is a clean multiple of 1000, it's likely millisecond data (1 minute = 60000, etc).
+        if abs(median_diff - round(median_diff / 1000.0) * 1000.0) < 1e-6:
+            return df  # already milliseconds
+        else:
+            # Likely seconds -> convert to milliseconds
+            df["timestamp"] = df["timestamp"] * 1000.0
+            return df
+
+    # Fallback: single representative timestamp -> magnitude-based detection
+    rep = float(np.abs(non_zero_ts).max())
+
+    # Epoch magnitude thresholds (approx):
+    # - seconds:      ~1e9
+    # - milliseconds: ~1e12
+    # - microseconds: ~1e15
+    if rep >= 1e15:
+        # microseconds -> convert to milliseconds
+        df["timestamp"] = df["timestamp"] / 1000.0
+    elif rep >= 1e12:
+        # already milliseconds
         pass
-    else:  # is seconds
-        df.timestamp *= 1000
+    elif rep >= 1e9:
+        # seconds -> convert to milliseconds
+        df["timestamp"] = df["timestamp"] * 1000.0
+    else:
+        # small magnitudes (< 1e9) are assumed to already be milliseconds (e.g., 60000)
+        pass
+
     return df
+
+
+async def load_markets(exchange: str, max_age_ms: int = 1000 * 60 * 60 * 24) -> dict:
+    """
+    Standalone helper to load and cache CCXT markets for a given exchange.
+
+    - Normalizes 'binance' -> 'binanceusdm'
+    - Reads from caches/{exchange}/markets.json if fresh
+    - Otherwise fetches via ccxt, writes cache, and returns the markets dict
+
+    Returns a markets dictionary as provided by ccxt.
+    """
+    ex = normalize_exchange_name(exchange)
+    markets_path = os.path.join("caches", ex, "markets.json")
+
+    # Try cache first
+    try:
+        if os.path.exists(markets_path):
+            if utc_ms() - get_file_mod_utc(markets_path) < max_age_ms:
+                markets = json.load(open(markets_path))
+                logging.info(f"{ex} Loaded markets from cache")
+                return markets
+    except Exception as e:
+        logging.error(f"Error loading {markets_path} {e}")
+
+    # Fetch from exchange via ccxt
+    cc = getattr(ccxt, ex)({"enableRateLimit": True})
+    try:
+        cc.options["defaultType"] = "swap"
+    except Exception:
+        pass
+
+    try:
+        markets = await cc.load_markets()
+    except Exception as e:
+        logging.error(f"Error loading markets from {ex}: {e}")
+        raise
+    finally:
+        try:
+            await cc.close()
+        except Exception:
+            pass
+
+    # Dump to cache
+    try:
+        json.dump(markets, open(make_get_filepath(markets_path), "w"))
+        logging.info(f"{ex} Dumped markets to cache")
+    except Exception as e:
+        logging.error(f"Error dumping markets to cache at {markets_path} {e}")
+
+    return markets
 
 
 class OHLCVManager:
@@ -252,7 +396,7 @@ class OHLCVManager:
         gap_tolerance_ohlcvs_minutes=120.0,
         verbose=True,
     ):
-        self.exchange = "binanceusdm" if exchange == "binance" else exchange
+        self.exchange = normalize_exchange_name(exchange)
         self.quote = "USDC" if exchange == "hyperliquid" else "USDT"
         self.start_date = "2020-01-01" if start_date is None else format_end_date(start_date)
         self.end_date = format_end_date("now" if end_date is None else end_date)
@@ -461,11 +605,13 @@ class OHLCVManager:
 
     async def load_markets(self):
         self.load_cc()
-        self.markets = self.load_markets_from_cache()
-        if self.markets:
-            return
-        self.markets = await self.cc.load_markets()
-        self.dump_markets_to_cache()
+        self.markets = await load_markets(self.exchange)
+        # Populate the ccxt client's markets without incurring another network call if possible
+        try:
+            if hasattr(self.cc, "set_markets"):
+                self.cc.set_markets(self.markets)
+        except Exception:
+            pass
 
     def load_markets_from_cache(self, max_age_ms=1000 * 60 * 60 * 24):
         try:
@@ -812,7 +958,7 @@ class OHLCVManager:
             prev_day = earliest - datetime.timedelta(days=1)
             prev_url = self.get_url_bitget(base_url, symbol, prev_day.strftime("%Y%m%d"))
             try:
-                await check_rate_limit()
+                await self.check_rate_limit()
                 async with aiohttp.ClientSession() as session:
                     async with session.head(prev_url) as response:
                         if response.status == 200:
@@ -920,8 +1066,7 @@ async def prepare_hlcvs(config: dict, exchange: str):
         set([symbol_to_coin(c) for c in config["live"]["approved_coins"]["long"]])
         | set([symbol_to_coin(c) for c in config["live"]["approved_coins"]["short"]])
     )
-    if exchange == "binance":
-        exchange = "binanceusdm"
+    exchange = normalize_exchange_name(exchange)
     start_date = config["backtest"]["start_date"]
     end_date = format_end_date(config["backtest"]["end_date"])
 
@@ -1091,9 +1236,7 @@ async def prepare_hlcvs_internal(config, coins, exchange, start_date, end_date, 
 
 
 async def prepare_hlcvs_combined(config):
-    exchanges_to_consider = [
-        "binanceusdm" if e == "binance" else e for e in config["backtest"]["exchanges"]
-    ]
+    exchanges_to_consider = [normalize_exchange_name(e) for e in config["backtest"]["exchanges"]]
     om_dict = {}
     for ex in exchanges_to_consider:
         om_dict[ex] = OHLCVManager(
