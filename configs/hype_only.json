@@ -3,7 +3,7 @@
         "base_dir": "backtests",
         "combine_ohlcvs": false,
         "compress_cache": true,
-        "end_date": "2025-08-10",
+        "end_date": "2025-08-24",
         "exchanges": ["gateio", "binance", "bybit"],
         "gap_tolerance_ohlcvs_minutes": 120,
         "start_date": "2021-07-01",
