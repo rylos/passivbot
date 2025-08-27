@@ -8,16 +8,15 @@ import traceback
 import numpy as np
 import passivbot_rust as pbr
 from collections import defaultdict
+from utils import ts_to_date_utc, utc_ms
 from pure_funcs import (
     multi_replace,
     floatify,
-    ts_to_date_utc,
     calc_hash,
     determine_pos_side_ccxt,
-    symbol_to_coin,
     flatten,
 )
-from procedures import print_async_exception, utc_ms, assert_correct_ccxt_version
+from procedures import print_async_exception, assert_correct_ccxt_version
 
 assert_correct_ccxt_version(ccxt=ccxt_async)
 
@@ -113,7 +112,10 @@ class BybitBot(Passivbot):
             )
             balinfo = fetched_balance["info"]["result"]["list"][0]
             if balinfo["accountType"] == "UNIFIED":
-                balance = float(balinfo["totalWalletBalance"])
+                balance = 0.0
+                for elm in balinfo["coin"]:
+                    if elm["marginCollateral"] and elm["collateralSwitch"]:
+                        balance += float(elm["usdValue"]) + float(elm["unrealisedPnl"])
                 if not hasattr(self, "previous_rounded_balance"):
                     self.previous_rounded_balance = balance
                 self.previous_rounded_balance = pbr.hysteresis_rounding(
@@ -338,39 +340,15 @@ class BybitBot(Passivbot):
             return "short" if float(x["info"]["closedSize"]) != 0.0 else "long"
         return "long" if float(x["info"]["closedSize"]) != 0.0 else "short"
 
-    async def execute_cancellation(self, order: dict) -> dict:
-        executed = None
-        try:
-            executed = await self.cca.cancel_order(order["id"], symbol=order["symbol"])
-            return executed
-        except Exception as e:
-            logging.error(f"error cancelling order {order} {e}")
-            print_async_exception(executed)
-            traceback.print_exc()
-            return {}
-
-    async def execute_cancellations(self, orders: [dict]) -> [dict]:
-        return await self.execute_multiple(orders, "execute_cancellation")
-
-    async def execute_order(self, order: dict) -> dict:
-        executed = await self.cca.create_order(
-            type=order["type"] if "type" in order else "limit",
-            symbol=order["symbol"],
-            side=order["side"],
-            amount=abs(order["qty"]),
-            price=order["price"],
-            params={
-                "positionIdx": 1 if order["position_side"] == "long" else 2,
-                "timeInForce": (
-                    "postOnly" if self.config["live"]["time_in_force"] == "post_only" else "GTC"
-                ),
-                "orderLinkId": order["custom_id"],
-            },
-        )
-        return executed
-
-    async def execute_orders(self, orders: [dict]) -> [dict]:
-        return await self.execute_multiple(orders, "execute_order")
+    def get_order_execution_params(self, order: dict) -> dict:
+        # defined for each exchange
+        return {
+            "positionIdx": 1 if order["position_side"] == "long" else 2,
+            "timeInForce": (
+                "postOnly" if self.config["live"]["time_in_force"] == "post_only" else "GTC"
+            ),
+            "orderLinkId": order["custom_id"],
+        }
 
     async def update_exchange_config_by_symbols(self, symbols):
         coros_to_call_lev, coros_to_call_margin_mode = {}, {}

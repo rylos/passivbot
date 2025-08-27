@@ -16,7 +16,7 @@ use crate::utils::{
     calc_pprice_diff_int, calc_wallet_exposure, cost_to_qty, hysteresis_rounding, qty_to_cost,
     round_, round_dn, round_up,
 };
-use ndarray::{s, Array1, Array2, Array3, Array4, ArrayView1, ArrayView3, Axis, Dim, ViewRepr};
+use ndarray::{s, ArrayView1, ArrayView3, Axis};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
@@ -36,12 +36,6 @@ pub struct Alphas {
 pub struct EMAs {
     pub long: [f64; 3],
     pub short: [f64; 3],
-}
-
-#[derive(Debug, Clone)]
-pub struct TotalWalletExposureLimit {
-    pub long: f64,
-    pub short: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -131,7 +125,6 @@ pub struct Backtest<'a> {
     bot_params_master: BotParamsPair,
     bot_params: Vec<BotParamsPair>,
     bot_params_original: Vec<BotParamsPair>,
-    total_wallet_exposure_limit: TotalWalletExposureLimit,
     effective_n_positions: EffectiveNPositions,
     exchange_params_list: Vec<ExchangeParams>,
     backtest_params: BacktestParams,
@@ -182,7 +175,6 @@ impl<'a> Backtest<'a> {
         balance.usd_total = backtest_params.starting_balance;
         balance.usd_total_rounded = balance.usd_total;
 
-        let n_timesteps = hlcvs.shape()[0];
         let n_coins = hlcvs.shape()[1];
         let initial_emas = (0..n_coins)
             .map(|i| {
@@ -204,12 +196,6 @@ impl<'a> Backtest<'a> {
 
         // Store original bot params to preserve dynamic WEL indicators
         let bot_params_original = bot_params.clone();
-
-        // Extract total wallet exposure limits
-        let total_wallet_exposure_limit = TotalWalletExposureLimit {
-            long: bot_params_master.long.total_wallet_exposure_limit,
-            short: bot_params_master.short.total_wallet_exposure_limit,
-        };
 
         let n_eligible_long = bot_params_master.long.n_positions.max(
             (n_coins as f64 * (1.0 - bot_params_master.long.filter_volume_drop_pct)).round()
@@ -245,7 +231,6 @@ impl<'a> Backtest<'a> {
             bot_params_master: bot_params_master.clone(),
             bot_params: bot_params.clone(),
             bot_params_original,
-            total_wallet_exposure_limit,
             effective_n_positions,
             exchange_params_list,
             backtest_params: backtest_params.clone(),
@@ -504,14 +489,6 @@ impl<'a> Backtest<'a> {
         }
     }
 
-    fn get_position(&self, idx: usize, pside: usize) -> Position {
-        match pside {
-            LONG => self.positions.long.get(&idx).cloned().unwrap_or_default(),
-            SHORT => self.positions.short.get(&idx).cloned().unwrap_or_default(),
-            _ => panic!("Invalid pside"),
-        }
-    }
-
     fn update_balance(&mut self, k: usize, mut pnl: f64, fee_paid: f64) {
         if self.balance.use_btc_collateral {
             // Fees reduce USD portion
@@ -526,7 +503,7 @@ impl<'a> Backtest<'a> {
                 }
                 // Any remaining positive PNL is converted to BTC
                 if pnl > 0.0 {
-                    let btc_to_add = (pnl / self.btc_usd_prices[k]);
+                    let btc_to_add = pnl / self.btc_usd_prices[k];
                     self.balance.btc += btc_to_add * 0.999; // apply 0.1% spot trading fee
                 }
             } else if pnl < 0.0 {
@@ -1752,7 +1729,7 @@ fn analyze_backtest_basic(fills: &[Fill], equities: &Vec<f64>) -> Analysis {
     let mut unchanged_durations: Vec<usize> = Vec::new(); // Durations of unchanged periods
 
     for fill in fills {
-        let side = if fill.order_type.to_string().contains("long") {
+        let side = if fill.order_type.is_long() {
             "long"
         } else {
             "short"
@@ -2031,7 +2008,7 @@ pub fn calc_exponential_fit_error(equity: &[f64]) -> f64 {
     let sum_xx = x.iter().map(|v| v * v).sum::<f64>();
     let sum_xy = x.iter().zip(log_y.iter()).map(|(x, y)| x * y).sum::<f64>();
 
-    let denom = (n as f64 * sum_xx - sum_x * sum_x);
+    let denom = n as f64 * sum_xx - sum_x * sum_x;
     if denom == 0.0 {
         return f64::INFINITY;
     }

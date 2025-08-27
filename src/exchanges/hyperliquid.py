@@ -8,25 +8,22 @@ import traceback
 import json
 import numpy as np
 import passivbot_rust as pbr
+from utils import ts_to_date_utc, symbol_to_coin, coin_to_symbol, utc_ms
 from pure_funcs import (
     multi_replace,
     floatify,
-    ts_to_date_utc,
     calc_hash,
     shorten_custom_id,
-    coin2symbol,
-    symbol_to_coin,
 )
-from njit_funcs import (
-    calc_diff,
-    round_,
-    round_up,
-    round_dn,
-    round_dynamic,
-    round_dynamic_up,
-    round_dynamic_dn,
-)
-from procedures import print_async_exception, utc_ms, assert_correct_ccxt_version
+
+calc_diff = pbr.calc_diff
+round_ = pbr.round_
+round_up = pbr.round_up
+round_dn = pbr.round_dn
+round_dynamic = pbr.round_dynamic
+round_dynamic_up = pbr.round_dynamic_up
+round_dynamic_dn = pbr.round_dynamic_dn
+from procedures import print_async_exception, assert_correct_ccxt_version
 from sortedcontainers import SortedDict
 
 assert_correct_ccxt_version(ccxt=ccxt_async)
@@ -44,6 +41,7 @@ class HyperliquidBot(Passivbot):
             )
             self.user_info["is_vault"] = False
         self.max_n_concurrent_ohlcvs_1m_updates = 2
+        self.custom_id_max_length = 34
 
     def create_ccxt_sessions(self):
         self.ccp = getattr(ccxt_pro, self.exchange)(
@@ -141,7 +139,7 @@ class HyperliquidBot(Passivbot):
             )
             positions = [
                 {
-                    "symbol": x["position"]["coin"] + "/USDC:USDC",
+                    "symbol": self.coin_to_symbol(x["position"]["coin"]),
                     "position_side": (
                         "long" if (size := float(x["position"]["szi"])) > 0.0 else "short"
                     ),
@@ -168,7 +166,7 @@ class HyperliquidBot(Passivbot):
                 body=json.dumps({"type": "allMids"}),
             )
             return {
-                coin2symbol(coin, self.quote): {
+                self.coin_to_symbol(coin): {
                     "bid": float(fetched[coin]),
                     "ask": float(fetched[coin]),
                     "last": float(fetched[coin]),
@@ -285,9 +283,6 @@ class HyperliquidBot(Passivbot):
             traceback.print_exc()
             return {}
 
-    async def execute_cancellations(self, orders: [dict]) -> [dict]:
-        return await self.execute_multiple(orders, "execute_cancellation")
-
     def did_cancel_order(self, executed, order=None) -> bool:
         if isinstance(executed, list) and len(executed) == 1:
             return self.did_cancel_order(executed[0])
@@ -296,29 +291,28 @@ class HyperliquidBot(Passivbot):
         except:
             return False
 
+    def get_order_execution_params(self, order: dict) -> dict:
+        # defined for each exchange
+        params = {
+            "reduceOnly": order["reduce_only"],
+            "timeInForce": ("Alo" if self.config["live"]["time_in_force"] == "post_only" else "Gtc"),
+            "clientOrderId": order["custom_id"],  # TODO
+        }
+        if self.user_info["is_vault"]:
+            params["vaultAddress"] = self.user_info["wallet_address"]
+        return params
+
     async def execute_order(self, order: dict) -> dict:
         executed = None
         try:
-            params = {
-                "reduceOnly": order["reduce_only"],
-                "timeInForce": (
-                    "Alo" if self.config["live"]["time_in_force"] == "post_only" else "Gtc"
-                ),
-            }
-            if self.user_info["is_vault"]:
-                params["vaultAddress"] = self.user_info["wallet_address"]
-            executed = await self.cca.create_order(
-                symbol=order["symbol"],
-                type=order["type"] if "type" in order else "limit",
-                side=order["side"],
-                amount=order["qty"],
-                price=order["price"],
-                params=params,
-            )
+            executed = await super().execute_order(order)
             return executed
         except Exception as e:
-            if self.adjust_min_cost_on_error(e):
-                return {}
+            try:
+                if self.adjust_min_cost_on_error(e):
+                    return {}
+            except Exception as e0:
+                logging.error(f"error with adjust_min_cost_on_error {e0}")
             logging.error(f"error executing order {order} {e}")
             print_async_exception(executed)
             traceback.print_exc()
@@ -440,3 +434,7 @@ class HyperliquidBot(Passivbot):
                     ideal_orders[sym][i]["price"], self.price_steps[sym]
                 )
         return ideal_orders
+
+    def format_custom_id_single(self, order_type_id: int) -> str:
+        formatted = super().format_custom_id_single(order_type_id)
+        return (formatted)[: self.custom_id_max_length]

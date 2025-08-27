@@ -7,13 +7,13 @@ import asyncio
 import traceback
 import numpy as np
 import passivbot_rust as pbr
+from utils import ts_to_date_utc, utc_ms
 from pure_funcs import (
     floatify,
-    ts_to_date_utc,
     calc_hash,
     shorten_custom_id,
 )
-from procedures import print_async_exception, utc_ms, assert_correct_ccxt_version
+from procedures import print_async_exception, assert_correct_ccxt_version
 from collections import defaultdict
 from typing import Any
 import hmac
@@ -191,6 +191,14 @@ class KucoinBot(Passivbot):
             self.price_steps[symbol] = elm["precision"]["price"]
             self.c_mults[symbol] = elm["contractSize"]
             self.max_leverage[symbol] = int(elm["limits"]["leverage"]["max"])
+
+    async def watch_ohlcvs_1m(self):
+        # print("debug watch_ohlcvs_1m")
+        return
+
+    async def watch_ohlcv_1m_single(self, symbol):
+        # print('debug watch_ohlcv_1m_single', symbol)
+        return
 
     async def watch_orders(self):
         while True:
@@ -425,53 +433,24 @@ class KucoinBot(Passivbot):
 
         return sorted(deduped.values(), key=lambda x: x["timestamp"])
 
-    async def execute_orders(self, orders: [dict]) -> [dict]:
-        return await self.execute_multiple(orders, "execute_order")
-
-    async def execute_order(self, order: dict) -> dict:
-        order_type = order["type"] if "type" in order else "limit"
-        reduce_only = order["reduce_only"] if "reduce_only" in order else False
-        params = {
-            "symbol": order["symbol"],
-            "type": order_type,
-            "side": order["side"],
-            "amount": abs(order["qty"]),
-            "price": order["price"],
-            "params": {
-                "timeInForce": "GTC",
-                "reduceOnly": reduce_only,
-                "marginMode": "CROSS",
-                "clientOid": order["custom_id"],
-            },
+    def get_order_execution_params(self, order: dict) -> dict:
+        # defined for each exchange
+        return {
+            "timeInForce": "GTC",
+            "reduceOnly": order.get("reduce_only", False),
+            "marginMode": "CROSS",
+            "clientOid": order.get("custom_id", None),
         }
-        executed = await self.cca.create_order(**params)
-        return executed
 
     def did_cancel_order(self, executed, order=None) -> bool:
         if isinstance(executed, list) and len(executed) == 1:
             return self.did_cancel_order(executed[0], order)
         try:
-            return order is not None and order["id"] in executed.get("cancelledOrderIds", [])
+            return order is not None and order["id"] in executed.get("info", {}).get("data", {}).get(
+                "cancelledOrderIds", []
+            )
         except:
             return False
-
-    async def execute_cancellation(self, order: dict) -> dict:
-        executed = None
-        try:
-            executed = await self.cca.cancel_order(order["id"], symbol=order["symbol"])
-            return executed
-        except Exception as e:
-            logging.error(f"error cancelling order {order} {e}")
-            print_async_exception(executed)
-            traceback.print_exc()
-            return {}
-
-    async def execute_cancellations(self, orders: [dict]) -> [dict]:
-        if len(orders) == 0:
-            return []
-        if len(orders) == 1:
-            return [await self.execute_cancellation(orders[0])]
-        return await self.execute_multiple(orders, "execute_cancellation")
 
     async def determine_utc_offset(self, verbose=True):
         # returns millis to add to utc to get exchange timestamp

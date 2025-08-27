@@ -189,54 +189,12 @@ class DefxBot(Passivbot):
                 raise Exception(f"invalid side {res[i]}")
         return res
 
-    async def execute_orders(self, orders: [dict]) -> [dict]:
-        return await self.execute_multiple(orders, "execute_order")
-
-    async def execute_order(self, order: dict) -> dict:
-        # order_type = order["type"] if "type" in order else "limit"
-        order_type = "limit"  # only limit orders
-        reduce_only = False  # reduceOnly=True gives server error
-        # reduce_only = order["reduce_only"] if "reduce_only" in order else False
-        params = {
-            "symbol": order["symbol"],
-            "type": order_type,
-            "side": order["side"],
-            "amount": abs(order["qty"]),
-            "price": order["price"],
-            "params": {
-                "timeInForce": "GTC",
-                "reduceOnly": reduce_only,
-            },
+    def get_order_execution_params(self, order: dict) -> dict:
+        # defined for each exchange
+        return {
+            "timeInForce": "GTC",
+            "reduceOnly": reduce_only,
         }
-        # print(params)
-        executed = await self.cca.create_order(**params)
-        # print(executed)
-        return executed
-
-    async def execute_cancellation(self, order: dict) -> dict:
-        executed = None
-        try:
-            executed = await self.cca.cancel_order(order["id"], symbol=order["symbol"])
-            return {
-                "symbol": executed["symbol"],
-                "side": order["side"],
-                "id": executed["id"],
-                "position_side": order["position_side"],
-                "qty": order["qty"],
-                "price": order["price"],
-            }
-        except Exception as e:
-            logging.error(f"error cancelling order {order} {e}")
-            print_async_exception(executed)
-            traceback.print_exc()
-            return {}
-
-    async def execute_cancellations(self, orders: [dict]) -> [dict]:
-        if len(orders) == 0:
-            return []
-        if len(orders) == 1:
-            return [await self.execute_cancellation(orders[0])]
-        return await self.execute_multiple(orders, "execute_cancellation")
 
     async def determine_utc_offset(self, verbose=True):
         # returns millis to add to utc to get exchange timestamp

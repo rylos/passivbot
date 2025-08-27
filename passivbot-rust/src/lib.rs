@@ -7,9 +7,6 @@ mod trailing_flip;
 mod types;
 mod utils;
 
-use backtest::*;
-use closes::*;
-use entries::*;
 use pyo3::prelude::*;
 use pyo3::wrap_pyfunction;
 use python::*;
@@ -43,7 +40,13 @@ fn passivbot_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run_backtest, m)?)?;
     m.add_function(wrap_pyfunction!(calc_auto_unstuck_allowance, m)?)?;
     m.add_function(wrap_pyfunction!(hysteresis_rounding, m)?)?;
+    m.add_function(wrap_pyfunction!(calc_min_entry_qty_py, m)?)?;
     m.add_function(wrap_pyfunction!(calc_pprice_diff_int, m)?)?;
     m.add_function(wrap_pyfunction!(backtest_trailing_flip, m)?)?;
+    m.add_function(wrap_pyfunction!(order_type_id_to_snake, m)?)?;
+    m.add_function(wrap_pyfunction!(all_order_types_ids, m)?)?;
+    m.add_function(wrap_pyfunction!(order_type_snake_to_id, m)?)?;
+    m.add_function(wrap_pyfunction!(get_order_id_type_from_string_alias, m)?)?;
+
     Ok(())
 }

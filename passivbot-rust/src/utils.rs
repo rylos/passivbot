@@ -1,4 +1,4 @@
-use crate::constants::{CLOSE, LONG, NO_POS, SHORT};
+use crate::constants::{LONG, SHORT};
 use crate::types::ExchangeParams;
 use pyo3::prelude::*;
 

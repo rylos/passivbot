@@ -211,7 +211,7 @@ fn process_fill(position: Position, open_order: Order, fee_rate: f64) -> Vec<Fil
 }
 
 /// Clips an order's quantity so that wallet exposure does not exceed the specified limit.
-fn clip_order_qty_to_WE_limit(
+fn clip_order_qty_to_we_limit(
     wallet_exposure_limit: f64,
     balance: f64,
     pos: Position,
@@ -242,13 +242,7 @@ fn clip_order_qty_to_WE_limit(
 
 /// Determines the next open order (if any) and unrealised PnL given the current trailing state.
 fn calc_open_order_and_upnl(
-    trailing_threshold_pct_profit: f64,
-    trailing_retracement_pct_profit: f64,
-    trailing_threshold_pct_loss: f64,
-    trailing_retracement_pct_loss: f64,
-    wallet_exposure_limit: f64,
-    double_down_factor: f64,
-    initial_qty_pct: f64,
+    params: &BacktestParams,
     balance: f64,
     pos: Position,
     high: f64,
@@ -258,15 +252,15 @@ fn calc_open_order_and_upnl(
 ) -> (Order, f64) {
     let pos_qty = pos.qty;
     let pos_price = pos.price;
-    let mut upnl = 0.0;
+    let upnl: f64;
 
     if pos_qty > 0.0 {
         // Long position: use the low to compute unrealised PnL
         upnl = calc_pnl_long(pos_price, low, pos_qty, 1.0);
         // Trailing take profit condition
-        if close >= pos_price * (1.0 + trailing_threshold_pct_profit) {
+        if close >= pos_price * (1.0 + params.trailing_threshold_pct_profit) {
             if extrema.min_since_max
-                <= extrema.max_since_open * (1.0 - trailing_retracement_pct_profit)
+                <= extrema.max_since_open * (1.0 - params.trailing_retracement_pct_profit)
             {
                 return (
                     Order {
@@ -278,17 +272,17 @@ fn calc_open_order_and_upnl(
             }
         }
         // Trailing stop loss / add to losing long condition
-        if close < pos_price * (1.0 - trailing_threshold_pct_loss) {
+        if close < pos_price * (1.0 - params.trailing_threshold_pct_loss) {
             if extrema.max_since_min
-                >= extrema.min_since_open * (1.0 + trailing_retracement_pct_loss)
+                >= extrema.min_since_open * (1.0 + params.trailing_retracement_pct_loss)
             {
-                let close_qty = -pos_qty - pos_qty * double_down_factor;
+                let close_qty = -pos_qty - pos_qty * params.double_down_factor;
                 let order = Order {
                     qty: close_qty,
                     price: close,
                 };
                 let clipped =
-                    clip_order_qty_to_WE_limit(wallet_exposure_limit, balance, pos, order);
+                    clip_order_qty_to_we_limit(params.wallet_exposure_limit, balance, pos, order);
                 return (clipped, upnl);
             }
         }
@@ -296,9 +290,9 @@ fn calc_open_order_and_upnl(
         // Short position: use the high to compute unrealised PnL
         upnl = calc_pnl_short(pos_price, high, pos_qty, 1.0);
         // Trailing take profit condition for shorts
-        if close <= pos_price * (1.0 - trailing_threshold_pct_profit) {
+        if close <= pos_price * (1.0 - params.trailing_threshold_pct_profit) {
             if extrema.max_since_min
-                >= extrema.min_since_open * (1.0 + trailing_retracement_pct_profit)
+                >= extrema.min_since_open * (1.0 + params.trailing_retracement_pct_profit)
             {
                 return (
                     Order {
@@ -310,24 +304,24 @@ fn calc_open_order_and_upnl(
             }
         }
         // Trailing stop loss / add to losing short condition
-        if close >= pos_price * (1.0 + trailing_threshold_pct_loss) {
+        if close >= pos_price * (1.0 + params.trailing_threshold_pct_loss) {
             if extrema.min_since_max
-                <= extrema.max_since_open * (1.0 - trailing_retracement_pct_loss)
+                <= extrema.max_since_open * (1.0 - params.trailing_retracement_pct_loss)
             {
-                let close_qty = -pos_qty - pos_qty * double_down_factor;
+                let close_qty = -pos_qty - pos_qty * params.double_down_factor;
                 let order = Order {
                     qty: close_qty,
                     price: close,
                 };
                 let clipped =
-                    clip_order_qty_to_WE_limit(wallet_exposure_limit, balance, pos, order);
+                    clip_order_qty_to_we_limit(params.wallet_exposure_limit, balance, pos, order);
                 return (clipped, upnl);
             }
         }
     } else {
         // Flat: open a new position
         if close != 0.0 {
-            let qty = (balance / close) * initial_qty_pct;
+            let qty = (balance / close) * params.initial_qty_pct;
             return (Order { qty, price: close }, 0.0);
         } else {
             return (
@@ -347,6 +341,16 @@ fn calc_open_order_and_upnl(
         },
         upnl,
     )
+}
+
+pub struct BacktestParams {
+    pub initial_qty_pct: f64,
+    pub double_down_factor: f64,
+    pub wallet_exposure_limit: f64,
+    pub trailing_threshold_pct_profit: f64,
+    pub trailing_retracement_pct_profit: f64,
+    pub trailing_threshold_pct_loss: f64,
+    pub trailing_retracement_pct_loss: f64,
 }
 
 /// Run a simple backtest using trailing-stop and flip logic.
@@ -393,6 +397,16 @@ pub fn backtest_trailing_flip<'py>(
     let mut fills_out: Vec<(usize, f64, f64, f64, f64, f64, f64, f64, f64, String)> = Vec::new();
     let mut equities: Vec<f64> = Vec::new();
 
+    let params = BacktestParams {
+        initial_qty_pct,
+        double_down_factor,
+        wallet_exposure_limit,
+        trailing_threshold_pct_profit,
+        trailing_retracement_pct_profit,
+        trailing_threshold_pct_loss,
+        trailing_retracement_pct_loss,
+    };
+
     for (i, row) in hlcv.outer_iter().enumerate() {
         let high = row[0];
         let low = row[1];
@@ -438,21 +452,8 @@ pub fn backtest_trailing_flip<'py>(
         }
 
         // Determine next open order and unrealised PnL.
-        let (new_order, upnl) = calc_open_order_and_upnl(
-            trailing_threshold_pct_profit,
-            trailing_retracement_pct_profit,
-            trailing_threshold_pct_loss,
-            trailing_retracement_pct_loss,
-            wallet_exposure_limit,
-            double_down_factor,
-            initial_qty_pct,
-            balance,
-            pos,
-            high,
-            low,
-            close,
-            extrema,
-        );
+        let (new_order, upnl) =
+            calc_open_order_and_upnl(&params, balance, pos, high, low, close, extrema);
 
         open_order = new_order;
         equities.push(balance + upnl);

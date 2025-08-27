@@ -8,16 +8,17 @@ import pprint
 import asyncio
 import traceback
 import numpy as np
+from utils import ts_to_date_utc, utc_ms
 from pure_funcs import (
     multi_replace,
     floatify,
-    ts_to_date_utc,
     calc_hash,
     determine_pos_side_ccxt,
     shorten_custom_id,
 )
-from njit_funcs import calc_diff
-from procedures import print_async_exception, utc_ms, assert_correct_ccxt_version
+
+calc_diff = pbr.calc_diff
+from procedures import print_async_exception, assert_correct_ccxt_version
 
 assert_correct_ccxt_version(ccxt=ccxt_async)
 
@@ -100,20 +101,25 @@ class OKXBot(Passivbot):
                 self.cca.fetch_positions(),
                 self.cca.fetch_balance(),
             )
+
             balance = 0.0
-            quote_cash_balance = 0.0
-            for elm in fetched_balance["info"]["data"]:
-                for elm2 in elm["details"]:
-                    if elm2["collateralEnabled"]:
-                        if elm2["ccy"] == self.quote:
-                            quote_cash_balance = float(elm2["cashBal"])
-                            balance += quote_cash_balance
-                        else:
-                            balance += float(elm2["cashBal"]) * self.get_last_price(
-                                self.coin_to_symbol(elm2["ccy"])
+
+            is_multi_asset_mode = True
+            if len(fetched_balance["info"]["data"]) == 1:
+                if len(fetched_balance["info"]["data"][0]["details"]) == 1:
+                    if fetched_balance["info"]["data"][0]["details"][0]["ccy"] == self.quote:
+                        if not fetched_balance["info"]["data"][0]["details"][0]["collateralEnabled"]:
+                            is_multi_asset_mode = False
+
+            if is_multi_asset_mode:
+                for elm in fetched_balance["info"]["data"]:
+                    for elm2 in elm["details"]:
+                        if elm2["collateralEnabled"]:
+                            balance += float(elm2["cashBal"]) * (
+                                self.get_last_price(self.coin_to_symbol(elm2["ccy"]))
+                                if elm2["ccy"] == self.quote
+                                else 1.0
                             )
-            if balance != quote_cash_balance:
-                # means non USDT collateral is used
                 if not hasattr(self, "previous_rounded_balance"):
                     self.previous_rounded_balance = balance
                 self.previous_rounded_balance = pbr.hysteresis_rounding(
@@ -123,6 +129,9 @@ class OKXBot(Passivbot):
                     self.hyst_rounding_balance_h,
                 )
                 balance = self.previous_rounded_balance
+            else:
+                balance = float(fetched_balance["info"]["data"][0]["details"][0]["cashBal"])
+
             fetched_positions = [x for x in fetched_positions if x["marginMode"] == "cross"]
             for i in range(len(fetched_positions)):
                 fetched_positions[i]["position_side"] = fetched_positions[i]["side"]
@@ -238,31 +247,17 @@ class OKXBot(Passivbot):
             traceback.print_exc()
             return {}
 
-    async def execute_cancellations(self, orders: [dict]) -> [dict]:
-        return await self.execute_multiple(orders, "execute_cancellation")
-
-    async def execute_order(self, order: dict) -> dict:
-        order_type = order["type"] if "type" in order else "limit"
-        executed = await self.cca.create_order(
-            symbol=order["symbol"],
-            type=order_type,
-            side=order["side"],
-            amount=abs(order["qty"]),
-            price=order["price"],
-            params={
-                "postOnly": self.config["live"]["time_in_force"] == "post_only",
-                "positionSide": order["position_side"],
-                "reduceOnly": order["reduce_only"],
-                "hedged": True,
-                "tag": self.broker_code,
-                "clOrdId": order["custom_id"],
-                "marginMode": "cross",
-            },
-        )
-        return executed
-
-    async def execute_orders(self, orders: [dict]) -> [dict]:
-        return await self.execute_multiple(orders, "execute_order")
+    def get_order_execution_params(self, order: dict) -> dict:
+        # defined for each exchange
+        return {
+            "postOnly": self.config["live"]["time_in_force"] == "post_only",
+            "positionSide": order["position_side"],
+            "reduceOnly": order["reduce_only"],
+            "hedged": True,
+            "tag": self.broker_code,
+            "clOrdId": order["custom_id"],
+            "marginMode": "cross",
+        }
 
     async def update_exchange_config_by_symbols(self, symbols: [str]):
         coros_to_call_margin_mode = {}
@@ -317,10 +312,6 @@ class OKXBot(Passivbot):
             ideal_orders[x["symbol"]].append(x)
         return ideal_orders
 
-    def format_custom_ids(self, orders: [dict]) -> [dict]:
-        # okx needs broker code at the beginning of the custom_id
-        new_orders = []
-        for order in orders:
-            order["custom_id"] = (self.broker_code + uuid4().hex)[: self.custom_id_max_length]
-            new_orders.append(order)
-        return new_orders
+    def format_custom_id_single(self, order_type_id: int) -> str:
+        formatted = super().format_custom_id_single(order_type_id)
+        return (self.broker_code + formatted)[: self.custom_id_max_length]

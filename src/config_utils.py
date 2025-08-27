@@ -1,14 +1,13 @@
 import os
 import re
 from copy import deepcopy
-from typing import Any, Dict, Tuple, List
+from typing import Any, Dict, Tuple, List, Union, Optional
 import argparse
-import pprint
-from typing import Union
-import traceback
-from pure_funcs import remove_OD, sort_dict_keys, str2bool, symbol_to_coin
-from procedures import format_end_date, dump_pretty_json
+import logging
 import hjson
+from pure_funcs import remove_OD, sort_dict_keys, str2bool
+from procedures import dump_pretty_json
+from utils import format_end_date, symbol_to_coin, normalize_coins_source
 
 
 Path = Tuple[str, ...]  # ("bot", "long", "entry_grid_spacing_pct")
@@ -16,9 +15,11 @@ Path = Tuple[str, ...]  # ("bot", "long", "entry_grid_spacing_pct")
 
 def load_hjson_config(config_path: str) -> dict:
     try:
-        return remove_OD(hjson.load(open(config_path, encoding="utf-8")))
+        with open(config_path, encoding="utf-8") as f:
+            return remove_OD(hjson.load(f))
     except Exception as e:
-        raise Exception(f"failed to load config file {config_path} {e}")
+        logging.exception("failed to load config file %s", config_path)
+        raise
 
 
 def load_config(filepath: str, live_only=False, verbose=True) -> dict:
@@ -29,14 +30,18 @@ def load_config(filepath: str, live_only=False, verbose=True) -> dict:
             config, live_only=live_only, verbose=verbose, base_config_path=filepath
         )
         return config
-    except Exception as e:
-        traceback.print_exc()
-        raise Exception(f"failed to load config {filepath}: {e}")
+    except Exception:
+        logging.exception("failed to load config %s", filepath)
+        raise
 
 
 def dump_config(config: dict, filepath: str):
     config_ = deepcopy(config)
-    dump_pretty_json(config_, filepath)
+    try:
+        dump_pretty_json(config_, filepath)
+    except Exception:
+        logging.exception("failed to dump config to %s", filepath)
+        raise
 
 
 def expand_PB_mode(mode: str) -> str:
@@ -289,8 +294,10 @@ def parse_overrides(config, verbose=True):
         result["coin_overrides"] = parse_old_coin_flags(config)
         if verbose:
             if result["coin_overrides"]:
-                print(
-                    f"Converted old coin_flags to coin_overrides: {config['live']['coin_flags']} -> {result['coin_overrides']}"
+                logging.info(
+                    "Converted old coin_flags to coin_overrides: %s -> %s",
+                    config.get("live", {}).get("coin_flags"),
+                    result["coin_overrides"],
                 )
     result["live"].pop("coin_flags", None) if "live" in result else None
     for coin in sorted(result["coin_overrides"]):
@@ -299,10 +306,10 @@ def parse_overrides(config, verbose=True):
             if coinf:
                 result["coin_overrides"][coinf] = deepcopy(result["coin_overrides"][coin])
                 if verbose:
-                    print(f"Renamed {coin} -> {coinf} for coin_overrides")
+                    logging.info("Renamed %s -> %s for coin_overrides", coin, coinf)
             else:
                 if verbose:
-                    print(f"Failed to format {coin}; removed from coin_overrides")
+                    logging.info("Failed to format %s; removed from coin_overrides", coin)
             del result["coin_overrides"][coin]
     for coin, overrides in result["coin_overrides"].items():
         parsed_overrides = {}
@@ -319,7 +326,7 @@ def parse_overrides(config, verbose=True):
 
         result.setdefault("coin_overrides", {})[coin] = parsed_overrides
         if verbose:
-            print(f"Added overrides for {coin}: {sort_dict_keys(parsed_overrides)}")
+            logging.info("Added overrides for %s: %s", coin, sort_dict_keys(parsed_overrides))
     return result
 
 
@@ -344,8 +351,7 @@ def load_override_config(config, coin):
             ):
                 return load_config(npath, verbose=False)
     except Exception as e:
-        print(f"error loading config {path} {e}")
-        traceback.print_exc()
+        logging.exception("error loading config %s: %s", path, e)
     return {}
 
 
@@ -564,7 +570,6 @@ def format_config(config: dict, verbose=True, live_only=False, base_config_path:
 
     add_missing_keys_recursively(template, result, verbose=verbose)
     result["live"]["base_config_path"] = base_config_path
-    result = parse_overrides(result, verbose=verbose)
     remove_unused_keys_recursively(template["bot"], result["bot"], verbose=verbose)
     remove_unused_keys_recursively(
         template["optimize"]["bounds"], result["optimize"]["bounds"], verbose=verbose
@@ -624,128 +629,6 @@ def format_config(config: dict, verbose=True, live_only=False, base_config_path:
     return result
 
 
-def read_external_coins_lists(filepath) -> dict:
-    """
-    reads filepath and returns dict {'long': [str], 'short': [str]}
-    """
-    try:
-        content = hjson.load(open(filepath))
-        if isinstance(content, list) and all([isinstance(x, str) for x in content]):
-            return {"long": content, "short": content}
-        elif isinstance(content, dict):
-            if all(
-                [
-                    pside in content
-                    and isinstance(content[pside], list)
-                    and all([isinstance(x, str) for x in content[pside]])
-                    for pside in ["long", "short"]
-                ]
-            ):
-                return content
-    except:
-        pass
-    with open(filepath, "r") as file:
-        content = file.read().strip()
-    # Check if the content is in list format
-    if content.startswith("[") and content.endswith("]"):
-        # Remove brackets and split by comma
-        items = content[1:-1].split(",")
-        # Remove quotes and whitespace
-        items = [item.strip().strip("\"'") for item in items if item.strip()]
-    elif all(
-        line.strip().startswith('"') and line.strip().endswith('"')
-        for line in content.split("\n")
-        if line.strip()
-    ):
-        # Split by newline, remove quotes and whitespace
-        items = [line.strip().strip("\"'") for line in content.split("\n") if line.strip()]
-    else:
-        # Split by newline, comma, and/or space, and filter out empty strings
-        items = [item.strip() for item in content.replace(",", " ").split() if item.strip()]
-    return {"long": items, "short": items}
-
-
-def normalize_coins_source(src):
-    """
-    Always return: {'long': [symbols…], 'short': [symbols…]}
-    – Handles:
-        • direct coin lists or comma-separated strings
-        • lists/tuples containing paths or strings
-        • dicts with 'long' / 'short' keys whose values may themselves
-          be strings, lists, or paths to external lists
-    """
-
-    # --------------------------------------------------------------------- #
-    #  Helpers                                                              #
-    # --------------------------------------------------------------------- #
-    def _expand(seq):
-        """Flatten seq and split any comma-delimited strings it contains."""
-        out = []
-        for item in seq:
-            if isinstance(item, (list, tuple, set)):
-                out.extend(_expand(item))  # recurse
-            elif isinstance(item, str):
-                out.extend(x.strip() for x in item.split(",") if x.strip())
-            elif item is not None:
-                out.append(str(item).strip())
-        return out
-
-    def _load_if_file(x):
-        """
-        If *x* (or *x[0]* when x is a single-item list/tuple) is a
-        readable file path, load it with `read_external_coins_lists`.
-        Otherwise just return *x* unchanged.
-        """
-        if isinstance(x, str) and os.path.exists(x):
-            return read_external_coins_lists(x)
-
-        if (
-            isinstance(x, (list, tuple))
-            and len(x) == 1
-            and isinstance(x[0], str)
-            and os.path.exists(x[0])
-        ):
-            return read_external_coins_lists(x[0])
-
-        return x
-
-    def _normalize_side(value, side):
-        """
-        Resolve one *long*/*short* entry:
-        1. Load from file if necessary.
-        2. If the loader returned a dict, pluck the correct side.
-        3. Flatten & split with _expand so we end up with a clean list.
-        """
-        value = _load_if_file(value)
-
-        if isinstance(value, dict) and sorted(value.keys()) == ["long", "short"]:
-            value = value.get(side, [])
-
-        # guarantee a sensible sequence for _expand
-        if not isinstance(value, (list, tuple)):
-            value = [value]
-
-        return _expand(value)
-
-    # --------------------------------------------------------------------- #
-    #  Main logic                                                           #
-    # --------------------------------------------------------------------- #
-    src = _load_if_file(src)  # try to load *src* itself
-
-    # Case 1 – already a dict with 'long' & 'short' keys
-    if isinstance(src, dict) and sorted(src.keys()) == ["long", "short"]:
-        return {
-            "long": _normalize_side(src.get("long", []), "long"),
-            "short": _normalize_side(src.get("short", []), "short"),
-        }
-
-    # Case 2 – anything else is treated the same for both sides
-    return {
-        "long": _normalize_side(src, "long"),
-        "short": _normalize_side(src, "short"),
-    }
-
-
 def parse_limits_string(limits_str: Union[str, dict]) -> dict:
     """
     Parses a string like "--penalize_if_greater_than_drawdown_worst 0.3 --penalize_if_lower_than_gain 0.005"
@@ -779,8 +662,8 @@ def add_missing_keys_recursively(src, dst, parent=None, verbose=True):
     for k in src:
         if k not in dst:
             if verbose:
-                print(f"Added missing {'.'.join(parent+[k])} to config.")
-                dst[k] = src[k]
+                logging.info("Added missing %s to config.", ".".join(parent + [k]))
+            dst[k] = src[k]
         # --- NEW: only walk down if both sides are dicts -------------
         elif isinstance(src[k], dict) and isinstance(dst.get(k), dict):
             add_missing_keys_recursively(src[k], dst[k], parent + [k], verbose)
@@ -788,27 +671,35 @@ def add_missing_keys_recursively(src, dst, parent=None, verbose=True):
         elif isinstance(src[k], dict):
             # type clash: leave the user’s value untouched
             if verbose:
-                print(
-                    f"Skipping template subtree {'.'.join(parent+[k])} "
-                    f"(template is dict, config is {type(dst.get(k)).__name__})"
+                logging.info(
+                    "Skipping template subtree %s (template is dict, config is %s)",
+                    ".".join(parent + [k]),
+                    type(dst.get(k)).__name__,
                 )
             continue
         else:
+            # previous branches already handle k not in dst; keep safe assignment
             if k not in dst:
                 if verbose:
-                    print(f"Adding missing key -> val {'.'.join(parent + [k])} -> {src[k]} to config")
+                    logging.info(
+                        "Adding missing key -> val %s -> %s to config",
+                        ".".join(parent + [k]),
+                        src[k],
+                    )
                 dst[k] = src[k]
 
 
-def remove_unused_keys_recursively(src, dst, parent=[], verbose=True):
-    for k in sorted(dst):
+def remove_unused_keys_recursively(src, dst, parent=None, verbose=True):
+    if parent is None:
+        parent = []
+    for k in sorted(list(dst.keys())):
         if k in src:
             if isinstance(dst[k], dict):
                 remove_unused_keys_recursively(src[k], dst[k], parent + [k], verbose=verbose)
         else:
             del dst[k]
             if verbose:
-                print(f"Removed unused key from config: {'.'.join(parent + [k])}")
+                logging.info("Removed unused key from config: %s", ".".join(parent + [k]))
 
 
 def comma_separated_values_float(x):
@@ -824,7 +715,7 @@ def create_acronym(full_name, acronyms=set()):
     while True:
         i += 1
         if i > 100:
-            raise Exception(f"too many acronym duplicates {acronym}")
+            raise Exception(f"too many acronym duplicates for {full_name}")
         shortened_name = full_name
         for k in [
             "backtest.",
@@ -844,7 +735,7 @@ def create_acronym(full_name, acronyms=set()):
 
         if acronym not in acronyms:
             break
-        acronym += str(i)
+        acronym = acronym + str(i)
         if acronym not in acronyms:
             break
     return acronym

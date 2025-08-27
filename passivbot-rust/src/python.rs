@@ -5,22 +5,19 @@ use crate::closes::{
 use crate::entries::{
     calc_entries_long, calc_entries_short, calc_next_entry_long, calc_next_entry_short,
 };
+use crate::types::OrderType;
 use crate::types::{
-    Analysis, BacktestParams, BotParams, BotParamsPair, EMABands, Equities, ExchangeParams, Order,
-    OrderBook, Position, StateParams, TrailingPriceBundle,
+    BacktestParams, BotParams, BotParamsPair, EMABands, ExchangeParams, OrderBook, Position,
+    StateParams, TrailingPriceBundle,
 };
 use memmap::MmapOptions;
-use ndarray::{Array1, Array2, Array3, Array4, ArrayBase, ArrayD, ArrayView, ShapeBuilder};
-use numpy::{
-    IntoPyArray, PyArray1, PyArray2, PyArray3, PyArray4, PyReadonlyArray2, PyReadonlyArray3,
-    PyReadonlyArray4,
-};
+use ndarray::{Array1, Array2, ArrayView};
+use numpy::{IntoPyArray, PyArray1, PyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
-use pyo3::wrap_pyfunction;
 use serde::Serialize;
-use std::{fs::File, slice};
+use std::fs::File;
 
 #[pyfunction]
 pub fn run_backtest(
@@ -148,10 +145,14 @@ pub fn run_backtest(
             py_fills[(i, 12)] = fill.order_type.to_string().into_py(py);
         }
 
-        let py_equities_usd = Array1::from_vec(equities.usd).into_pyarray(py).to_owned();
-        let py_equities_btc = Array1::from_vec(equities.btc).into_pyarray(py).to_owned();
+        let py_equities_usd = Array1::from_vec(equities.usd)
+            .into_pyarray_bound(py)
+            .unbind();
+        let py_equities_btc = Array1::from_vec(equities.btc)
+            .into_pyarray_bound(py)
+            .unbind();
         Ok((
-            py_fills.into_pyarray(py).to_owned(),
+            py_fills.into_pyarray_bound(py).unbind(),
             py_equities_usd,
             py_equities_btc,
             py_analysis_usd.into(),
@@ -272,7 +273,12 @@ fn extract_value<'a, T: pyo3::FromPyObject<'a>>(dict: &'a PyDict, key: &str) -> 
         .map_err(|_| {
             PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!("Key '{}' not found", key))
         })?
-        .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Value for key '{}' is None", key)))
+        .ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "Value for key '{}' is None",
+                key
+            ))
+        })
         .and_then(pyo3::FromPyObject::extract)
 }
 
@@ -622,7 +628,7 @@ pub fn calc_entries_long_py(
     min_since_max: f64,
     ema_bands_lower: f64,
     order_book_bid: f64,
-) -> Vec<(f64, f64, String)> {
+) -> Vec<(f64, f64, u16)> {
     let exchange_params = ExchangeParams {
         qty_step,
         price_step,
@@ -679,7 +685,7 @@ pub fn calc_entries_long_py(
     // Convert entries to Python-compatible format
     entries
         .into_iter()
-        .map(|order| (order.qty, order.price, order.order_type.to_string()))
+        .map(|order| (order.qty, order.price, order.order_type.id()))
         .collect()
 }
 
@@ -709,7 +715,7 @@ pub fn calc_entries_short_py(
     min_since_max: f64,
     ema_bands_upper: f64,
     order_book_ask: f64,
-) -> Vec<(f64, f64, String)> {
+) -> Vec<(f64, f64, u16)> {
     let exchange_params = ExchangeParams {
         qty_step,
         price_step,
@@ -766,8 +772,26 @@ pub fn calc_entries_short_py(
     // Convert entries to Python-compatible format
     entries
         .into_iter()
-        .map(|order| (order.qty, order.price, order.order_type.to_string()))
+        .map(|order| (order.qty, order.price, order.order_type.id()))
         .collect()
+}
+
+#[pyfunction]
+pub fn calc_min_entry_qty_py(
+    price: f64,
+    c_mult: f64,
+    qty_step: f64,
+    min_qty: f64,
+    min_cost: f64,
+) -> f64 {
+    let exchange_params = ExchangeParams {
+        qty_step,
+        price_step: 0.0,
+        min_qty,
+        min_cost,
+        c_mult,
+    };
+    crate::entries::calc_min_entry_qty(price, &exchange_params)
 }
 
 #[pyfunction]
@@ -794,7 +818,7 @@ pub fn calc_closes_long_py(
     max_since_open: f64,
     min_since_max: f64,
     order_book_ask: f64,
-) -> Vec<(f64, f64, String)> {
+) -> Vec<(f64, f64, u16)> {
     let exchange_params = ExchangeParams {
         qty_step,
         price_step,
@@ -846,7 +870,7 @@ pub fn calc_closes_long_py(
     // Convert closes to Python-compatible format
     closes
         .into_iter()
-        .map(|order| (order.qty, order.price, order.order_type.to_string()))
+        .map(|order| (order.qty, order.price, order.order_type.id()))
         .collect()
 }
 
@@ -874,7 +898,7 @@ pub fn calc_closes_short_py(
     max_since_open: f64,
     min_since_max: f64,
     order_book_bid: f64,
-) -> Vec<(f64, f64, String)> {
+) -> Vec<(f64, f64, u16)> {
     let exchange_params = ExchangeParams {
         qty_step,
         price_step,
@@ -925,6 +949,60 @@ pub fn calc_closes_short_py(
     // Convert closes to Python-compatible format
     closes
         .into_iter()
-        .map(|order| (order.qty, order.price, order.order_type.to_string()))
+        .map(|order| (order.qty, order.price, order.order_type.id()))
         .collect()
+}
+
+#[pyfunction]
+pub fn order_type_id_to_snake(id: u16) -> PyResult<String> {
+    let ot = OrderType::try_from(id)
+        .map_err(|_| pyo3::exceptions::PyValueError::new_err("unknown order type id"))?;
+    Ok(ot.snake().to_string())
+}
+
+#[pyfunction]
+pub fn all_order_types_ids(py: Python<'_>) -> PyResult<Py<PyDict>> {
+    let d = PyDict::new(py);
+    use OrderType::*;
+    let items: &[(OrderType, &str)] = &[
+        (EntryInitialNormalLong, "entry_initial_normal_long"),
+        (EntryInitialPartialLong, "entry_initial_partial_long"),
+        (EntryTrailingNormalLong, "entry_trailing_normal_long"),
+        (EntryTrailingCroppedLong, "entry_trailing_cropped_long"),
+        (EntryGridNormalLong, "entry_grid_normal_long"),
+        (EntryGridCroppedLong, "entry_grid_cropped_long"),
+        (EntryGridInflatedLong, "entry_grid_inflated_long"),
+        (CloseGridLong, "close_grid_long"),
+        (CloseTrailingLong, "close_trailing_long"),
+        (CloseUnstuckLong, "close_unstuck_long"),
+        (CloseAutoReduceLong, "close_auto_reduce_long"),
+        (EntryInitialNormalShort, "entry_initial_normal_short"),
+        (EntryInitialPartialShort, "entry_initial_partial_short"),
+        (EntryTrailingNormalShort, "entry_trailing_normal_short"),
+        (EntryTrailingCroppedShort, "entry_trailing_cropped_short"),
+        (EntryGridNormalShort, "entry_grid_normal_short"),
+        (EntryGridCroppedShort, "entry_grid_cropped_short"),
+        (EntryGridInflatedShort, "entry_grid_inflated_short"),
+        (CloseGridShort, "close_grid_short"),
+        (CloseTrailingShort, "close_trailing_short"),
+        (CloseUnstuckShort, "close_unstuck_short"),
+        (CloseAutoReduceShort, "close_auto_reduce_short"),
+        (Empty, "empty"),
+    ];
+    for (ot, s) in items {
+        d.set_item(ot.id(), *s)?;
+    }
+    Ok(d.into())
+}
+
+#[pyfunction]
+pub fn order_type_snake_to_id(name: &str) -> PyResult<u16> {
+    OrderType::from_snake(name)
+        .map(|ot| ot.id())
+        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("unknown order type name"))
+}
+
+#[pyfunction(name = "get_order_id_type_from_string")]
+pub fn get_order_id_type_from_string_alias(name: &str) -> PyResult<u16> {
+    order_type_snake_to_id(name)
 }

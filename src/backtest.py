@@ -16,11 +16,14 @@ from config_utils import (
     update_config_with_args,
     format_config,
     get_template_live_config,
+    parse_overrides,
 )
-from procedures import (
+from utils import (
     utc_ms,
     make_get_filepath,
+    load_markets,
     format_end_date,
+    format_approved_ignored_coins,
 )
 from pure_funcs import (
     ts_to_date,
@@ -29,7 +32,10 @@ from pure_funcs import (
 )
 import pprint
 from copy import deepcopy
-from downloader import prepare_hlcvs, prepare_hlcvs_combined, add_all_eligible_coins_to_config
+from downloader import (
+    prepare_hlcvs,
+    prepare_hlcvs_combined,
+)
 from pathlib import Path
 from plotting import plot_fills_forager
 from collections import defaultdict
@@ -501,7 +507,10 @@ async def main():
         config = load_config(args.config_path)
     update_config_with_args(config, args)
     config = format_config(config, verbose=False)
-    await add_all_eligible_coins_to_config(config)
+    for ex in config["backtest"]["exchanges"]:
+        await load_markets(ex)
+    config = parse_overrides(config, verbose=True)
+    await format_approved_ignored_coins(config, config["backtest"]["exchanges"])
     config["disable_plotting"] = args.disable_plotting
     config["backtest"]["cache_dir"] = {}
     config["backtest"]["coins"] = {}
