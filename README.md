@@ -159,9 +159,9 @@ For more detailed information about Passivbot, see documentation files here: [do
 
 ## Third Party Links, Referrals and Tip Jar
 
-**Passivbot Manager Service:**  
-There is a paid manager service to run Passivbot on the user's behalf:  
-www.passivbotmanager.com  
+**Hyperliquid Reference Vault**
+Passivbot's default template config running on a Hyperliquid Vault:  
+https://app.hyperliquid.xyz/vaults/0x490af7d4a048a81db0f677517ed6373565b42349
 
 **Passivbot GUI**
 A graphical user interface for Passivbot:  
