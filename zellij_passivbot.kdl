@@ -1,0 +1,18 @@
+layout {
+    tab name="passivbot" {
+        pane split_direction="vertical" {
+            pane name="bybit" {
+                command "bash"
+                args "-c" "cd /opt/pb && source venv/bin/activate && python src/main.py configs/live/config_bybit.json"
+            }
+            pane name="hyperliquid" {
+                command "bash"
+                args "-c" "cd /opt/pb && source venv/bin/activate && python src/main.py configs/live/config_hl.json"
+            }
+            pane name="hype" {
+                command "bash"
+                args "-c" "cd /opt/pb && source venv/bin/activate && python src/main.py configs/live/config_hype_only.json"
+            }
+        }
+    }
+}
