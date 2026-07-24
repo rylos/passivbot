@@ -1504,7 +1504,7 @@ def serve_dash(data_root: str, host: str = "127.0.0.1", port: int = 8050):
             else (numeric_cols[1] if len(numeric_cols) > 1 else default_x),
         )
         default_color = _pick(
-            "mdg_strategy_eq_w",
+            "adg_strategy_eq_w",
             preferred[2] if len(preferred) > 2 else None,
         )
         return options, options, color_options, default_x, default_y, default_color
@@ -1751,11 +1751,11 @@ def serve_dash(data_root: str, host: str = "127.0.0.1", port: int = 8050):
             frontier_mask = df_filtered["_is_frontier"].to_numpy()
             fig.update_traces(
                 marker=dict(
-                    size=np.where(frontier_mask, 12, 6),
-                    opacity=np.where(frontier_mask, 1.0, 0.45),
+                    size=np.where(frontier_mask, 13, 6),
+                    opacity=np.where(frontier_mask, 1.0, 0.4),
                     line=dict(
-                        width=np.where(frontier_mask, 1.5, 0.0),
-                        color=THEME["green"],
+                        width=np.where(frontier_mask, 3.0, 0.0),
+                        color="#ffffff",
                     ),
                 )
             )
