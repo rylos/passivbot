@@ -236,8 +236,13 @@ def load_pareto_dataframe(run_dir: str) -> RunData:
     display_labels: Dict[str, str] = {}
 
     for path in sorted(glob(os.path.join(pareto_dir, "*.json"))):
-        with open(path) as f:
-            entry = json.load(f)
+        try:
+            with open(path) as f:
+                entry = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            # pareto members rotate while an optimize run is writing:
+            # files can vanish or be mid-write between glob and open
+            continue
         config_id = os.path.basename(path)
         raw_configs[config_id] = entry
         base = {"_id": config_id}
