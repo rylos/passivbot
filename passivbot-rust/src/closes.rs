@@ -465,37 +465,44 @@ pub fn calc_next_close_long(
         }
     } else {
         // grid first
-        if wallet_exposure_ratio < 1.0 + bot_params.close_trailing_grid_ratio {
+        // se il prezzo in ask dell'order book è superiore al prezzo della posizione, chiudiamo il 100% in modalità grid
+        if state_params.order_book.ask > position.price {
             // return grid order, closing whole position
             calc_grid_close_long(&exchange_params, &state_params, &bot_params, &position)
         } else {
-            // return trailing order, but leave full_psize * (1.0 + close_trailing_grid_ratio) for grid close
-            let mut grid_allocation = cost_to_qty(
-                state_params.balance
-                    * wallet_exposure_limit_with_allowance(bot_params)
-                    * (1.0 + bot_params.close_trailing_grid_ratio),
-                position.price,
-                exchange_params.c_mult,
-            );
-            let min_entry_qty = calc_min_entry_qty(position.price, &exchange_params);
-            if grid_allocation < min_entry_qty {
-                grid_allocation = 0.0;
+            // logica attuale:
+            if wallet_exposure_ratio < 1.0 + bot_params.close_trailing_grid_ratio {
+                // return grid order, closing whole position
+                calc_grid_close_long(&exchange_params, &state_params, &bot_params, &position)
+            } else {
+                // return trailing order, but leave full_psize * (1.0 + close_trailing_grid_ratio) for grid close
+                let mut grid_allocation = cost_to_qty(
+                    state_params.balance
+                        * wallet_exposure_limit_with_allowance(bot_params)
+                        * (1.0 + bot_params.close_trailing_grid_ratio),
+                    position.price,
+                    exchange_params.c_mult,
+                );
+                let min_entry_qty = calc_min_entry_qty(position.price, &exchange_params);
+                if grid_allocation < min_entry_qty {
+                    grid_allocation = 0.0;
+                }
+                let trailing_allocation = round_(
+                    (position.size - grid_allocation) * 1.01,
+                    exchange_params.qty_step,
+                );
+                let position_mod = Position {
+                    size: f64::min(position.size, f64::max(trailing_allocation, min_entry_qty)),
+                    price: position.price,
+                };
+                calc_trailing_close_long(
+                    &exchange_params,
+                    &state_params,
+                    &bot_params,
+                    &position_mod,
+                    &trailing_price_bundle,
+                )
             }
-            let trailing_allocation = round_(
-                (position.size - grid_allocation) * 1.01,
-                exchange_params.qty_step,
-            );
-            let position_mod = Position {
-                size: f64::min(position.size, f64::max(trailing_allocation, min_entry_qty)),
-                price: position.price,
-            };
-            calc_trailing_close_long(
-                &exchange_params,
-                &state_params,
-                &bot_params,
-                &position_mod,
-                &trailing_price_bundle,
-            )
         }
     }
 }
@@ -759,40 +766,53 @@ pub fn calc_next_close_short(
             calc_grid_close_short(&exchange_params, &state_params, &bot_params, &position_mod)
         }
     } else {
-        if wallet_exposure_ratio < 1.0 + bot_params.close_trailing_grid_ratio {
+        // grid first
+        // se il prezzo in bid dell'order book è inferiore al prezzo della posizione, chiudiamo il 100% in modalità grid
+        if state_params.order_book.bid < position.price {
             // return grid order, closing whole position
-            return calc_grid_close_short(&exchange_params, &state_params, &bot_params, &position);
+            calc_grid_close_short(&exchange_params, &state_params, &bot_params, &position)
         } else {
-            // return trailing order, but leave full_psize * (1.0 + close_trailing_grid_ratio) for grid close
-            let mut grid_allocation = cost_to_qty(
-                state_params.balance
-                    * wallet_exposure_limit_with_allowance(bot_params)
-                    * (1.0 + bot_params.close_trailing_grid_ratio),
-                position.price,
-                exchange_params.c_mult,
-            );
-            let min_entry_qty = calc_min_entry_qty(position.price, &exchange_params);
-            if grid_allocation < min_entry_qty {
-                grid_allocation = 0.0;
+            // logica attuale:
+            if wallet_exposure_ratio < 1.0 + bot_params.close_trailing_grid_ratio {
+                // return grid order, closing whole position
+                return calc_grid_close_short(
+                    &exchange_params,
+                    &state_params,
+                    &bot_params,
+                    &position,
+                );
+            } else {
+                // return trailing order, but leave full_psize * (1.0 + close_trailing_grid_ratio) for grid close
+                let mut grid_allocation = cost_to_qty(
+                    state_params.balance
+                        * wallet_exposure_limit_with_allowance(bot_params)
+                        * (1.0 + bot_params.close_trailing_grid_ratio),
+                    position.price,
+                    exchange_params.c_mult,
+                );
+                let min_entry_qty = calc_min_entry_qty(position.price, &exchange_params);
+                if grid_allocation < min_entry_qty {
+                    grid_allocation = 0.0;
+                }
+                let trailing_allocation = round_(
+                    (position_size_abs - grid_allocation) * 1.01,
+                    exchange_params.qty_step,
+                );
+                let position_mod = Position {
+                    size: -f64::min(
+                        position_size_abs,
+                        f64::max(trailing_allocation, min_entry_qty),
+                    ),
+                    price: position.price,
+                };
+                calc_trailing_close_short(
+                    &exchange_params,
+                    &state_params,
+                    &bot_params,
+                    &position_mod,
+                    &trailing_price_bundle,
+                )
             }
-            let trailing_allocation = round_(
-                (position_size_abs - grid_allocation) * 1.01,
-                exchange_params.qty_step,
-            );
-            let position_mod = Position {
-                size: -f64::min(
-                    position_size_abs,
-                    f64::max(trailing_allocation, min_entry_qty),
-                ),
-                price: position.price,
-            };
-            calc_trailing_close_short(
-                &exchange_params,
-                &state_params,
-                &bot_params,
-                &position_mod,
-                &trailing_price_bundle,
-            )
         }
     }
 }
