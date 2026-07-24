@@ -1486,13 +1486,27 @@ def serve_dash(data_root: str, host: str = "127.0.0.1", port: int = 8050):
         if scoring_weights:
             color_options.insert(0, {"label": "Weighted Score", "value": "_weighted_score"})
         preferred = [col for col in run_data.scoring_metrics if col in numeric_cols]
-        default_x = preferred[0] if preferred else (numeric_cols[0] if numeric_cols else None)
-        default_y = (
+
+        def _pick(name, fallback):
+            for col in (name, f"{OBJECTIVE_PREFIX}{name}"):
+                if col in numeric_cols:
+                    return col
+            return fallback
+
+        default_x = _pick(
+            "adg_strategy_eq",
+            preferred[0] if preferred else (numeric_cols[0] if numeric_cols else None),
+        )
+        default_y = _pick(
+            "drawdown_worst_strategy_eq",
             preferred[1]
             if len(preferred) > 1
-            else (numeric_cols[1] if len(numeric_cols) > 1 else default_x)
+            else (numeric_cols[1] if len(numeric_cols) > 1 else default_x),
         )
-        default_color = preferred[2] if len(preferred) > 2 else None
+        default_color = _pick(
+            "mdg_strategy_eq_w",
+            preferred[2] if len(preferred) > 2 else None,
+        )
         return options, options, color_options, default_x, default_y, default_color
 
     @app.callback(
@@ -1714,7 +1728,38 @@ def serve_dash(data_root: str, host: str = "127.0.0.1", port: int = 8050):
         x_label = _metric_label(run_data, x_metric) or x_metric
         y_label = _metric_label(run_data, y_metric) or y_metric
         plot_labels = _plot_metric_labels(run_data, [x_metric, y_metric, color_metric])
-        if highlight_frontier and "highlight" in highlight_frontier:
+        color_col = (
+            color_metric
+            if color_metric
+            and color_metric in df_filtered.columns
+            and pd.api.types.is_numeric_dtype(df_filtered[color_metric])
+            else None
+        )
+        if highlight_frontier and "highlight" in highlight_frontier and color_col:
+            # Color by the chosen metric; express frontier membership via
+            # marker size/outline so Color By keeps working with highlight on
+            fig = px.scatter(
+                df_filtered,
+                x=x_metric,
+                y=y_metric,
+                color=color_col,
+                hover_data=["_id"],
+                title=f"{y_label} vs {x_label} ({is_frontier.sum()} on frontier)",
+                custom_data=["_id"],
+                labels=plot_labels,
+            )
+            frontier_mask = df_filtered["_is_frontier"].to_numpy()
+            fig.update_traces(
+                marker=dict(
+                    size=np.where(frontier_mask, 12, 6),
+                    opacity=np.where(frontier_mask, 1.0, 0.45),
+                    line=dict(
+                        width=np.where(frontier_mask, 1.5, 0.0),
+                        color=THEME["green"],
+                    ),
+                )
+            )
+        elif highlight_frontier and "highlight" in highlight_frontier:
             # Use different colors for frontier vs non-frontier
             df_filtered["_frontier_label"] = df_filtered["_is_frontier"].map(
                 {True: "Frontier", False: "Dominated"}
