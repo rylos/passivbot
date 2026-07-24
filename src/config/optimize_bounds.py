@@ -88,11 +88,11 @@ SHARED_OPTIMIZE_BOUNDS_DEFAULTS = {
             "we_excess_allowance_pct": [0, 3, 0.01]
         },
         "rylos_4rsi": {
-            "osc_entry_threshold": [-40, -10, 0.001],
-            "entry_stoch_threshold": [10, 40, 0.001],
-            "osc_exit_threshold": [10, 40, 0.001],
-            "exit_stoch_threshold": [60, 90, 0.001],
-            "exit_min_gain": [0.0025, 0.025, 0.0001]
+            "osc_entry_threshold": [-10.028, -10.028, 0.001],
+            "entry_stoch_threshold": [36.222, 36.222, 0.001],
+            "osc_exit_threshold": [24.845, 24.845, 0.001],
+            "exit_stoch_threshold": [73.05, 73.05, 0.001],
+            "exit_min_gain": [0.0103, 0.0103, 0.0001]
         },
         "unstuck": {
             "close_pct": [0.01, 0.12, 0.001],
@@ -124,11 +124,11 @@ SHARED_OPTIMIZE_BOUNDS_DEFAULTS = {
             "we_excess_allowance_pct": [0, 3, 0.01]
         },
         "rylos_4rsi": {
-            "osc_entry_threshold": [-40, -10, 0.001],
-            "entry_stoch_threshold": [10, 40, 0.001],
-            "osc_exit_threshold": [10, 40, 0.001],
-            "exit_stoch_threshold": [60, 90, 0.001],
-            "exit_min_gain": [0.0025, 0.025, 0.0001]
+            "osc_entry_threshold": [-10.028, -10.028, 0.001],
+            "entry_stoch_threshold": [36.222, 36.222, 0.001],
+            "osc_exit_threshold": [24.845, 24.845, 0.001],
+            "exit_stoch_threshold": [73.05, 73.05, 0.001],
+            "exit_min_gain": [0.0103, 0.0103, 0.0001]
         },
         "unstuck": {
             "close_pct": [0.01, 0.12, 0.001],

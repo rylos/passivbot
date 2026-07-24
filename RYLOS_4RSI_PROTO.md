@@ -54,7 +54,11 @@ Periodi indicatori fissi (RSI 2/7/14, stoch 14/3, tf 5m), sovrascrivibili con un
 sezione top-level opzionale `rylos_signal` (`timeframe_minutes`, `rsi_periods`,
 `stoch_period`, `stoch_smooth`).
 
-Bounds optimize (default, sezione `optimize.bounds.long.rylos_4rsi`):
+Bounds optimize (sezione `optimize.bounds.long.rylos_4rsi`): i **default sono
+fissati** ai valori 5371 (lo = hi → zero dimensioni aggiunte alle optimize
+esistenti, stesso pattern di `total_wallet_exposure_limit`). Per ottimizzare
+le soglie, allargare esplicitamente i bounds nel config, range suggeriti
+(spazi hyperopt freqtrade):
 
 ```
 osc_entry_threshold   [-40, -10]     entry_stoch_threshold [10, 40]
