@@ -1754,7 +1754,7 @@ def serve_dash(data_root: str, host: str = "127.0.0.1", port: int = 8050):
                     size=np.where(frontier_mask, 13, 6),
                     opacity=np.where(frontier_mask, 1.0, 0.4),
                     line=dict(
-                        width=np.where(frontier_mask, 3.0, 0.0),
+                        width=np.where(frontier_mask, 1.5, 0.0),
                         color="#ffffff",
                     ),
                 )
