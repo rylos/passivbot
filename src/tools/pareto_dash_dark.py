@@ -1923,11 +1923,9 @@ def serve_dash(data_root: str, host: str = "127.0.0.1", port: int = 8050):
             for m in _extract_limit_metrics(run_data.default_limits):
                 if m not in metrics:
                     metrics.append(m)
-            # gain: stats columns carry the _mean suffix after flattening
-            for m in ["gain_strategy_eq", "gain_strategy_eq_mean", "gain_usd_mean"]:
-                if m in row.columns and m not in metrics:
+            for m in ["gain_strategy_eq"]:
+                if m not in metrics:
                     metrics.append(m)
-                    break
             for metric in metrics:
                 if metric in row.columns:
                     val = row[metric].values[0]
@@ -1935,12 +1933,19 @@ def serve_dash(data_root: str, host: str = "127.0.0.1", port: int = 8050):
                         summary_items.append(
                             html.Div(f"{_metric_label(run_data, metric)}: {val:.4f}")
                         )
-        rylos = (
-            run_data.raw_configs.get(selected_id, {})
-            .get("bot", {})
-            .get("long", {})
-            .get("rylos_4rsi")
-        )
+        raw_entry = run_data.raw_configs.get(selected_id, {})
+        # gain lives only in the raw stats block, not in the dataframe columns
+        stats = (raw_entry.get("metrics") or {}).get("stats") or {}
+        for gain_key in ("gain_strategy_eq", "gain_usd"):
+            payload = stats.get(gain_key)
+            gain_val = payload.get("mean") if isinstance(payload, dict) else payload
+            if isinstance(gain_val, (int, float)) and np.isfinite(gain_val):
+                summary_items.append(
+                    html.Div(f"{gain_key}: {gain_val:.4f}", className="text-warning")
+                )
+                break
+
+        rylos = raw_entry.get("bot", {}).get("long", {}).get("rylos_4rsi")
         if isinstance(rylos, dict) and rylos.get("enabled"):
             summary_items.append(
                 html.Strong("4RSI", style={"display": "block", "marginTop": "8px"})
