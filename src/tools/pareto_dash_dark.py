@@ -1556,13 +1556,15 @@ def serve_dash(data_root: str, host: str = "127.0.0.1", port: int = 8050):
 
         limits_default = "\n".join(run_data.default_limits)
 
-        # Frontier metrics - preferred defaults, fall back to scoring metrics
+        # Frontier metrics - preferred defaults, fall back to scoring metrics.
+        # Objective columns carry the OBJECTIVE_PREFIX; match either form.
         frontier_options = _metric_options(run_data, metric_cols)
-        preferred_frontier = [
-            m
-            for m in ("drawdown_worst_strategy_eq", "sortino_ratio_strategy_eq")
-            if m in metric_cols
-        ]
+        preferred_frontier = []
+        for name in ("drawdown_worst_strategy_eq", "sortino_ratio_strategy_eq"):
+            for col in (name, f"{OBJECTIVE_PREFIX}{name}"):
+                if col in metric_cols:
+                    preferred_frontier.append(col)
+                    break
         frontier_default = preferred_frontier or (
             run_data.scoring_metrics[:3] if run_data.scoring_metrics else metric_cols[:3]
         )
