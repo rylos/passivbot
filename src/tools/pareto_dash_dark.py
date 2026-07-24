@@ -728,11 +728,26 @@ def compute_weighted_score(df: pd.DataFrame, weights: Dict[str, float]) -> pd.Se
     return score
 
 
+_LOWER_IS_BETTER_TOKENS = (
+    "drawdown",
+    "recovery_days",
+    "held_days",
+    "underwater",
+    "loss_profit_ratio",
+)
+
+
+def _metric_lower_is_better(metric: str) -> bool:
+    name = metric.lower()
+    return any(token in name for token in _LOWER_IS_BETTER_TOKENS)
+
+
 def compute_pareto_frontier(df: pd.DataFrame, metrics: List[str], maximize: bool = True) -> pd.Series:
     """Compute which points are on the Pareto frontier.
 
     Returns a boolean Series indicating frontier membership.
-    Assumes higher is better for all metrics if maximize=True.
+    With maximize=True, higher is better except for metrics recognized as
+    lower-is-better (drawdown, recovery/held days, ...), which are flipped.
     """
     if df.empty or not metrics:
         return pd.Series(False, index=df.index)
@@ -742,7 +757,10 @@ def compute_pareto_frontier(df: pd.DataFrame, metrics: List[str], maximize: bool
     if not available:
         return pd.Series(False, index=df.index)
 
-    values = df[available].values
+    values = df[available].values.astype(float).copy()
+    for col, metric in enumerate(available):
+        if _metric_lower_is_better(metric):
+            values[:, col] = -values[:, col]
     n = len(df)
     is_frontier = np.ones(n, dtype=bool)
 
