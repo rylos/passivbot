@@ -572,6 +572,10 @@ struct OrderFillExecution {
 pub struct Backtest<'a> {
     hlcvs: ArrayView3<'a, f64>,
     btc_usd_prices: ArrayView1<'a, f64>, // Change to ArrayView1 (1D view)
+    // Optional RyLoS 4RSI indicators, shape (T, n_columns, 3):
+    // [osc_4rsi, stoch_k, candle_color] of the last closed 5m candle at each
+    // 1m row; NaN during warmup. Same column order as hlcvs.
+    rylos_indicators: Option<ArrayView3<'a, f64>>,
     active_coin_indices: Vec<usize>,
     interval_ms: u64,
     bot_params_master: BotParamsPair,
@@ -1527,6 +1531,7 @@ impl<'a> Backtest<'a> {
                         strategy_params: None,
                         parsed_strategy_params: Some(self.strategy_params[idx].long),
                         runtime_budget: Some(self.runtime_budget[idx].long.clone()),
+                        rylos_signal: self.rylos_signal_at(k, idx),
                     },
                     short: orchestrator::SymbolSideInput {
                         mode: mode_short,
@@ -1538,6 +1543,7 @@ impl<'a> Backtest<'a> {
                         strategy_params: None,
                         parsed_strategy_params: Some(self.strategy_params[idx].short),
                         runtime_budget: Some(self.runtime_budget[idx].short.clone()),
+                        rylos_signal: None,
                     },
                 }
             })
@@ -1667,6 +1673,8 @@ impl<'a> Backtest<'a> {
             sym.long.runtime_budget = Some(self.runtime_budget[idx].long.clone());
             sym.short.runtime_budget = Some(self.runtime_budget[idx].short.clone());
 
+            sym.long.rylos_signal = self.rylos_signal_at(k, idx);
+
             let valid_now = self.coin_is_valid_at(idx, k);
             let mut mode_long: Option<orchestrator::TradingMode> =
                 self.forced_normal_mode(idx, LONG);
@@ -1764,6 +1772,30 @@ impl<'a> Backtest<'a> {
     fn hlcvs_value(&self, row: usize, coin_idx: usize, feature: usize) -> f64 {
         let col = self.col(coin_idx);
         self.hlcvs[[row, col, feature]]
+    }
+
+    pub fn set_rylos_indicators(&mut self, indicators: ArrayView3<'a, f64>) {
+        self.rylos_indicators = Some(indicators);
+    }
+
+    fn rylos_signal_at(
+        &self,
+        row: usize,
+        coin_idx: usize,
+    ) -> Option<orchestrator::RylosSignalInput> {
+        let arr = self.rylos_indicators.as_ref()?;
+        let col = self.col(coin_idx);
+        let osc_4rsi = arr[[row, col, 0]];
+        let stoch_k = arr[[row, col, 1]];
+        let candle_color = arr[[row, col, 2]];
+        if !(osc_4rsi.is_finite() && stoch_k.is_finite()) {
+            return None;
+        }
+        Some(orchestrator::RylosSignalInput {
+            osc_4rsi,
+            stoch_k,
+            candle_color,
+        })
     }
 
     #[cfg(test)]
@@ -2079,6 +2111,7 @@ impl<'a> Backtest<'a> {
         Backtest {
             hlcvs,
             btc_usd_prices,
+            rylos_indicators: None,
             active_coin_indices,
             interval_ms: backtest_params.candle_interval_minutes * 60_000,
             bot_params_master: bot_params_master.clone(),

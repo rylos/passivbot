@@ -46,6 +46,13 @@ SHARED_OPTIMIZE_LOCAL_TO_FLAT_KEY = {
         "loss_allowance_pct": "unstuck_loss_allowance_pct",
         "threshold": "unstuck_threshold",
     },
+    "rylos_4rsi": {
+        "osc_entry_threshold": "rylos_osc_entry_threshold",
+        "entry_stoch_threshold": "rylos_entry_stoch_threshold",
+        "osc_exit_threshold": "rylos_osc_exit_threshold",
+        "exit_stoch_threshold": "rylos_exit_stoch_threshold",
+        "exit_min_gain": "rylos_exit_min_gain",
+    },
 }
 SHARED_OPTIMIZE_FLAT_TO_LOCAL_KEY = {
     group_name: {flat_key: local_key for local_key, flat_key in field_map.items()}
@@ -80,6 +87,13 @@ SHARED_OPTIMIZE_BOUNDS_DEFAULTS = {
             "total_wallet_exposure_limit": [1.5, 1.5, 0.01],
             "we_excess_allowance_pct": [0, 3, 0.01]
         },
+        "rylos_4rsi": {
+            "osc_entry_threshold": [-40, -10, 0.001],
+            "entry_stoch_threshold": [10, 40, 0.001],
+            "osc_exit_threshold": [10, 40, 0.001],
+            "exit_stoch_threshold": [60, 90, 0.001],
+            "exit_min_gain": [0.0025, 0.025, 0.0001]
+        },
         "unstuck": {
             "close_pct": [0.01, 0.12, 0.001],
             "ema_dist": [-0.2, 0.01, 0.0001],
@@ -108,6 +122,13 @@ SHARED_OPTIMIZE_BOUNDS_DEFAULTS = {
             "total_exposure_enforcer_threshold": [0.8, 1.01, 0.001],
             "total_wallet_exposure_limit": [0, 0],
             "we_excess_allowance_pct": [0, 3, 0.01]
+        },
+        "rylos_4rsi": {
+            "osc_entry_threshold": [-40, -10, 0.001],
+            "entry_stoch_threshold": [10, 40, 0.001],
+            "osc_exit_threshold": [10, 40, 0.001],
+            "exit_stoch_threshold": [60, 90, 0.001],
+            "exit_min_gain": [0.0025, 0.025, 0.0001]
         },
         "unstuck": {
             "close_pct": [0.01, 0.12, 0.001],

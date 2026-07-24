@@ -1527,6 +1527,24 @@ fn run_backtest_core<'py>(
     let skip_btc_analysis = metrics_only
         && backtest_params.skip_btc_analysis
         && backtest_params.btc_collateral_cap <= 0.0;
+    // Optional RyLoS 4RSI indicator array, shape (T, n_columns, 3):
+    // [osc_4rsi, stoch_k, candle_color] per 1m row, NaN during warmup.
+    let rylos_indicators: Option<PyReadonlyArray3<f64>> =
+        match backtest_params_dict.get_item("rylos_indicators")? {
+            Some(item) if !item.is_none() => Some(item.extract::<PyReadonlyArray3<f64>>()?),
+            _ => None,
+        };
+    if let Some(arr) = rylos_indicators.as_ref() {
+        let shape = arr.as_array().shape().to_vec();
+        let expected = [n_timesteps, hlcvs_rust.shape()[1], 3];
+        if shape != expected {
+            return Err(PyValueError::new_err(format!(
+                "rylos_indicators shape {:?} does not match expected {:?}",
+                shape, expected
+            )));
+        }
+    }
+
     let init_start = profile_start(profile_enabled);
     let mut backtest = Backtest::new_with_strategy_params(
         hlcvs_rust,
@@ -1537,6 +1555,9 @@ fn run_backtest_core<'py>(
         exchange_params,
         &backtest_params,
     );
+    if let Some(arr) = rylos_indicators.as_ref() {
+        backtest.set_rylos_indicators(arr.as_array());
+    }
     profile_add(&mut rust_profile, "rust_backtest_init_ms", init_start);
 
     // Run the backtest and process results
@@ -2538,6 +2559,12 @@ fn bot_params_from_dict(dict: &PyDict) -> PyResult<BotParams> {
         unstuck_ema_dist: extract_value(dict, "unstuck_ema_dist")?,
         unstuck_loss_allowance_pct: extract_value(dict, "unstuck_loss_allowance_pct")?,
         unstuck_threshold: extract_value(dict, "unstuck_threshold")?,
+        rylos_4rsi_enabled: extract_optional_bool(dict, "rylos_4rsi_enabled", false)?,
+        rylos_osc_entry_threshold: extract_optional_f64(dict, "rylos_osc_entry_threshold")?,
+        rylos_entry_stoch_threshold: extract_optional_f64(dict, "rylos_entry_stoch_threshold")?,
+        rylos_osc_exit_threshold: extract_optional_f64(dict, "rylos_osc_exit_threshold")?,
+        rylos_exit_stoch_threshold: extract_optional_f64(dict, "rylos_exit_stoch_threshold")?,
+        rylos_exit_min_gain: extract_optional_f64(dict, "rylos_exit_min_gain")?,
     })
 }
 

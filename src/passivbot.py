@@ -15094,6 +15094,7 @@ class Passivbot:
             "risk_twel_entry_gate_enabled",
             "unstuck_enabled",
             "unstuck_ema_gating_enabled",
+            "rylos_4rsi_enabled",
         }
         string_keys = {
             "risk_twel_enforcer_policy",
@@ -15163,6 +15164,12 @@ class Passivbot:
             "unstuck_ema_dist",
             "unstuck_loss_allowance_pct",
             "unstuck_threshold",
+            "rylos_4rsi_enabled",
+            "rylos_osc_entry_threshold",
+            "rylos_entry_stoch_threshold",
+            "rylos_osc_exit_threshold",
+            "rylos_exit_stoch_threshold",
+            "rylos_exit_min_gain",
         ]
         out: dict[str, object] = {}
         strategy_getter = getattr(self, "_strategy_params_to_rust_dict", None)
@@ -15247,6 +15254,56 @@ class Passivbot:
             }
         )
         return out
+
+    async def _compute_rylos_signals(self, symbols: list[str]) -> dict[str, dict]:
+        """Compute RyLoS 4RSI signal values (last closed 5m candle) per symbol
+        from CandlestickManager 1m candles. Stateless: safe across restarts."""
+        from rylos_signal import (
+            DEFAULT_RYLOS_SIGNAL_CONFIG,
+            LIVE_MIN_CANDLES,
+            compute_rylos_signal_live,
+        )
+
+        cfg = {
+            **DEFAULT_RYLOS_SIGNAL_CONFIG,
+            **(self.config.get("rylos_signal") or {}),
+        }
+        tf = int(cfg["timeframe_minutes"])
+        lookback_minutes = (LIVE_MIN_CANDLES + 30) * tf
+        now_minute = (int(utc_ms()) // 60_000) * 60_000
+        end_ts = now_minute - 60_000  # last fully closed 1m candle
+        start_ts = end_ts - lookback_minutes * 60_000
+
+        async def one(symbol: str):
+            try:
+                arr = await self.cm.get_candles(
+                    symbol,
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                    strict=False,
+                    skip_historical_gap_fill=True,
+                )
+                if arr is None or len(arr) == 0:
+                    return symbol, None
+                arr = arr[arr["ts"] <= end_ts]  # exclude in-progress candle
+                sig = compute_rylos_signal_live(
+                    arr["h"].astype(np.float64),
+                    arr["l"].astype(np.float64),
+                    arr["c"].astype(np.float64),
+                    arr["ts"],
+                    cfg,
+                )
+                return symbol, sig
+            except Exception as exc:
+                logging.warning(
+                    "rylos_signal unavailable for %s: %s (initial entry blocked)",
+                    symbol,
+                    exc,
+                )
+                return symbol, None
+
+        results = await asyncio.gather(*(one(s) for s in symbols))
+        return {symbol: sig for symbol, sig in results if sig is not None}
 
     def _pb_mode_to_orchestrator_mode(self, mode: str) -> str:
         m = (mode or "").strip().lower()
@@ -17561,6 +17618,16 @@ class Passivbot:
             Passivbot._build_orchestrator_runtime_hints(self, symbol_to_idx)
         )
 
+        # RyLoS 4RSI signal (long only): raw indicator values of the last
+        # closed 5m candle, recomputed statelessly each cycle (restart-safe).
+        # Missing signal => Rust blocks only the initial entry (fail-closed).
+        rylos_signals: dict[str, dict] = {}
+        rylos_symbols = [
+            s for s in symbols if bool(self.bp("long", "rylos_4rsi_enabled", s))
+        ]
+        if rylos_symbols:
+            rylos_signals = await self._compute_rylos_signals(rylos_symbols)
+
         for symbol in symbols:
             idx = symbol_to_idx[symbol]
             snap = market_snapshots.get(symbol)
@@ -17609,6 +17676,11 @@ class Passivbot:
                     "last_increase_fill_timestamp_ms": last_increase_fill_timestamps.get(symbol, {}).get(pside),
                     "bot_params": self._bot_params_to_rust_dict(pside, symbol),
                     "strategy_params": self._strategy_params_to_rust_dict(pside, symbol),
+                    **(
+                        {"rylos_signal": rylos_signals[symbol]}
+                        if pside == "long" and symbol in rylos_signals
+                        else {}
+                    ),
                 }
 
             # Build EMA bundle for this symbol.

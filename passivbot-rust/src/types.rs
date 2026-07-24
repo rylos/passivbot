@@ -620,6 +620,20 @@ pub struct BotParams {
     pub unstuck_ema_dist: f64,
     pub unstuck_loss_allowance_pct: f64,
     pub unstuck_threshold: f64,
+    // RyLoS 4RSI signal: gate initial entry on oversold, force full close on
+    // overbought (indicators computed on 5m candles outside the engine)
+    #[serde(default)]
+    pub rylos_4rsi_enabled: bool,
+    #[serde(default)]
+    pub rylos_osc_entry_threshold: f64,
+    #[serde(default)]
+    pub rylos_entry_stoch_threshold: f64,
+    #[serde(default)]
+    pub rylos_osc_exit_threshold: f64,
+    #[serde(default)]
+    pub rylos_exit_stoch_threshold: f64,
+    #[serde(default)]
+    pub rylos_exit_min_gain: f64,
 }
 
 impl Default for BotParams {
@@ -679,6 +693,12 @@ impl Default for BotParams {
             unstuck_ema_dist: 0.0,
             unstuck_loss_allowance_pct: 0.0,
             unstuck_threshold: 0.0,
+            rylos_4rsi_enabled: false,
+            rylos_osc_entry_threshold: 0.0,
+            rylos_entry_stoch_threshold: 0.0,
+            rylos_osc_exit_threshold: 0.0,
+            rylos_exit_stoch_threshold: 0.0,
+            rylos_exit_min_gain: 0.0,
         }
     }
 }

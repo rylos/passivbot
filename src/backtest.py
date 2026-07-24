@@ -744,6 +744,72 @@ class BacktestPayload:
     rust_profile: dict | None = None
 
 
+# Cache of computed RyLoS indicator arrays. Indicators depend only on candles
+# (fixed periods; thresholds are BotParams applied in Rust), so during an
+# optimize run every evaluation reuses the same array. Keyed by identity of
+# the (shared-memory) hlcvs array + shape + first timestamp + signal params.
+_rylos_indicators_cache: dict = {}
+
+
+def rylos_signal_enabled(runtime_config: dict) -> bool:
+    """True if the RyLoS 4RSI signal is enabled on bot.long (master or any
+    coin override)."""
+    from config.shared_bot import get_grouped_bot_value
+
+    bot_long = runtime_config.get("bot", {}).get("long", {})
+    if bool(get_grouped_bot_value(bot_long, "rylos_4rsi_enabled", False)):
+        return True
+    for override in (runtime_config.get("coin_overrides") or {}).values():
+        if not isinstance(override, dict):
+            continue
+        override_long = override.get("bot", {}).get("long", {})
+        if bool(get_grouped_bot_value(override_long, "rylos_4rsi_enabled", False)):
+            return True
+    return False
+
+
+def _maybe_add_rylos_indicators(
+    backtest_params: dict,
+    runtime_config: dict,
+    hlcvs,
+    timestamps,
+    candle_interval: int,
+) -> None:
+    if not rylos_signal_enabled(runtime_config):
+        return
+    if candle_interval != 1:
+        raise ValueError(
+            "rylos_4rsi requires candle_interval_minutes=1 "
+            "(the 5m signal is aggregated from 1m candles)"
+        )
+    if timestamps is None or len(timestamps) == 0:
+        raise ValueError("rylos_4rsi requires candle timestamps")
+    from rylos_signal import (
+        DEFAULT_RYLOS_SIGNAL_CONFIG,
+        compute_rylos_indicators_for_backtest,
+    )
+
+    signal_cfg = {
+        **DEFAULT_RYLOS_SIGNAL_CONFIG,
+        **(runtime_config.get("rylos_signal") or {}),
+    }
+    hlcvs_arr = np.asarray(hlcvs)
+    ts_arr = np.asarray(timestamps, dtype=np.int64)
+    cache_key = (
+        id(hlcvs),
+        hlcvs_arr.shape,
+        int(ts_arr[0]),
+        tuple(sorted((k, str(v)) for k, v in signal_cfg.items())),
+    )
+    cached = _rylos_indicators_cache.get(cache_key)
+    if cached is None:
+        cached = compute_rylos_indicators_for_backtest(hlcvs_arr, ts_arr, signal_cfg)
+        if len(_rylos_indicators_cache) >= 4:  # bound memory (one entry per exchange)
+            _rylos_indicators_cache.clear()
+        _rylos_indicators_cache[cache_key] = cached
+    backtest_params["rylos_indicators"] = cached
+
+
 def build_backtest_payload(
     hlcvs,
     mss,
@@ -973,6 +1039,14 @@ def build_backtest_payload(
         "warmup_minutes_requested": warmup_requested,
         "warmup_minutes_provided": warmup_provided,
     }
+
+    _maybe_add_rylos_indicators(
+        backtest_params,
+        runtime_config,
+        hlcvs,
+        timestamps,
+        candle_interval,
+    )
 
     bundle = _build_hlcvs_bundle(
         hlcvs,

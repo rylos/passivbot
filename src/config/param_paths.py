@@ -123,7 +123,7 @@ def resolve_dotted_config_path(config: dict, selector_or_path: str) -> tuple[str
     if raw_parts[0] in BOT_POSITION_SIDES or (
         raw_parts[0] == "*"
         and len(raw_parts) >= 2
-        and raw_parts[1] in ("strategy", "risk", "forager", "hsl", "unstuck")
+        and raw_parts[1] in ("strategy", "risk", "forager", "hsl", "unstuck", "rylos_4rsi")
     ):
         parts = ("bot", *raw_parts)
     else:

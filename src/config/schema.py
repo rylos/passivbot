@@ -35,6 +35,14 @@ def _get_shared_bot_defaults():
                     "yellow": 0.5
                 }
             },
+            "rylos_4rsi": {
+                "enabled": False,
+                "entry_stoch_threshold": 36.222,
+                "exit_min_gain": 0.0103,
+                "exit_stoch_threshold": 73.05,
+                "osc_entry_threshold": -10.028,
+                "osc_exit_threshold": 24.845
+            },
             "risk": {
                 "entry_cooldown_minutes": 7.4,
                 "n_positions": 5.0,
@@ -81,6 +89,14 @@ def _get_shared_bot_defaults():
                     "orange": 0.75,
                     "yellow": 0.5
                 }
+            },
+            "rylos_4rsi": {
+                "enabled": False,
+                "entry_stoch_threshold": 36.222,
+                "exit_min_gain": 0.0103,
+                "exit_stoch_threshold": 73.05,
+                "osc_entry_threshold": -10.028,
+                "osc_exit_threshold": 24.845
             },
             "risk": {
                 "entry_cooldown_minutes": 0.0,

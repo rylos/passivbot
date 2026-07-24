@@ -3,7 +3,7 @@ from typing import Optional
 
 
 BOT_POSITION_SIDES = ("long", "short")
-BOT_SHARED_GROUPS = ("risk", "forager", "hsl", "unstuck")
+BOT_SHARED_GROUPS = ("risk", "forager", "hsl", "unstuck", "rylos_4rsi")
 
 BOT_GROUP_FIELD_MAP = {
     "risk": {
@@ -43,6 +43,14 @@ BOT_GROUP_FIELD_MAP = {
         "enabled": "unstuck_enabled",
         "loss_allowance_pct": "unstuck_loss_allowance_pct",
         "threshold": "unstuck_threshold",
+    },
+    "rylos_4rsi": {
+        "enabled": "rylos_4rsi_enabled",
+        "osc_entry_threshold": "rylos_osc_entry_threshold",
+        "entry_stoch_threshold": "rylos_entry_stoch_threshold",
+        "osc_exit_threshold": "rylos_osc_exit_threshold",
+        "exit_stoch_threshold": "rylos_exit_stoch_threshold",
+        "exit_min_gain": "rylos_exit_min_gain",
     },
 }
 

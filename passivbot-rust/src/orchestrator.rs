@@ -354,6 +354,20 @@ mod core {
         0.001
     }
 
+    /// RyLoS 4RSI signal values for the last *closed* higher-timeframe (5m)
+    /// candle. Raw indicator values only; thresholds live in BotParams so the
+    /// gating logic is identical for backtest and live.
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct RylosSignalInput {
+        /// avg(RSI2, RSI7, RSI14) - 50 on 5m closes.
+        pub osc_4rsi: f64,
+        /// STOCHF(14) fast %D (SMA 3 of raw stochastic) on 5m candles.
+        pub stoch_k: f64,
+        /// Candle color of the closed 5m candle: >0 green, <0 red, 0 doji/unknown.
+        pub candle_color: f64,
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     pub struct SymbolSideInput {
@@ -372,6 +386,10 @@ mod core {
         pub parsed_strategy_params: Option<crate::strategies::StrategyParams>,
         #[serde(default)]
         pub runtime_budget: Option<RuntimeBudgetState>,
+        /// RyLoS 4RSI signal (None => warmup/unavailable; blocks initial entry
+        /// when rylos_4rsi_enabled).
+        #[serde(default)]
+        pub rylos_signal: Option<RylosSignalInput>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2272,6 +2290,49 @@ mod core {
         }
     }
 
+    /// RyLoS 4RSI entry gate (long only): initial entry allowed only when the
+    /// last closed 5m candle is oversold (osc + stoch below thresholds) and red.
+    /// Missing/NaN signal (warmup) blocks the initial entry, like freqtrade's
+    /// startup_candle_count.
+    fn rylos_entry_allowed(bp: &BotParams, sig: Option<&RylosSignalInput>) -> bool {
+        if !bp.rylos_4rsi_enabled {
+            return true;
+        }
+        match sig {
+            Some(s) if s.osc_4rsi.is_finite() && s.stoch_k.is_finite() => {
+                s.osc_4rsi < bp.rylos_osc_entry_threshold
+                    && s.stoch_k < bp.rylos_entry_stoch_threshold
+                    && s.candle_color < 0.0
+            }
+            _ => false,
+        }
+    }
+
+    /// RyLoS 4RSI overbought exit (long only): force a full close when the last
+    /// closed 5m candle is overbought (osc + stoch above thresholds), green, and
+    /// the position gains more than rylos_exit_min_gain vs pprice.
+    fn rylos_exit_triggered(
+        bp: &BotParams,
+        sig: Option<&RylosSignalInput>,
+        pos: &Position,
+        ob: &OrderBook,
+    ) -> bool {
+        if !bp.rylos_4rsi_enabled || pos.size <= 0.0 || pos.price <= 0.0 {
+            return false;
+        }
+        let Some(s) = sig else {
+            return false;
+        };
+        if !(s.osc_4rsi.is_finite() && s.stoch_k.is_finite()) {
+            return false;
+        }
+        let gain = (ob.bid - pos.price) / pos.price;
+        s.osc_4rsi > bp.rylos_osc_exit_threshold
+            && s.stoch_k > bp.rylos_exit_stoch_threshold
+            && s.candle_color > 0.0
+            && gain > bp.rylos_exit_min_gain
+    }
+
     fn should_generate_closes(mode: TradingMode, has_pos: bool) -> bool {
         match mode {
             TradingMode::Manual => false,
@@ -3138,12 +3199,22 @@ mod core {
                         &s.long.bot_params,
                         &workspace.runtime_budget_long[s.symbol_idx],
                         strategy_initial_qty_pct(&strategy_params_for_min_cost),
-                    );
+                    )
+                    && rylos_entry_allowed(&s.long.bot_params, s.long.rylos_signal.as_ref());
 
                 let mut entries: Vec<IdealOrder> = Vec::new();
                 let mut closes: Vec<IdealOrder> = Vec::new();
 
-                if mode == TradingMode::Panic {
+                let rylos_exit = has_pos
+                    && mode != TradingMode::Manual
+                    && rylos_exit_triggered(
+                        &s.long.bot_params,
+                        s.long.rylos_signal.as_ref(),
+                        &s.long.position,
+                        &s.order_book,
+                    );
+
+                if mode == TradingMode::Panic || rylos_exit {
                     if let Some(p) = calc_panic_close(
                         s.symbol_idx,
                         PositionSide::Long,
@@ -4153,6 +4224,7 @@ mod core {
                     parsed_strategy_params: None,
                     last_increase_fill_timestamp_ms: None,
                     runtime_budget: None,
+                    rylos_signal: None,
                 },
                 short: SymbolSideInput {
                     mode: None,
@@ -4163,6 +4235,7 @@ mod core {
                     parsed_strategy_params: None,
                     last_increase_fill_timestamp_ms: None,
                     runtime_budget: None,
+                    rylos_signal: None,
                 },
             }
         }
