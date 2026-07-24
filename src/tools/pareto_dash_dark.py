@@ -1905,6 +1905,28 @@ def serve_dash(data_root: str, host: str = "127.0.0.1", port: int = 8050):
                         summary_items.append(
                             html.Div(f"{_metric_label(run_data, metric)}: {val:.4f}")
                         )
+        rylos = (
+            run_data.raw_configs.get(selected_id, {})
+            .get("bot", {})
+            .get("long", {})
+            .get("rylos_4rsi")
+        )
+        if isinstance(rylos, dict) and rylos.get("enabled"):
+            summary_items.append(
+                html.Strong("4RSI", style={"display": "block", "marginTop": "8px"})
+            )
+            for key in (
+                "osc_entry_threshold",
+                "entry_stoch_threshold",
+                "osc_exit_threshold",
+                "exit_stoch_threshold",
+                "exit_min_gain",
+            ):
+                val = rylos.get(key)
+                if isinstance(val, (int, float)):
+                    summary_items.append(
+                        html.Div(f"{key}: {val:.4f}", className="text-info")
+                    )
         return html.Div(summary_items, style={"fontSize": "12px"})
 
     @app.callback(
