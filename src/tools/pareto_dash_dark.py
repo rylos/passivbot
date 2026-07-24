@@ -1918,9 +1918,11 @@ def serve_dash(data_root: str, host: str = "127.0.0.1", port: int = 8050):
             for m in _extract_limit_metrics(run_data.default_limits):
                 if m not in metrics:
                     metrics.append(m)
-            for m in ["gain_strategy_eq"]:
-                if m not in metrics:
+            # gain: stats columns carry the _mean suffix after flattening
+            for m in ["gain_strategy_eq", "gain_strategy_eq_mean", "gain_usd_mean"]:
+                if m in row.columns and m not in metrics:
                     metrics.append(m)
+                    break
             for metric in metrics:
                 if metric in row.columns:
                     val = row[metric].values[0]
