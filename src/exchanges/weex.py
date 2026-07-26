@@ -9,6 +9,7 @@ import ccxt.pro as ccxt_pro
 
 from config.access import require_live_value
 from exchanges.ccxt_bot import CCXTBot, format_exchange_config_response
+from exchanges.ipv4_transport import IPv4TransportMixin
 from passivbot import logging
 from utils import symbol_to_coin
 
@@ -51,11 +52,11 @@ class _WeexSuccessEnvelopeMixin:
         )
 
 
-class AsyncWeex(_WeexSuccessEnvelopeMixin, ccxt_async.weex):
+class AsyncWeex(IPv4TransportMixin, _WeexSuccessEnvelopeMixin, ccxt_async.weex):
     pass
 
 
-class ProWeex(_WeexSuccessEnvelopeMixin, ccxt_pro.weex):
+class ProWeex(IPv4TransportMixin, _WeexSuccessEnvelopeMixin, ccxt_pro.weex):
     def handle_orders(self, client, message):
         """Ignore WEEX order-channel heartbeats with no order rows.
 

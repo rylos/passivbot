@@ -45,6 +45,15 @@ Handling in Passivbot:
 4. For each broker-agreement exchange, verify the actual signed CCXT/raw request includes the required broker field/header/tag.
 5. Add regression tests at the request-construction boundary when changing exchange sessions, signing, or order payload code.
 
+## Exchange Hedge Mode Versus Strategy Hedge Mode
+
+`live.hedge_mode=false` disables simultaneous long and short strategy exposure; it does not put an
+exchange account into one-way mode. Binance and Bitget connectors keep the exchange account in
+hedge mode. Their private order updates must therefore normalize `position_side` and close-only
+semantics from the exchange's actual mode and explicit `positionSide`/`posSide` fields even when
+the strategy setting is false. Only connectors whose `hedge_mode` capability is actually false may
+use the one-way side plus `reduceOnly` attribution path.
+
 ## Bybit
 
 ### Broker referer header
@@ -60,17 +69,34 @@ Handling:
 
 Problem:
 
-1. Cursor pagination has limited historical reach.
-2. Time-based pagination can skip records when windows exceed page limits.
+1. Supplying only `endTime` makes Bybit search the preceding seven days.
+2. Deriving the next window from a sparse page's oldest row can skip records
+   between that row and the current window boundary.
+3. A time window may still contain more than one page.
 
 Handling in Passivbot:
 
-1. Use hybrid pagination (cursor for recent, time-window for older).
-2. Deduplicate by `orderId`.
+1. Partition the requested range into explicit contiguous windows shorter than
+   seven days, passing both `startTime` and `endTime`.
+2. Cursor-paginate each window to exhaustion before moving to the next older
+   window.
+3. Deduplicate by `orderId`.
+4. Propagate endpoint and pagination-progress failures; incomplete closed-PnL
+   history must not be treated as a successful fetch.
 
 Primary reference: `src/fill_events_manager.py` (`BybitFetcher._fetch_positions_history`).
 
 ## KuCoin Futures
+
+### IPv4 API-key whitelist transport
+
+Problem: A dual-stack host may select IPv6 for KuCoin REST and private
+WebSocket traffic even when the API key permits only the host's stable public
+IPv4 address. KuCoin then rejects the first authenticated request as an IP
+whitelist authentication failure.
+
+Handling: Both KuCoin REST and WebSocket CCXT clients use IPv4-only network
+connectors. Keep the host's stable public IPv4 address in the API-key whitelist.
 
 ### KuCoin hedge-mode refresh
 
@@ -112,7 +138,9 @@ Handling:
 
 1. Treat current same-mode success as success (`code=00000`, `data.posMode=hedge_mode`).
 2. Let unknown `set_position_mode` failures raise unless a verified Bitget no-op code is added with a targeted test.
-3. Require explicit side-disambiguating payloads for order/fill normalization instead of defaulting to long; open orders should carry `posSide`, while fills may use `tradeSide`/`side`/`posMode`.
+3. Normalize against the actual exchange account mode, not `live.hedge_mode`, which only controls
+   simultaneous strategy exposure.
+4. Require explicit side-disambiguating payloads for order/fill normalization instead of defaulting to long; open orders should carry `posSide`, while fills may use `tradeSide`/`side`/`posMode`.
 
 ### UTA / Elite hedge-mode order direction
 
@@ -163,6 +191,19 @@ Handling in Passivbot:
    semantics.
 
 ## Gate.io Futures
+
+### Exchange identity boundary
+
+Passivbot's canonical exchange identity is `gateio`. This identity owns connector
+routing, cache and event paths, broker attribution, and persisted state. CCXT 4.5.66
+renamed only its client class to `gate`.
+
+For compatibility, `api-keys.json` may specify either `"exchange": "gateio"` or
+`"exchange": "gate"`. Passivbot normalizes the latter to `gateio` and logs that
+migration. Only CCXT REST and WebSocket client construction translates `gateio` to
+`gate`; do not add parallel `gate` identities to internal registries or state paths.
+Normalize Gate's numeric REST account `user` value to a string before assigning it
+as CCXT Pro's private futures subscription UID.
 
 ### Contract order text must start with `t-`
 
@@ -233,6 +274,21 @@ Handling in Passivbot:
 Primary references: [WEEX V3 place-order API](https://www.weex.com/api-doc/contract/Transaction_API/PlaceOrder),
 [current-orders API](https://www.weex.com/api-doc/contract/Transaction_API/GetCurrentOrderStatus),
 and [account-balance API](https://www.weex.com/api-doc/contract/Account_API/GetAccountBalance).
+
+### API whitelist transport
+
+Problem: WEEX API keys accept IPv4 whitelist entries, while a dual-stack host
+may select its IPv6 source address for `api-contract.weex.com`. Public market
+data then works, but private endpoints reject the authenticated request with
+`-1056 ILLEGAL_IP` even when the host's public IPv4 address is whitelisted.
+
+Handling: Both the REST and WebSocket WEEX CCXT clients use IPv4-only network
+connectors. Keep the host's stable public IPv4 address in the API-key whitelist;
+do not interpret `-1056` as a credential, signature, or Passivbot fill-history
+failure.
+
+Primary references: [WEEX V3 error codes](https://www.weex.com/api-doc/contract/ExampleOfErrorCode)
+and [WEEX API integration preparation](https://www.weex.com/api-doc/spot/QuickStart/IntegrationPreparation).
 
 ### Market data and CCXT compatibility
 

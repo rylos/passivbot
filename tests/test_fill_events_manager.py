@@ -7,7 +7,7 @@ import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -2950,6 +2950,162 @@ async def test_bybit_fetcher_merges_pnl_and_batches(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_bybit_trade_fetch_traverses_empty_recent_windows():
+    day_ms = 24 * 60 * 60 * 1000
+    end_ms = 2_000_000_000_000
+    start_ms = end_ms - 14 * day_ms
+    older_trade = {
+        "id": "old-sparse",
+        "timestamp": start_ms + 2 * day_ms,
+        "amount": 0.1,
+        "price": 100.0,
+        "side": "buy",
+        "symbol": "BTC/USDT",
+        "info": {},
+    }
+    api = _FakeBybitAPI(
+        trades_batches=[[], [older_trade], []],
+        positions_batches=[],
+    )
+    fetcher = BybitFetcher(api, max_span_days=6.5)
+
+    trades = await fetcher._fetch_my_trades(start_ms, end_ms)
+
+    assert [trade["id"] for trade in trades] == ["old-sparse"]
+    assert len(api.trade_calls) == 3
+    assert api.trade_calls[1]["endTime"] == end_ms - fetcher._max_span_ms
+    assert api.trade_calls[2]["endTime"] == (
+        end_ms - 2 * fetcher._max_span_ms
+    )
+
+
+@pytest.mark.asyncio
+async def test_bybit_closed_pnl_uses_contiguous_cursor_paginated_windows():
+    day_ms = 24 * 60 * 60 * 1000
+    end_ms = 2_000_000_000_000
+    start_ms = end_ms - 14 * day_ms
+
+    def record(order_id: str, timestamp: int) -> Dict[str, object]:
+        return {
+            "symbol": "XMRUSDT",
+            "orderId": order_id,
+            "side": "Sell",
+            "closedPnl": "1.0",
+            "closedSize": "0.1",
+            "avgEntryPrice": "300.0",
+            "avgExitPrice": "310.0",
+            "updatedTime": str(timestamp),
+            "createdTime": str(timestamp),
+            "leverage": "1",
+        }
+
+    class _WindowedBybitAPI:
+        markets = {}
+
+        def __init__(self):
+            self.calls: List[Dict[str, object]] = []
+            self.responses = [
+                {
+                    "result": {
+                        "list": [record("recent-1", end_ms - day_ms)],
+                        "nextPageCursor": "recent-page-2",
+                    }
+                },
+                {
+                    "result": {
+                        "list": [record("recent-2", end_ms - 2 * day_ms)],
+                        "nextPageCursor": "",
+                    }
+                },
+                {"result": {"list": [], "nextPageCursor": ""}},
+                {
+                    "result": {
+                        "list": [record("old-sparse", start_ms + day_ms)],
+                        "nextPageCursor": "",
+                    }
+                },
+            ]
+
+        async def private_get_v5_position_closed_pnl(self, params):
+            self.calls.append(dict(params))
+            return self.responses.pop(0)
+
+    api = _WindowedBybitAPI()
+    fetcher = BybitFetcher(api, max_span_days=6.5)
+
+    positions = await fetcher._fetch_positions_history(start_ms, end_ms)
+
+    assert {row["info"]["orderId"] for row in positions} == {
+        "recent-1",
+        "recent-2",
+        "old-sparse",
+    }
+    assert len(api.calls) == 4
+    assert api.calls[1]["cursor"] == "recent-page-2"
+    assert api.calls[1]["startTime"] == api.calls[0]["startTime"]
+    assert api.calls[1]["endTime"] == api.calls[0]["endTime"]
+    window_calls = [api.calls[0], api.calls[2], api.calls[3]]
+    assert window_calls[1]["endTime"] == window_calls[0]["startTime"] - 1
+    assert window_calls[2]["endTime"] == window_calls[1]["startTime"] - 1
+    assert window_calls[-1]["startTime"] == start_ms
+    assert all(
+        call["endTime"] - call["startTime"] <= fetcher._max_span_ms
+        for call in window_calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_bybit_closed_pnl_fetch_propagates_api_error():
+    api = types.SimpleNamespace(
+        markets={},
+        private_get_v5_position_closed_pnl=AsyncMock(
+            side_effect=RuntimeError("closed-pnl unavailable")
+        ),
+    )
+    fetcher = BybitFetcher(api)
+
+    with pytest.raises(RuntimeError, match="closed-pnl unavailable"):
+        await fetcher._fetch_positions_history(1_900_000_000_000, 1_900_000_060_000)
+
+
+@pytest.mark.asyncio
+async def test_bybit_degraded_repair_uses_independent_trade_and_pnl_ranges():
+    fetcher = BybitFetcher(api=object())
+    trade_start_ms = 1_700_000_000_000
+    trade_end_ms = trade_start_ms + 15 * 60_000
+    pnl_start_ms = trade_start_ms + 3 * 86_400_000
+    pnl_end_ms = pnl_start_ms + 86_400_000
+    trade = {"id": "trade-1"}
+    position = {"id": "position-1"}
+    event = {
+        "id": "trade-1",
+        "timestamp": trade_start_ms + 60_000,
+    }
+    fetcher._fetch_my_trades = AsyncMock(return_value=[trade])
+    fetcher._fetch_positions_history = AsyncMock(return_value=[position])
+    fetcher._combine = MagicMock(return_value=[event])
+
+    out = await fetcher.fetch_degraded_pnl_repair(
+        trade_start_ms,
+        trade_end_ms,
+        pnl_start_ms,
+        pnl_end_ms,
+        detail_cache={},
+    )
+
+    assert len(out) == 1
+    assert out[0]["id"] == event["id"]
+    assert out[0]["timestamp"] == event["timestamp"]
+    fetcher._fetch_my_trades.assert_awaited_once_with(
+        trade_start_ms, trade_end_ms
+    )
+    fetcher._fetch_positions_history.assert_awaited_once_with(
+        pnl_start_ms, pnl_end_ms
+    )
+    fetcher._combine.assert_called_once_with([trade], [position], {})
+
+
+@pytest.mark.asyncio
 async def test_bybit_fetcher_uses_detail_cache(monkeypatch):
     base_ts = int(datetime.now(timezone.utc).timestamp() * 1000)
     trades_batches = [
@@ -4645,6 +4801,233 @@ async def test_manager_refresh_latest_skips_old_synthetic_pnl_repair_window(
 
 
 @pytest.mark.asyncio
+async def test_manager_targeted_repair_heals_old_degraded_pnl(tmp_path: Path):
+    cache_dir = tmp_path / "fills_old_degraded_targeted_repair"
+    now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+    entry_ts = now_ms - 28 * 24 * 60 * 60 * 1000
+    close_ts = entry_ts + 60_000
+    entry = dict(
+        id="entry",
+        timestamp=entry_ts,
+        datetime="",
+        symbol="SOL/USDT:USDT",
+        side="buy",
+        qty=5.0,
+        price=100.0,
+        pnl=0.0,
+        pnl_status="complete",
+        pb_order_type="entry_grid_long",
+        position_side="long",
+        client_order_id="cid-entry",
+    )
+    pending_close = dict(
+        id="close",
+        timestamp=close_ts,
+        datetime="",
+        symbol="SOL/USDT:USDT",
+        side="sell",
+        qty=-6.0,
+        price=103.0,
+        pnl=0.0,
+        pnl_status="pending",
+        pb_order_type="close_grid_long",
+        position_side="long",
+        client_order_id="cid-close",
+    )
+    authoritative_close = dict(pending_close)
+    authoritative_close["pnl"] = 12.0
+    authoritative_close["pnl_status"] = "complete"
+
+    class _RecordingFetcher(BaseFetcher):
+        def __init__(self):
+            self.calls: List[Tuple[Optional[int], Optional[int]]] = []
+            self.batches = [[entry, pending_close], [authoritative_close], []]
+
+        async def fetch(self, since_ms, until_ms, detail_cache, on_batch=None):
+            self.calls.append((since_ms, until_ms))
+            batch = [dict(event) for event in self.batches.pop(0)]
+            if since_ms is not None:
+                batch = [event for event in batch if event["timestamp"] >= since_ms]
+            if until_ms is not None:
+                batch = [event for event in batch if event["timestamp"] <= until_ms]
+            if on_batch and batch:
+                on_batch(batch)
+            return batch
+
+    fetcher = _RecordingFetcher()
+    manager = FillEventsManager(
+        exchange="bybit",
+        user="default",
+        fetcher=fetcher,
+        cache_path=cache_dir,
+        fee_pct_fallback=0.0,
+    )
+
+    await manager.refresh()
+    close = next(event for event in manager.get_events() if event.id == "close")
+    assert close.pnl_source == fem.PNL_SOURCE_SYNTHETIC_DEGRADED
+    assert close.pnl_synthetic_reason == "close_exceeds_known_position"
+    previous_refresh_ms = close_ts + 2 * 60 * 60 * 1000
+    metadata = manager.cache.load_metadata()
+    metadata["last_refresh_ms"] = previous_refresh_ms
+    manager.cache.save_metadata(metadata)
+
+    report = await manager.refresh_degraded_pnl_events(
+        start_ms=entry_ts - 60_000,
+        end_ms=now_ms,
+    )
+
+    assert fetcher.calls[1] == (
+        max(entry_ts - 60_000, close_ts - fem.PENDING_PNL_REFRESH_MARGIN_MS),
+        close_ts + fem.KUCOIN_POSITION_HISTORY_LOOKAHEAD_MS,
+    )
+    assert report == {
+        "attempted": True,
+        "before_count": 1,
+        "repaired_count": 1,
+        "remaining_count": 0,
+        "range_count": 1,
+        "total_range_count": 1,
+        "deferred_range_count": 0,
+    }
+    assert manager.cache.load_metadata()["last_refresh_ms"] == previous_refresh_ms
+    close = next(event for event in manager.get_events() if event.id == "close")
+    assert close.pnl == pytest.approx(12.0)
+    assert close.pnl_source == fem.PNL_SOURCE_AUTHORITATIVE
+    assert not FillEventsManager.degraded_pnl_events(manager.get_events())
+
+    overlap_ms = 60_000
+    await manager.refresh_latest(
+        overlap=20,
+        last_refresh_overlap_ms=overlap_ms,
+    )
+    assert fetcher.calls[2] == (previous_refresh_ms - overlap_ms, None)
+
+
+@pytest.mark.asyncio
+async def test_manager_degraded_pnl_repair_caps_and_rotates_ranges(tmp_path: Path):
+    manager = FillEventsManager(
+        exchange="bybit",
+        user="default",
+        fetcher=BaseFetcher(),
+        cache_path=tmp_path / "fills_degraded_repair_cap",
+    )
+    start_ms = 1_700_000_000_000
+    interval_spacing_ms = 60_000
+    manager._events = [
+        types.SimpleNamespace(
+            timestamp=start_ms + index * interval_spacing_ms,
+            pnl_source=fem.PNL_SOURCE_SYNTHETIC_DEGRADED,
+        )
+        for index in range(6)
+    ]
+    manager._loaded = True
+    manager.refresh = AsyncMock()
+
+    first = await manager.refresh_degraded_pnl_events(
+        start_ms=start_ms - 10 * 60_000,
+        end_ms=start_ms + 20 * 60_000,
+    )
+    first_calls = list(manager.refresh.await_args_list)
+
+    assert first["range_count"] == fem.DEGRADED_PNL_REPAIR_MAX_INTERVALS_PER_CYCLE
+    assert first["total_range_count"] == 6
+    assert first["deferred_range_count"] == 2
+    assert len(first_calls) == 4
+    assert all(call.kwargs["mark_refreshed"] is False for call in first_calls)
+    assert all(
+        call.kwargs["end_ms"] - call.kwargs["start_ms"]
+        <= fem.PENDING_PNL_REFRESH_MARGIN_MS
+        + fem.KUCOIN_POSITION_HISTORY_LOOKAHEAD_MS
+        for call in first_calls
+    )
+
+    manager.refresh.reset_mock()
+    second = await manager.refresh_degraded_pnl_events(
+        start_ms=start_ms - 10 * 60_000,
+        end_ms=start_ms + 20 * 60_000,
+    )
+    second_calls = list(manager.refresh.await_args_list)
+
+    assert second["range_count"] == 2
+    assert second["total_range_count"] == 6
+    assert second["deferred_range_count"] == 0
+    assert len(second_calls) == 2
+    assert {
+        (
+            call.kwargs["start_ms"],
+            call.kwargs["end_ms"],
+        )
+        for call in first_calls
+    }.isdisjoint(
+        {
+            (
+                call.kwargs["start_ms"],
+                call.kwargs["end_ms"],
+            )
+            for call in second_calls
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_manager_degraded_pnl_repair_advances_bounded_auxiliary_windows(
+    tmp_path: Path,
+):
+    class _DelayedPnlFetcher(BaseFetcher):
+        async def fetch_degraded_pnl_repair(self, *args, **kwargs):
+            return []
+
+    manager = FillEventsManager(
+        exchange="bybit",
+        user="default",
+        fetcher=_DelayedPnlFetcher(),
+        cache_path=tmp_path / "fills_degraded_delayed_aux",
+    )
+    event_ts = 1_700_000_000_000
+    upper_bound = event_ts + 3 * fem.DEGRADED_PNL_REPAIR_MAX_INTERVAL_SPAN_MS
+    manager._events = [
+        types.SimpleNamespace(
+            id="close-1",
+            source_ids=["trade-1"],
+            timestamp=event_ts,
+            pnl_source=fem.PNL_SOURCE_SYNTHETIC_DEGRADED,
+        )
+    ]
+    manager._loaded = True
+    manager.refresh = AsyncMock()
+
+    await manager.refresh_degraded_pnl_events(
+        start_ms=event_ts - 10 * 60_000,
+        end_ms=upper_bound,
+    )
+    first_aux_range = manager.refresh.await_args.kwargs[
+        "degraded_pnl_aux_range"
+    ]
+
+    manager.refresh.reset_mock()
+    await manager.refresh_degraded_pnl_events(
+        start_ms=event_ts - 10 * 60_000,
+        end_ms=upper_bound,
+    )
+    second_aux_range = manager.refresh.await_args.kwargs[
+        "degraded_pnl_aux_range"
+    ]
+
+    assert first_aux_range[1] - first_aux_range[0] <= (
+        fem.DEGRADED_PNL_REPAIR_MAX_INTERVAL_SPAN_MS
+    )
+    assert second_aux_range[0] == first_aux_range[1]
+    assert second_aux_range[1] > first_aux_range[1]
+    assert manager.refresh.await_args.kwargs["start_ms"] == (
+        event_ts - fem.PENDING_PNL_REFRESH_MARGIN_MS
+    )
+    assert manager.refresh.await_args.kwargs["end_ms"] == (
+        event_ts + fem.KUCOIN_POSITION_HISTORY_LOOKAHEAD_MS
+    )
+
+
+@pytest.mark.asyncio
 async def test_manager_synthesizes_pending_close_pnl_with_contract_value(
     tmp_path: Path, caplog
 ):
@@ -4822,6 +5205,39 @@ async def test_manager_refresh_records_successful_empty_refresh(tmp_path: Path):
     assert fetcher.calls == [(None, None)]
     assert metadata["last_refresh_ms"] > 0
     assert manager.get_events() == []
+
+
+@pytest.mark.asyncio
+async def test_manager_cache_load_does_not_advance_last_exchange_refresh(
+    tmp_path: Path, sample_events
+):
+    cache_dir = tmp_path / "fills_local_load_preserves_refresh"
+    cached = [FillEvent.from_dict(dict(event)) for event in sample_events]
+    cache = FillEventCache(cache_dir)
+    cache.save(cached)
+    previous_refresh_ms = sample_events[-1]["timestamp"] + 60_000
+    cache.save_metadata(
+        {
+            "last_refresh_ms": previous_refresh_ms,
+            "oldest_event_ts": sample_events[0]["timestamp"],
+            "newest_event_ts": sample_events[-1]["timestamp"],
+            "covered_start_ms": sample_events[0]["timestamp"],
+            "known_gaps": [],
+            "history_scope": "window",
+            "pnl_contract": fem.PNL_CONTRACT_CURRENT,
+        }
+    )
+    fetcher = _StaticFetcher([])
+    manager = FillEventsManager(
+        exchange="bitget",
+        user="default",
+        fetcher=fetcher,
+        cache_path=cache_dir,
+    )
+
+    await manager.ensure_loaded()
+
+    assert manager.cache.load_metadata()["last_refresh_ms"] == previous_refresh_ms
 
 
 @pytest.mark.asyncio

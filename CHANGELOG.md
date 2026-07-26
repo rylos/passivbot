@@ -4,6 +4,126 @@ All notable user-facing changes will be documented in this file.
 
 ## Unreleased
 
+- Binance and Bitget private order updates now use the connector's actual exchange hedge mode for
+  mandatory long/short attribution even when `live.hedge_mode=false` disables simultaneous
+  strategy exposure. Valid hedge-account updates no longer enter the one-way normalization path
+  and reconnect their watchers merely because native `reduceOnly` metadata is absent.
+
+- Live trailing fill confirmation can now recover from a polluted historical
+  `psize`/`pprice` residue when the exchange supplies an explicit position
+  opening timestamp. Recovery is restricted to a single identified opening fill
+  exactly matching both the opening and latest position-update timestamps, still
+  requires its zero-state after-state to match the authoritative position, and
+  emits an operator-visible fallback diagnostic only when confirmation actually
+  clears. Multi-fill cohorts, later updates, proximity-only matches, and generic
+  or update-only timestamps remain insufficient.
+
+- KuCoin REST and private WebSocket clients now use IPv4 transport so API keys
+  restricted to a host's stable public IPv4 address are not rejected when the
+  host also has IPv6 connectivity.
+
+- Gate.io live configuration now accepts CCXT's `gate` exchange label as an alias,
+  logs its normalization to Passivbot's canonical `gateio` identity, and consistently
+  selects the dedicated Gate.io connector. Standalone market loading now also
+  translates `gateio` to CCXT's renamed `gate` client without changing canonical
+  cache, broker, event, or persisted-state paths. Gate's numeric REST account UID
+  is normalized to the string required by CCXT Pro, preventing private order
+  WebSocket reconnect loops after otherwise successful startup.
+
+- Scope cancel-first create deferral to the symbol and position side of stale-order cancellations
+  in hedge mode, or the whole symbol in one-way mode, while retaining conservative account-wide
+  deferral for malformed unscoped cancellations.
+
+- Monitor `state.latest.json` snapshots now refresh from a serialized background
+  maintainer at least every five seconds, independently of successful planning
+  cycles. Prolonged authoritative-data or planning degradation therefore remains
+  visible without concurrent snapshot builds or any change to trading behavior.
+
+- Live fill recovery now performs bounded historical refetches around degraded
+  synthetic realized-PnL rows even when cache metadata already proves the configured
+  lookback. Repair-only fetches preserve the incremental checkpoint and rotate through
+  at most four independently bounded execution ranges per authoritative cycle. Bybit
+  repair also advances a separately bounded closed-PnL update-time window so delayed
+  records remain discoverable. Authoritative replacements are reported before later
+  fallible refresh work; uptime health adds the full authoritative PnL for cached rows
+  not previously counted by this process and applies a delta against the exact synthetic
+  amount counted at runtime. Outstanding synthetic accounting is discarded after
+  enrichment. Unresolved degraded rows defer risk planning with exponential backoff,
+  retain pending/degraded PnL counts in structured cycle diagnostics, and do not consume
+  the generic bot restart budget.
+
+- WEEX REST and private WebSocket clients now use IPv4 transport so API keys
+  bound to the host's public IPv4 address do not fail with `-1056 ILLEGAL_IP`
+  when a dual-stack host would otherwise select IPv6.
+
+- Documented Python 3.12 and 3.14 support, explicitly excluding Python 3.13 until its dependency
+  set is supported and bounding package metadata to those validated minor versions, and fixed
+  reentrant candle fetch-lock
+  cleanup so a missing bookkeeping record no longer suppresses an exception raised by the
+  protected operation. CI now builds the Rust extension and runs the Python suite on both Python
+  3.12 and 3.14. Reentrancy is now restricted to the owning asyncio task, so parallel requests
+  sharing one candle manager serialize same-symbol/timeframe fetches correctly. Installation
+  examples now create the venv with the explicitly selected supported interpreter instead of
+  assuming the system `python3` points to it.
+
+- Reduced Hyperliquid account-state refresh churn by recovering websocket order-update semantics
+  from Passivbot's own acknowledged order record when the exchange order id matches exactly.
+  Every supplied native, unified, and client identity must agree, along with existing websocket
+  side, raw side, raw status, position-side, and reduce-only metadata. This includes
+  Hyperliquid-native `oid` and `cloid` identities, with `cloid` retained in acknowledged-order
+  records. Recovered partial-fill updates force an authoritative refresh; ambiguous,
+  contradictory, and foreign updates still fail closed.
+
+- Backtests now treat a finite balance depleted by fills as liquidation before recomputing orders,
+  so extreme optimizer candidates terminate normally instead of panicking an optimizer worker.
+  Other invalid orchestrator inputs now propagate as backtest errors without unwinding Rust.
+
+- Live fill confirmation now preserves the last successful exchange-refresh timestamp while
+  loading or repairing local fill caches, widens fill-history fetches with bounded backoff when a
+  position remains tied to a stale or mismatched fill, starting before the earliest available
+  position/open timestamp even when that predates the configured PnL window. Affected trailing
+  positions remain fail-closed until refreshed history reconstructs a post-fill state matching
+  exchange state; price and quantity alone cannot prove a flat-to-position transition. Id-less
+  fills use stable content-based identities rather than history-list indices. Position snapshots
+  preserve distinct exchange opening times, while timestamp-free positions retry with
+  progressively wider history windows outside the account-wide execution barrier, so only the
+  affected trailing coin and position side remain nontradable between attempts.
+  Widening starts only in background recovery after the required recent post-snapshot confirmation,
+  tracks progress per coin and position side, and is capped by connector pagination capacity
+  (two years on Bybit, otherwise one year) to avoid unbounded exchange pagination. Sparse Bybit
+  trade history now traverses empty recent windows instead of stopping before older fills, while
+  stale fill state remains part of the blocking authoritative refresh rather than being displaced
+  by a background recovery.
+
+- Bybit closed-PnL refreshes now cover requested history with explicit,
+  contiguous sub-seven-day windows and cursor pagination inside each window.
+  Sparse pages no longer create gaps in older realized-PnL history, and endpoint
+  or pagination failures propagate instead of returning a partial result as a
+  successful refresh.
+
+- Unexpected PyMoo worker failures and process exits now abort optimization visibly instead of
+  leaving the optimizer polling forever for a lost result.
+
+- Live candle orchestration now reads bounded cache-only native 1h EMA carry-forward from the 1h
+  index, requires a complete native window, isolates carried values from the active EMA cache, and
+  applies the background refresher's surface-count staleness limit using the active live/replay
+  clock. A minute-boundary open-tail projection is also retried before reusing a previous close
+  EMA, avoiding transient candidate drops and unnecessary close-EMA fallback on WEEX and other
+  exchanges without weakening active-symbol fail-closed behavior.
+
+- Optimizer suites may set `optimize.objective_scenario` (or
+  `--objective-scenario LABEL`) to score performance objectives on one named scenario while
+  continuing to enforce limits against configured suite aggregates. Suite scenario labels must
+  now be unique. Dataset preparation restricts exchange-specific preloads to the union of
+  explicitly requested scenario coins when every assigned scenario names its coins. Resume
+  validation rejects objective-scenario changes, including old results that predate the setting.
+
+- `passivbot tool crash-finder` can discover ordered low-to-later-high pumps as well as
+  high-to-later-low crashes via `--direction up|both`. Generated idiosyncratic stress scenarios
+  may use `--scenario-force-normal adverse` to isolate long exposure during crashes and short
+  exposure during pumps. CSV regeneration preserves all stored directions unless explicitly
+  filtered with `--direction`.
+
 - Canonical live-event payloads now make a bounded JSON-compatible copy at construction time,
   revalidate that copy at persistence boundaries, redact sensitive keys before retention, and
   record aggregate truncation metadata only when a limit applies. Event identity, routing, monitor

@@ -43,6 +43,7 @@ async def refresh_protective_authoritative_state(bot) -> bool:
     bot._begin_authoritative_refresh_epoch()
     bot._last_authoritative_block_reason = None
     bot._last_authoritative_pending_pnl_count = 0
+    bot._last_authoritative_degraded_pnl_count = 0
     plan = {"balance", "positions", "open_orders"}
     bot._authoritative_refresh_plan_surfaces = set(plan)
     snapshot = await bot._fetch_authoritative_state_staged_snapshot(plan)
@@ -88,6 +89,7 @@ async def refresh_authoritative_state_staged(bot) -> bool:
     """Refresh live account state through the staged authoritative cohort."""
     bot._last_authoritative_block_reason = None
     bot._last_authoritative_pending_pnl_count = 0
+    bot._last_authoritative_degraded_pnl_count = 0
     plan = bot._authoritative_staged_refresh_plan()
     snapshot = await bot._fetch_authoritative_state_staged_snapshot(plan)
     fetched_balance = snapshot.get("balance")
@@ -101,9 +103,16 @@ async def refresh_authoritative_state_staged(bot) -> bool:
     if "open_orders" in plan and fetched_open_orders in [None, False]:
         return False
     if "fills" in plan and not pnls_ok:
-        bot._last_authoritative_block_reason = "pending_pnl"
         bot._last_authoritative_pending_pnl_count = int(
             snapshot.get("pending_pnl_count", 0) or 0
+        )
+        bot._last_authoritative_degraded_pnl_count = int(
+            snapshot.get("degraded_pnl_count", 0) or 0
+        )
+        bot._last_authoritative_block_reason = (
+            "degraded_pnl"
+            if bot._last_authoritative_degraded_pnl_count
+            else "pending_pnl"
         )
         return False
     prepared_balance_snapshot = None
@@ -196,8 +205,16 @@ async def capture_positions_staged_snapshot(bot) -> tuple[object, list[dict]]:
 def authoritative_staged_refresh_plan(bot) -> set[str]:
     """Return the minimal staged authoritative surfaces needed this cycle."""
     pending = set(getattr(bot, "_authoritative_pending_confirmations", {}) or {})
+    trailing_recovery_due = getattr(
+        bot, "_trailing_fill_recovery_prefetch_due", None
+    )
+    should_prefetch_trailing_recovery = bool(
+        callable(trailing_recovery_due) and trailing_recovery_due()
+    )
     if pending == {"open_orders"}:
         plan = {"open_orders"}
+        if should_prefetch_trailing_recovery:
+            bot._schedule_routine_fill_refresh_prefetch(reason="trailing_recovery")
         bot._authoritative_refresh_plan_surfaces = set(plan)
         return plan
     plan = {"balance", "positions", "open_orders", "fills"}
@@ -209,6 +226,17 @@ def authoritative_staged_refresh_plan(bot) -> set[str]:
         if not coverage_ready:
             logging.debug(
                 "[state] staged fills refresh required: risk lookback coverage unproven"
+            )
+        elif (
+            should_prefetch_trailing_recovery
+            and bot._staged_fills_can_prefetch_routine()
+            and bot._schedule_routine_fill_refresh_prefetch(
+                reason="trailing_recovery"
+            )
+        ):
+            plan.discard("fills")
+            logging.debug(
+                "[state] trailing fill recovery scheduled outside blocking staged refresh"
             )
         elif not bot._staged_fills_refresh_due():
             plan.discard("fills")
@@ -715,5 +743,8 @@ async def fetch_authoritative_state_staged_snapshot(bot, plan: set[str]) -> dict
             out["pnls_ok"] = result
             out["pending_pnl_count"] = int(
                 getattr(bot, "_last_fill_refresh_pending_pnl_count", 0) or 0
+            )
+            out["degraded_pnl_count"] = int(
+                getattr(bot, "_last_fill_refresh_degraded_pnl_count", 0) or 0
             )
     return out

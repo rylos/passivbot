@@ -223,6 +223,7 @@ class _LockRecord:
     count: int
     acquired_at: float
     path: str
+    owner_task: Optional[asyncio.Task[Any]]
 
 
 class GapEntry(TypedDict, total=False):
@@ -837,7 +838,9 @@ class CandlestickManager:
         self._lock_backoff_initial = float(_LOCK_BACKOFF_INITIAL)
         self._lock_backoff_max = float(_LOCK_BACKOFF_MAX)
         self._lock_hold_timeout_seconds = max(60.0, self._lock_timeout_seconds * 6.0)
-        # Reentrant bookkeeping for portalocker fetch locks: key -> _LockRecord
+        # Reentrant bookkeeping for portalocker fetch locks: key -> _LockRecord.
+        # Reentrancy is valid only within the owning asyncio task; a different
+        # coroutine using this manager must wait for the same symbol/timeframe.
         self._held_fetch_locks: Dict[Tuple[str, str], _LockRecord] = {}
         self._fetch_lock_watchdogs: Dict[Tuple[str, str], asyncio.Task] = {}
         self._shutdown_guard = threading.Lock()
@@ -1921,13 +1924,15 @@ class CandlestickManager:
 
         lock_path = self._fetch_lock_path(symbol, tf_norm)
         key = (symbol, tf_norm)
+        current_task = asyncio.current_task()
         held = self._held_fetch_locks.get(key)
-        if held is not None:
+        if held is not None and held.owner_task is current_task:
             self._held_fetch_locks[key] = _LockRecord(
                 lock=held.lock,
                 path=held.path,
                 count=held.count + 1,
                 acquired_at=held.acquired_at,
+                owner_task=held.owner_task,
             )
             self._log(
                 "debug",
@@ -1940,18 +1945,17 @@ class CandlestickManager:
                 yield
             finally:
                 record = self._held_fetch_locks.get(key)
-                if record is None:
-                    return
-                if record.count <= 1:
+                if record is not None and record.count <= 1:
                     self._held_fetch_locks.pop(key, None)
                     self._cancel_fetch_lock_watchdog(key)
                     await self._release_lock(record.lock, record.path, symbol, tf_norm)
-                else:
+                elif record is not None:
                     self._held_fetch_locks[key] = _LockRecord(
                         lock=record.lock,
                         path=record.path,
                         count=record.count - 1,
                         acquired_at=record.acquired_at,
+                        owner_task=record.owner_task,
                     )
             return
 
@@ -1978,6 +1982,7 @@ class CandlestickManager:
                     path=lock_path,
                     count=1,
                     acquired_at=acquired_at,
+                    owner_task=current_task,
                 )
                 self._start_fetch_lock_watchdog(
                     key,
@@ -3670,12 +3675,28 @@ class CandlestickManager:
         """Public helper to read last refresh timestamp (ms) from index metadata."""
         return self._get_last_refresh_ms(symbol)
 
-    def get_last_final_ts(self, symbol: str) -> int:
-        """Return last finalized candle timestamp (ms) seen for this symbol, or 0 if unknown."""
-        idx = self._ensure_symbol_index(symbol)
+    def get_last_final_ts(
+        self,
+        symbol: str,
+        timeframe: Optional[str] = None,
+        *,
+        tf: Optional[str] = None,
+    ) -> int:
+        """Return the last locally cached finalized timestamp for one timeframe."""
+        idx = self._ensure_symbol_index(symbol, timeframe=timeframe, tf=tf)
         try:
-            return int(idx.get("meta", {}).get("last_final_ts", 0))
+            last_final = int(idx.get("meta", {}).get("last_final_ts", 0) or 0)
         except Exception:
+            last_final = 0
+        if last_final > 0:
+            return last_final
+        try:
+            return max(
+                int(shard.get("max_ts", 0) or 0)
+                for shard in (idx.get("shards", {}) or {}).values()
+                if isinstance(shard, dict)
+            )
+        except (TypeError, ValueError):
             return 0
 
     def _set_last_refresh_meta(
@@ -7161,7 +7182,10 @@ class CandlestickManager:
         normalized = self._normalize_spans_by_metric(spans_by_metric)
         if not normalized:
             return {}
-        last_cached = _floor_minute(int(self.get_last_final_ts(symbol) or 0))
+        last_cached = int(
+            self.get_last_final_ts(symbol, timeframe=timeframe) or 0
+        )
+        last_cached = (last_cached // period_ms) * period_ms
         if last_cached <= 0:
             return {}
         latest_expected = (int(self._now_ms()) // period_ms) * period_ms - period_ms
@@ -7191,18 +7215,12 @@ class CandlestickManager:
             fill_trailing_gaps=False,
             allow_remote_fetch=False,
         )
-        if raw.size == 0 or not self._ema_window_has_required_coverage(
-            raw,
-            start_ts,
-            int(last_cached),
-            timeframe=timeframe,
+        if raw.size == 0 or not candle_range_has_full_coverage(
+            raw, start_ts, int(last_cached), timeframe=timeframe
         ):
             return {}
 
         out: Dict[str, float] = {}
-        tf_key = str(period_ms)
-        now = self._now_ms()
-        cache = self._ema_cache.setdefault(symbol, {})
         for metric_key, spans in normalized.items():
             for span in spans:
                 span_candles = max(1, int(math.ceil(span)))
@@ -7228,11 +7246,6 @@ class CandlestickManager:
                 val = float(self._ema(series, span))
                 if math.isfinite(val):
                     out[str(metric_key)] = val
-                    cache[(str(metric_key), float(span), tf_key)] = (
-                        val,
-                        int(last_cached),
-                        int(now),
-                    )
         return out
 
     async def _latest_finalized_range(
@@ -8074,6 +8087,15 @@ class CandlestickManager:
             "count": int(arr.shape[0]),
             "crc32": crc,
         }
+        meta = idx.setdefault("meta", {})
+        meta["last_final_ts"] = max(
+            int(meta.get("last_final_ts", 0) or 0),
+            int(arr[-1]["ts"]),
+        )
+        observed_start = meta.get("observed_start_ts", meta.get("inception_ts"))
+        if observed_start is None or int(arr[0]["ts"]) < int(observed_start):
+            meta["observed_start_ts"] = int(arr[0]["ts"])
+            meta["inception_ts"] = int(arr[0]["ts"])
         key = f"{symbol}::{tf_norm}"
         self._index[key] = idx
 

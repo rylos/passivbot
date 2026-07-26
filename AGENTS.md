@@ -17,6 +17,19 @@ The local `fake` exchange harness is deterministic and offline. Public unauthent
 probes use real networks but no account credentials; state that clearly before running them.
 Testnet, sandbox, demo, and paper-trading modes are not assumed safe or unauthenticated.
 
+## Public Repository Data Boundary
+
+Treat material specific to a local environment, private host, account, or operator as private unless
+the user explicitly identifies that exact material as intended for public release. Never commit or
+push private credentials, configs, logs, telemetry, debugging output, optimization results, dumps,
+or artifacts copied or derived from private VPSs to a public repository.
+
+Configuration files are private by default. The only configs that may be published without
+case-specific approval are the repository's intentionally public template/example configs under
+`configs/examples/`. A new config outside that established public set requires explicit user
+authorization before it is committed or pushed. Keep private inputs outside the tracked tree and
+redact any derived evidence that is appropriate to publish.
+
 ## Instruction Precedence
 
 When instructions conflict, use this order:
