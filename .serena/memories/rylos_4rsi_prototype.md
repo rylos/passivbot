@@ -1,0 +1,24 @@
+# Prototipo RyLoS 4RSI (branch rylos-4rsi-proto)
+
+Porta in passivbot v8 l'entry della strategia RyLoS Classic di freqtrade (`~/dev/freqtrade/user_data/strategies/`) e l'exit 4RSI, timeframe 5m, solo lato long. Doc completa: `RYLOS_4RSI_PROTO.md` in root.
+
+## Segnale
+- `osc_4rsi` = media(RSI2, RSI7, RSI14) − 50 (Wilder, seed compatibile talib, match < 1e-13).
+- `stoch_k` = fast %D di STOCHF(14,3) = SMA(3) dello stocastico raw.
+- Colore candela 5m: open = close della 5m precedente (i dati HLCV non hanno open).
+- Entry gate (solo initial entry, size==0): osc < soglia AND stoch < soglia AND candela rossa.
+- Exit: osc > soglia AND stoch > soglia AND candela verde AND gain prezzo > `exit_min_gain` → chiusura totale via `calc_panic_close` (`close_panic_long` = limit aggressivo a 1 tick sotto il best ask, NON market; vedi `orchestrator.rs::calc_panic_close`).
+
+## Architettura
+- Indicatori precalcolati in Python: `src/rylos_signal.py` (backtest: array (T,N,3) con warmup NaN; live: `compute_rylos_signal_live`, min 100 candele 5m ≈ 8h20m di storico, scaricato all'avvio).
+- Soglie in Rust: `BotParams` campi `rylos_*` (`types.rs`), gruppo config `bot.long.rylos_4rsi` (`src/config/shared_bot.py`, `schema.py`), ottimizzabili via `optimize.bounds.long.rylos_4rsi.*` (`optimize_bounds.py`; default pinnati lo=hi ai valori config freqtrade 5371 → zero dimensioni extra se non allargati).
+- Gate unico nell'orchestrator Rust (`rylos_entry_allowed` / `rylos_exit_triggered`), identico backtest/live. Segnale mancante/NaN → blocca solo l'initial entry (fail-closed).
+- Live: stateless e restart-safe — ricalcolo a ogni ciclo dalle candele 1m del CandlestickManager (`_compute_rylos_signals` in `src/passivbot.py`).
+- `enabled: false` (default) ≡ comportamento master identico, verificato.
+- Cache indicatori nell'optimizer: `_rylos_indicators_cache` module-level in `src/backtest.py` (chiave: id hlcvs + shape + primo ts + config).
+
+## Vincoli noti
+- `candle_interval_minutes` deve restare 1.
+- `exit_min_gain` è sul PREZZO (0.0103 ≈ min_profit 4.1% / leva 4 di freqtrade).
+- Allineamento no-lookahead: valori 5m disponibili alla riga 1m che chiude la candela (minute_idx % 5 == 4).
+- Dopo l'exit il bot resta flat finché non torna il segnale d'ingresso (diverso dal master che rientra subito).
