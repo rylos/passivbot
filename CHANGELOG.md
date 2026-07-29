@@ -4,6 +4,195 @@ All notable user-facing changes will be documented in this file.
 
 ## Unreleased
 
+- Fills sharing a single millisecond are now ordered by the position chain the exchange reports
+  with each fill instead of by arbitrary response order. Hyperliquid emits a `startPosition` per
+  fill, so a cohort executed within one millisecond forms an unambiguous chain; previously the
+  cached order could end on a fill whose after-state was not the account's final position, leaving
+  live trailing confirmation permanently in `fill_after_state_mismatch` and the symbol nontradable
+  until an unrelated new fill arrived. Trailing anchor selection also prefers the chain terminal, so
+  caches already written out of order recover without a rewrite. Cohorts without chain evidence keep
+  their existing order.
+
+- WEEX Futures orders now carry Passivbot's registered broker ID in the required
+  `newClientOrderId` prefix while preserving Passivbot order-type markers for
+  reconciliation and fill diagnostics.
+- Retired the diagnostic-only Python planning-availability Cartesian product
+  and its routine `planning.symbol_state` event. Snapshot provenance, actual
+  planning deferrals, EMA degradation, Rust results, reconciliation, and
+  initial-entry outcomes remain available through their canonical structured
+  events; live trading and readiness enforcement are unchanged.
+- Optimizer suites may now select the scoring basis independently for each objective. A scoring
+  entry may set `scenario` to a named suite scenario, set it explicitly to `null` to use suite
+  aggregation, and optionally set `aggregate` to `mean`, `min`, `max`, `std`, or `median`.
+  Omitting `scenario` inherits `optimize.objective_scenario`; aggregate objectives without an
+  explicit reducer inherit the metric-specific or default `backtest.aggregate` rule. Limits remain
+  suite-aggregated.
+- Live EMA preparation now batches compatible spans per symbol and metric family, including bounded
+  cache-only fallbacks for stale forager candidates, and complete candle windows bypass redundant
+  Python gap reconstruction. A failed combined read retries each span through its primary reader
+  before using bounded fallback, preserving shorter complete EMA windows. Batched cache-only
+  fallbacks likewise validate coverage per span so a missing long-window prefix does not discard a
+  complete shorter fallback. Metadata-only candle refreshes no longer invalidate otherwise
+  identical open-tail projections, while candle-content and known-gap changes written by another
+  bot process invalidate the affected cached projection. This removes repeated candle-window loads
+  and projection recomputation. The final scalar EMA recurrence now runs in the Rust extension with
+  the same sequential floating-point and non-finite-sample semantics, without changing
+  completed-candle freshness, gap handling, or EMA math.
+- KuCoin aggregate position-cycle PnL reconciliation is now idempotent across overlapping fill
+  refreshes: a pending trade row no longer discards an already reconciled authoritative value, while
+  a genuinely revised position-history total still updates the affected lifecycle.
+- The in-memory order replacement churn gate now emits a compact account-wide admission-reason
+  summary every ten minutes, distinguishing allowed near-market, stable/new, risk-critical, and
+  allowance-backed creations from deferred candidates.
+- Gate multi-currency futures balance now remains stable while resting orders reserve and release
+  margin, preventing balance-driven ideal-order resizing and reconciliation churn. Passivbot
+  reconstructs account margin balance from Gate's available, position-margin, and order-margin
+  fields instead of treating available margin as equity.
+- KuCoin 1m sparse-gap repair now immediately includes the nearest real candle on both sides of an
+  unresolved interval, allowing one successful exchange payload to prove and materialize genuine
+  no-trade minutes without first exhausting empty-range retries or waiting seven days. Empty,
+  one-sided, malformed, or partially recovered responses are never converted into candles. Failed
+  contextual verification preserves the unresolved gap and starts an independent bounded proof
+  cooldown instead of consuming REST capacity on every candle read. Background forager
+  refreshes also back off unchanged empty tails without ERROR spam while unexpected failures
+  remain loud.
+- Trailing extrema now use the configured bounded active-candle tail projection for a missing open
+  1m tail after otherwise dense post-fill coverage. The temporary flat zero-volume rows are not
+  persisted, delayed real candles replace them on the next cycle, and leading, internal, or
+  over-limit gaps still make trailing state unavailable. Structured diagnostics identify the
+  trailing consumer, symbol, position side, projection bounds, and consecutive fallback uses.
+
+- Flat forager-selected symbols with resting entries now degrade to nontradable when required EMA
+  inputs are temporarily unavailable, allowing normal reconciliation to cancel the stale entry
+  instead of repeatedly crashing and restarting the whole live bot. Held positions and explicitly
+  configured normal modes retain their strict required-input behavior. Bounded open-ended 1m gaps
+  continue using provisional in-memory EMA projection even when retry metadata records the missing
+  tail, so symbols remain tradable through the configured active-tail grace period and recover
+  immediately when authoritative candles arrive. The same bounded open-tail policy now applies to
+  stock perps instead of granting them an unbounded no-trade-tail exception. EMA reads also
+  provisionally bridge unresolved gaps already bounded by later authoritative candles without
+  persisting them, recompute when delayed real rows arrive, and refuse gaps wider than the live
+  active-tail bound. Cache-only forager ranking carry-forward does not project unresolved internal
+  gaps. Mixed fixed/forager sides retain strict readiness for the fixed side, and a dynamically
+  managed resting entry is still cancelled if close, strategy, or ranking EMA degradation changes
+  its side to the configured manual stop mode. A disabled opposite side no longer misclassifies an
+  otherwise dynamic forager symbol as fixed-normal. Ranking degradation retires entries only on
+  the affected side, while dynamic-forager eligibility survives the resulting symbol-level manual
+  stop so a later identical ranking gap does not become an account-wide error. Failed or ambiguous
+  cancellation attempts are retried only for the exact proven
+  exchange/client order ID, including when an exchange ID appears after the client ID and after EMA
+  recovery, without weakening ownership for orders first observed after the side enters manual or
+  ordinary tp-only mode. Cache-only candidate close EMAs and completed-candle forager ranking
+  metrics cannot reuse provisional active-strategy cache values; active-symbol quote-volume and
+  log-range ranking reads are equally strict and remain separate from provisional strategy
+  log-range inputs. Temporary bot-managed entry
+  overrides such as HSL graceful-stop retain the same flat-symbol degradation behavior instead of
+  promoting missing EMA inputs into an account-wide restart loop. Budget-derived forager ranking
+  staleness also retains the active-tail grace period (10 minutes by default), so a large refresh
+  budget cannot make flat candidates nontradable after only one or two missing completed candles.
+
+- Supported CCXT private order streams now isolate malformed semantic rows from websocket
+  transport health: unnormalizable rows are discarded with a bounded warning and force an
+  authoritative account-state refresh, while valid rows in the same message are processed without
+  reconnecting. Bitget side-attribution failures now use this path without logging raw payloads.
+- Binance's explicit `MarginModeAlreadySet` response is now treated as a successful configuration
+  no-op at DEBUG instead of an ERROR; unknown margin-mode failures retain their existing loud
+  handling.
+
+- KuCoin private order updates now use the connector's actual exchange hedge mode for mandatory
+  long/short attribution even when `live.hedge_mode=false` disables simultaneous strategy
+  exposure, preventing valid updates without one-way `reduceOnly` metadata from reconnecting the
+  watcher. Hedge-mode close-only effect now follows KuCoin's authoritative side plus position-side
+  tuple when `reduceOnly` is omitted. KuCoin native higher-timeframe no-tick gaps are materialized
+  only when bounded by real candles, absent from one successful raw payload, and no wider than the
+  fixed 120-minute live connector policy, restoring required 1h volatility EMA readiness without
+  allowing the simulation-only backtest gap setting to alter live behavior. Rejected or
+  unidentifiable rows break payload continuity, expansion is bounded to the requested range, and
+  later real candles deterministically replace persisted synthetic buckets. A later rejected real
+  payload row evicts a cached sparse placeholder at the same timestamp; an unidentifiable rejection
+  evicts cached placeholders between accepted page bounds or across the remaining requested range
+  when those bounds are unavailable. Eviction also recomputes native-timeframe cache index bounds.
+
+- Hyperliquid recent candle gaps now retry on a time-spaced schedule instead of
+  exhausting the persistent-gap budget in consecutive live cycles while the
+  venue may still publish an authoritative no-trade row. Accelerated retries are
+  limited to bounded tail-sized gaps, and the retry decision now precedes ordinary
+  present and tail-completion fetches without suppressing newly finalized candles
+  beyond the deferred gap or repair of unrelated internal gaps. Deferred
+  unverified rows remain absent from returned candle continuity rather than
+  becoming synthetic zero-volume candles even when their retry is due or remote
+  fetching is disabled. Targeted retries and day-coalesced historical fetches
+  split around deferred ranges. Forced 1m candidate refreshes now detect partial
+  pagination followed by an empty terminal page, allowing repeated failures to
+  use the bounded in-memory retry delay without misclassifying complete
+  overlap-pagination fetches. Persisted 1m rows trim or split stale known-gap
+  metadata; unresolved remainders are deferred after partial recovery. Missing
+  rows remain unavailable and are never fabricated by this recovery path, and
+  large deferred ranges remain interval-based rather than expanding into one
+  Python object per minute. Failed recent Hyperliquid persistent-gap retries
+  retain the persistent retry cadence, and forced overlap refreshes split around
+  deferred internal gaps. Gap retry metadata follows the manager's replay/live
+  clock, partial historical pages flush their deferred index before propagating
+  failure, and unresolved internal gaps keep dependent EMA windows unavailable.
+  Overlap refreshes now stamp any attempted-but-unresolved known-gap remainder
+  before later repair stages can retry it in the same request. Newly recorded
+  1m gaps invalidate affected EMA/projection caches, while complete authoritative
+  rows remain usable if stale gap metadata has not yet been trimmed.
+
+- Binance and KuCoin private order streams now recover sparse Passivbot-owned
+  hedge-mode updates only when the encoded client-order position side has an
+  exact identity in this process's emitted-order registry, native position-side
+  metadata is absent, and all supplied order identities agree with the same
+  emitted record. Acknowledged identities remain registered while their orders
+  are open, including orders resting longer than the normal foreign-writer
+  lookback. Recovered updates force an authoritative account refresh without
+  weakening strict REST open-order reconciliation. Genuine transport failures
+  retain the existing bounded reconnect backoff.
+
+- Forager monitor health now distinguishes approved candidates that are
+  temporarily unrankable because volume/log-range or required candidate EMA
+  inputs are unavailable from active-symbol trading degradation. Ranking-feature
+  health is populated by the active Rust-orchestrator preparation path, candidate
+  labels use the same market-age and effective-minimum-cost eligibility as live
+  selection, all EMA health is cleared before a failed replacement bundle can
+  leave stale state behind, candidates remain explicitly unrankable until a
+  bundle completes, and active-symbol EMA failures retain their active
+  degradation reason. Open-tail forager projection computes only close EMAs
+  because ranking metrics must come from real candles, and latest-value EMA
+  calculations avoid allocating an unused full series.
+
+- Live trailing fill confirmation now accepts reconstructed position-price
+  differences of at most one effective executable price tick to accommodate
+  exchange rounding or truncation of sub-tick VWAPs, including Hyperliquid's
+  significant-digit price ladder and its asymmetric spacing across powers of
+  ten. Fill identity and reconstructed position size remain strict, the explicit
+  position-opening replay retains its ordinary half-tick requirement, larger
+  discrepancies remain fail-closed, and acceptance beyond the ordinary half-tick
+  comparison emits one warning plus a structured diagnostic when confirmation
+  clears.
+
+- Live order-write failures now include bounded, sanitized exchange status, code,
+  label, and reason fields when CCXT exposes a structured rejection payload through
+  either an exception or a terminal result mapping, including OKX per-order
+  `sCode`/`sMsg` details. Successful outcomes retain ordinary result summaries
+  without misclassifying native success codes/messages as errors.
+  Sensitive-marked values and long identifier-like tokens remain redacted; the
+  existing bot restart error budget is unchanged.
+
+- Gate.io now applies the configured leverage and margin mode before a symbol's
+  first order creation. This refreshes Gate's leverage-derived position risk limit
+  after contract risk-table changes instead of repeatedly failing valid orders
+  with a zero risk limit. An hourly market refresh invalidates the configured
+  marker when the effective leverage cap changes so the next entry refreshes
+  the exchange configuration.
+  A failed refresh blocks entries and advances the existing restart budget,
+  while reduce-only closes remain eligible. Churn admission and the later
+  configuration write now share one retry-eligibility timestamp so a backoff
+  expiring mid-wave cannot introduce an unreserved signed action. Missing or
+  invalid leverage-cap metadata is isolated to the affected symbol: entries
+  remain pending and restart-visible, but market initialization and protective
+  closes continue.
+
 - Binance and Bitget private order updates now use the connector's actual exchange hedge mode for
   mandatory long/short attribution even when `live.hedge_mode=false` disables simultaneous
   strategy exposure. Valid hedge-account updates no longer enter the one-way normalization path

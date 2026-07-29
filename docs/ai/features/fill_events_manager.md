@@ -104,6 +104,11 @@ logs, runtime windows, and immutable manifests.
    checkpoint. Bybit keeps the execution-time range narrow while rotating a separate
    closed-PnL `updatedTime` range toward the present; each auxiliary range spans at most
    one day.
+6. Fills sharing one millisecond carry no execution order in exchange responses or caches, yet
+   position reconstruction replays them in list order. When the exchange reports the position size
+   preceding each fill (Hyperliquid `startPosition`), the cohort is reordered along that chain
+   before annotation so the last cached fill's after-state is the account's actual position.
+   Cohorts without chain evidence, or whose chain is ambiguous, keep their existing order.
 
 ## Failure Semantics And Risks
 
