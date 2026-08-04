@@ -195,6 +195,45 @@ def test_limit_order_create_market_distance_default_and_validation():
             validate_config(invalid, verbose=False)
 
 
+def test_exchange_symbol_unavailable_cooldown_default_and_validation():
+    from config.schema import MAX_EXCHANGE_SYMBOL_UNAVAILABLE_COOLDOWN_HOURS
+
+    config = get_template_config()
+
+    assert config["live"]["exchange_symbol_unavailable_cooldown_hours"] == pytest.approx(
+        6.0
+    )
+    validate_config(config, verbose=False)
+
+    for value in (
+        True,
+        -0.01,
+        float("nan"),
+        float("inf"),
+        1e308,
+        MAX_EXCHANGE_SYMBOL_UNAVAILABLE_COOLDOWN_HOURS + 1.0,
+        "invalid",
+    ):
+        invalid = get_template_config()
+        invalid["live"]["exchange_symbol_unavailable_cooldown_hours"] = value
+
+        with pytest.raises(
+            (TypeError, ValueError),
+            match="exchange_symbol_unavailable_cooldown_hours",
+        ):
+            validate_config(invalid, verbose=False)
+
+    disabled = get_template_config()
+    disabled["live"]["exchange_symbol_unavailable_cooldown_hours"] = 0.0
+    validate_config(disabled, verbose=False)
+
+    maximum = get_template_config()
+    maximum["live"]["exchange_symbol_unavailable_cooldown_hours"] = (
+        MAX_EXCHANGE_SYMBOL_UNAVAILABLE_COOLDOWN_HOURS
+    )
+    validate_config(maximum, verbose=False)
+
+
 def test_order_replacement_churn_gate_defaults_and_validation():
     config = get_template_config()
     live = config["live"]
@@ -202,26 +241,32 @@ def test_order_replacement_churn_gate_defaults_and_validation():
     assert live["order_replacement_churn_gate_window_minutes"] == pytest.approx(10.0)
     assert live["order_replacement_churn_gate_stability_minutes"] == pytest.approx(2.0)
     assert live["order_replacement_churn_gate_market_dist_pct"] == pytest.approx(0.005)
-    assert live["order_replacement_churn_gate_tracking_tolerance_pct"] == pytest.approx(
-        0.002
-    )
+    assert live["order_match_tolerance_pct"] == pytest.approx(0.0002)
     validate_config(config, verbose=False)
 
     invalid_cases = (
+        ("order_match_tolerance_pct", True),
+        ("order_match_tolerance_pct", -0.0001),
+        ("order_match_tolerance_pct", 0.010001),
+        ("order_match_tolerance_pct", float("nan")),
+        ("order_match_tolerance_pct", float("inf")),
         ("order_replacement_churn_gate_activation_count", True),
         ("order_replacement_churn_gate_activation_count", -1),
         ("order_replacement_churn_gate_window_minutes", 0.0),
         ("order_replacement_churn_gate_stability_minutes", 11.0),
         ("order_replacement_churn_gate_market_dist_pct", 1.0),
         ("order_replacement_churn_gate_market_dist_pct", -0.1),
-        ("order_replacement_churn_gate_tracking_tolerance_pct", 0.0002),
-        ("order_replacement_churn_gate_tracking_tolerance_pct", float("inf")),
     )
     for key, value in invalid_cases:
         invalid = get_template_config()
         invalid["live"][key] = value
         with pytest.raises((TypeError, ValueError), match=key):
             validate_config(invalid, verbose=False)
+
+    for tolerance in (0.0, 0.01):
+        valid = get_template_config()
+        valid["live"]["order_match_tolerance_pct"] = tolerance
+        validate_config(valid, verbose=False)
 
 
 def test_retired_initial_entry_gate_migrates_distance_and_hydrates_defaults():
@@ -230,7 +275,6 @@ def test_retired_initial_entry_gate_migrates_distance_and_hydrates_defaults():
         "order_replacement_churn_gate_activation_count",
         "order_replacement_churn_gate_market_dist_pct",
         "order_replacement_churn_gate_stability_minutes",
-        "order_replacement_churn_gate_tracking_tolerance_pct",
         "order_replacement_churn_gate_window_minutes",
     ):
         source["live"].pop(key)
@@ -244,15 +288,30 @@ def test_retired_initial_entry_gate_migrates_distance_and_hydrates_defaults():
     assert live["order_replacement_churn_gate_activation_count"] == 10
     assert live["order_replacement_churn_gate_window_minutes"] == pytest.approx(10.0)
     assert live["order_replacement_churn_gate_stability_minutes"] == pytest.approx(2.0)
-    assert live["order_replacement_churn_gate_tracking_tolerance_pct"] == pytest.approx(
-        0.002
-    )
     changes = prepared["_transform_log"][-1]["details"]["changes"]
     assert {
         "action": "rename",
         "from": "live.initial_entry_exec_max_market_dist_pct",
         "to": "live.order_replacement_churn_gate_market_dist_pct",
         "value": 0.005,
+    } in changes
+
+
+def test_retired_churn_tracking_tolerance_is_removed():
+    source = get_template_config()
+    source["live"]["order_replacement_churn_gate_tracking_tolerance_pct"] = 0.002
+
+    prepared = prepare_config(source, verbose=False, target="canonical", runtime=None)
+
+    assert (
+        "order_replacement_churn_gate_tracking_tolerance_pct"
+        not in prepared["live"]
+    )
+    changes = prepared["_transform_log"][-1]["details"]["changes"]
+    assert {
+        "action": "remove",
+        "path": "live.order_replacement_churn_gate_tracking_tolerance_pct",
+        "value": 0.002,
     } in changes
 
 
@@ -662,6 +721,78 @@ def test_normalize_limit_entries_preserves_optional_fields_on_canonical_entries(
     assert normalized[1]["enabled"] is False
 
 
+def test_normalize_limit_entries_supports_scenario_specific_limits():
+    raw = [
+        {
+            "metric": "drawdown_worst_strategy_eq",
+            "penalize_if": "greater_than",
+            "scenario": " base ",
+            "value": 0.5,
+        },
+        {
+            "metric": "drawdown_worst_strategy_eq",
+            "penalize_if": "greater_than",
+            "scenario": None,
+            "stat": "max",
+            "value": 0.7,
+        },
+    ]
+
+    assert config_utils.normalize_limit_entries(raw) == [
+        {
+            "metric": "drawdown_worst_strategy_eq",
+            "penalize_if": "greater_than",
+            "scenario": "base",
+            "value": 0.5,
+        },
+        {
+            "metric": "drawdown_worst_strategy_eq",
+            "penalize_if": "greater_than",
+            "scenario": None,
+            "stat": "max",
+            "value": 0.7,
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    ("entry", "match"),
+    [
+        (
+            {
+                "metric": "drawdown_worst_strategy_eq",
+                "penalize_if": "greater_than",
+                "scenario": "base",
+                "stat": "max",
+                "value": 0.5,
+            },
+            "cannot set both a named scenario and stat",
+        ),
+        (
+            {
+                "metric": "drawdown_worst_strategy_eq",
+                "penalize_if": "greater_than",
+                "scenario": "",
+                "value": 0.5,
+            },
+            "non-empty scenario label",
+        ),
+        (
+            {
+                "metric": "drawdown_worst_strategy_eq",
+                "penalize_if": "greater_than",
+                "scenario": 123,
+                "value": 0.5,
+            },
+            "scenario label string or null",
+        ),
+    ],
+)
+def test_normalize_limit_entries_rejects_invalid_scenario_basis(entry, match):
+    with pytest.raises(ValueError, match=match):
+        config_utils.normalize_limit_entries([entry])
+
+
 def test_load_config_preserves_canonical_optimize_limits(tmp_path):
     cfg = get_template_config()
     cfg["optimize"]["limits"] = [
@@ -771,6 +902,41 @@ def test_parse_limit_cli_entry_supports_range_and_extras():
         "range": [0.05, 0.7],
         "stat": "mean",
         "enabled": False,
+    }
+
+
+def test_parse_limit_cli_entry_supports_scenario_selector():
+    entry = config_utils.parse_limit_cli_entry(
+        "drawdown_worst_strategy_eq > 0.5 scenario=base"
+    )
+
+    assert entry == {
+        "metric": "drawdown_worst_strategy_eq",
+        "penalize_if": "less_than_or_equal",
+        "value": 0.5,
+        "scenario": "base",
+    }
+
+
+def test_parse_limit_cli_entry_preserves_none_scenario_label():
+    entry = config_utils.parse_limit_cli_entry(
+        "drawdown_worst_strategy_eq > 0.5 scenario=none"
+    )
+
+    assert entry["scenario"] == "none"
+
+
+def test_parse_limit_cli_entry_supports_compact_operator_with_multiple_options():
+    entry = config_utils.parse_limit_cli_entry(
+        "drawdown_worst_strategy_eq<=0.7 scenario=null stat=max"
+    )
+
+    assert entry == {
+        "metric": "drawdown_worst_strategy_eq",
+        "penalize_if": "greater_than",
+        "value": 0.7,
+        "scenario": None,
+        "stat": "max",
     }
 
 

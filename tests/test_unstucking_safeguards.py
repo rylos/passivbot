@@ -626,6 +626,11 @@ def _make_dummy_bot(config, *, last_price=100.0):
             self.ineligible_symbols = {}
             self.approved_coins_minus_ignored_coins = {"long": [], "short": []}
             self.PB_modes = {"long": {}, "short": {}}
+            auto_gs = bool(cfg["live"]["auto_gs"])
+            self.PB_mode_stop = {
+                "long": "graceful_stop" if auto_gs else "manual",
+                "short": "graceful_stop" if auto_gs else "manual",
+            }
             self._runtime_forced_modes = {"long": {}, "short": {}}
             self.inactive_coin_candle_ttl_ms = 60_000
             self.trailing_prices = {}
@@ -1015,6 +1020,7 @@ async def test_live_orchestrator_passes_merged_entry_cooldown_delta_anchor(monke
     captured = {}
 
     async def fake_load_bundle(self, symbols, modes):
+        self._orchestrator_allow_missing_strategy_inputs_symbols = {symbol}
         m1_close = {symbol: {1.0: 100.0, 2.0: 100.0}}
         m1_volume = {symbol: {10.0: 1_000.0}}
         m1_log_range = {symbol: {10.0: 0.01}}
@@ -1035,6 +1041,7 @@ async def test_live_orchestrator_passes_merged_entry_cooldown_delta_anchor(monke
 
     rust_symbol = captured["input"]["symbols"][0]
     assert rust_symbol["long"]["last_increase_fill_timestamp_ms"] == 121_000
+    assert rust_symbol["allow_missing_strategy_inputs"] is True
     assert snapshot["last_increase_fill_timestamps"][symbol]["long"] == 121_000
     assert bot._live_event_pipeline.flush(timeout=2.0) is True
     rust_events = [
@@ -1053,6 +1060,7 @@ async def test_live_orchestrator_passes_merged_entry_cooldown_delta_anchor(monke
     assert {event.cycle_id for event in rust_events} == {"cy_live"}
     assert rust_events[0].remote_call_id == rust_events[1].remote_call_id
     assert rust_events[0].data["input_hash"] == rust_events[1].data["input_hash"]
+    assert rust_events[0].data["ema_unavailable_count"] == 1
     assert rust_events[1].data["order_count"] == 0
     assert bot._live_event_pipeline.close(timeout=2.0) is True
 
@@ -1537,6 +1545,88 @@ async def test_position_delta_waits_for_new_fill_identity_across_refresh_cohorts
 
 
 @pytest.mark.asyncio
+async def test_bounded_fill_position_price_discrepancy_clears_once(caplog):
+    cfg = _dummy_config()
+    bot = _make_dummy_bot(cfg)
+    diagnostic_events = []
+    bot._monitor_record_event = lambda kind, tags, payload, **kwargs: (
+        diagnostic_events.append((kind, tags, payload, kwargs))
+    )
+    symbol = _set_basic_state(bot)
+    old_fill = _DummyFillEvent(
+        symbol, "long", 120_000, "old-fill", psize=1.0, pprice=100.0
+    )
+    bot._pnls_manager = _DummyPnlsManager([old_fill])
+    bot._trailing_position_change_epochs = {
+        (symbol, "long"): "fill:120000:old-fill"
+    }
+    bot.is_trailing = lambda sym, pside=None: pside == "long"
+    bot.get_exchange_time = lambda: 361_000
+
+    bot._apply_positions_snapshot(
+        [
+            {
+                "symbol": symbol,
+                "position_side": "long",
+                "size": 1.0,
+                "price": 100.0,
+                "lastUpdateTimestamp": 120_000,
+            }
+        ]
+    )
+    bot._begin_authoritative_refresh_epoch()
+    bot._apply_positions_snapshot(
+        [
+            {
+                "symbol": symbol,
+                "position_side": "long",
+                "size": 1.5,
+                "price": 101.0095,
+                "lastUpdateTimestamp": 240_000,
+            }
+        ]
+    )
+    bot._pnls_manager._events.append(
+        _DummyFillEvent(
+            symbol,
+            "long",
+            240_000,
+            "new-fill",
+            psize=1.5,
+            pprice=101.0,
+        )
+    )
+    bot._trailing_fill_fetch_generation = 1
+
+    async def complete_candles(*args, **kwargs):
+        return _make_candles(
+            [
+                (240_000, 100.0, 102.0, 99.0, 101.0, 1.0),
+                (300_000, 101.0, 103.0, 100.0, 102.0, 1.0),
+            ]
+        )
+
+    bot.cm.get_candles = complete_candles
+    with caplog.at_level(logging.WARNING):
+        await bot.update_trailing_data()
+        await bot.update_trailing_data()
+
+    assert bot._trailing_pending_fill_confirmations == {}
+    message = "accepted bounded reconstructed position-price discrepancy"
+    assert caplog.text.count(message) == 1
+    assert len(diagnostic_events) == 1
+    kind, tags, payload, kwargs = diagnostic_events[0]
+    assert kind == "fill.position_price_tolerance_used"
+    assert tags == ("diagnostic", "fills", "recovery", "fallback")
+    assert payload["recovery"] == "recorded_after_state_price_tolerance"
+    assert payload["effective_price_tick"] == pytest.approx(0.01)
+    assert payload["price_delta"] == pytest.approx(0.0095)
+    assert payload["delta_ticks"] == pytest.approx(0.95)
+    assert kwargs["symbol"] == symbol
+    assert kwargs["pside"] == "long"
+
+
+@pytest.mark.asyncio
 async def test_fill_prefetch_before_position_delta_waits_for_post_snapshot_refresh():
     cfg = _dummy_config()
     bot = _make_dummy_bot(cfg)
@@ -1731,6 +1821,104 @@ def test_matching_fill_shape_does_not_override_truncated_cache_psize():
     )
     assert not bot._fill_anchor_matches_position_state(
         symbol, "short", (1.1, 58.717), anchor
+    )
+
+
+def test_fill_after_state_position_price_tolerance_is_one_tick():
+    cfg = _dummy_config()
+    bot = _make_dummy_bot(cfg)
+    symbol = _set_basic_state(bot)
+    anchor = {"psize": 1.0, "pprice": 100.0}
+
+    assert (
+        bot._fill_anchor_position_state_match_kind(
+            symbol, "long", (1.0, 100.0049), anchor
+        )
+        == "recorded_after_state"
+    )
+    assert (
+        bot._fill_anchor_position_state_match_kind(
+            symbol, "long", (1.0, 100.0095), anchor
+        )
+        == "recorded_after_state_price_tolerance"
+    )
+    assert (
+        bot._fill_anchor_position_state_match_kind(
+            symbol, "long", (1.0, 100.01), anchor
+        )
+        == "recorded_after_state_price_tolerance"
+    )
+    assert (
+        bot._fill_anchor_position_state_match_kind(
+            symbol, "long", (1.0, 100.0100001), anchor
+        )
+        is None
+    )
+    assert (
+        bot._fill_anchor_position_state_match_kind(
+            symbol, "long", (1.02, 100.0095), anchor
+        )
+        is None
+    )
+
+
+def test_hyperliquid_fill_price_tolerance_uses_discrepancy_side_tick():
+    cfg = _dummy_config()
+    bot = _make_dummy_bot(cfg)
+    symbol = _set_basic_state(bot)
+    bot._effective_position_price_tick = (
+        lambda _symbol, price, comparison_price=None: 1.0
+        if comparison_price is not None
+        and min(abs(price), abs(comparison_price)) < 100_000.0
+        else 10.0
+    )
+
+    assert (
+        bot._fill_anchor_position_state_match_kind(
+            symbol,
+            "long",
+            (1.0, 100_000.0),
+            {"psize": 1.0, "pprice": 99_999.0},
+        )
+        == "recorded_after_state_price_tolerance"
+    )
+    assert (
+        bot._fill_anchor_position_state_match_kind(
+            symbol,
+            "long",
+            (1.0, 100_000.0),
+            {"psize": 1.0, "pprice": 99_990.0},
+        )
+        is None
+    )
+
+
+def test_position_open_replay_retains_strict_half_tick_price_tolerance():
+    cfg = _dummy_config()
+    bot = _make_dummy_bot(cfg)
+    symbol = _set_basic_state(bot)
+    bot.positions[symbol]["long"] = {
+        "size": 1.0,
+        "price": 100.0,
+        "openTime": 180_000,
+        "lastUpdateTimestamp": 180_000,
+    }
+    opening_fill = _DummyFillEvent(
+        symbol,
+        "long",
+        180_000,
+        "opening-fill",
+        psize=9.0,
+        pprice=90.0,
+        qty=1.0,
+        price=100.0095,
+        source_ids=["opening-fill"],
+    )
+    bot._pnls_manager = _DummyPnlsManager([opening_fill])
+    anchor = bot._latest_fill_position_change_anchors()[(symbol, "long")]
+
+    assert not bot._fill_anchor_matches_position_state(
+        symbol, "long", (1.0, 100.0), anchor
     )
 
 
@@ -2681,7 +2869,6 @@ async def test_restart_accepts_matching_fill_before_bybit_position_update_time_a
     "rows",
     [
         [(240_000, 100.0, 102.0, 98.0, 101.0, 1.0)],
-        [(180_000, 100.0, 101.0, 99.0, 100.0, 1.0)],
     ],
 )
 async def test_trailing_extrema_reject_incomplete_post_fill_coverage(rows):
@@ -2698,6 +2885,96 @@ async def test_trailing_extrema_reject_incomplete_post_fill_coverage(rows):
         return _make_candles(rows)
 
     bot.cm.get_candles = partial_candles
+    await bot.update_trailing_data()
+
+    assert bot.trailing_prices[symbol]["long"] == _trailing_default()
+    assert bot._orchestrator_trailing_unavailable_reasons == {
+        symbol: ["incomplete_trailing_candle_coverage"]
+    }
+
+
+@pytest.mark.asyncio
+async def test_trailing_extrema_projects_bounded_open_tail_without_persisting():
+    cfg = _dummy_config()
+    cfg["live"]["max_active_candle_tail_gap_minutes"] = 10
+    bot = _make_dummy_bot(cfg)
+    symbol = _set_basic_state(bot)
+    bot._pnls_manager = _DummyPnlsManager(
+        [_DummyFillEvent(symbol, "long", 120_000, "fill-1")]
+    )
+    bot.is_trailing = lambda sym, pside=None: pside == "long"
+    bot.get_exchange_time = lambda: 301_000
+    emitted = []
+    bot._emit_live_event = lambda event_type, **kwargs: emitted.append(
+        (event_type, kwargs)
+    )
+    returned = _make_candles(
+        [(180_000, 100.0, 101.0, 99.0, 100.0, 1.0)]
+    )
+
+    async def candles_with_open_tail(*args, **kwargs):
+        return returned
+
+    bot.cm.get_candles = candles_with_open_tail
+    await bot.update_trailing_data()
+
+    assert bot._orchestrator_trailing_unavailable_symbols == set()
+    assert bot.trailing_prices[symbol]["long"]["max_since_open"] == pytest.approx(
+        101.0
+    )
+    assert list(returned["ts"]) == [180_000]
+    assert bot._orchestrator_trailing_projection_contexts[symbol]["long"][
+        "consecutive_uses"
+    ] == 1
+    assert len(emitted) == 1
+    assert emitted[0][0] == "candle.tail_projected"
+    assert emitted[0][1]["pside"] == "long"
+    assert emitted[0][1]["status"] == "degraded"
+    assert emitted[0][1]["reason_code"] == "trailing_open_tail_projection"
+    assert emitted[0][1]["data"]["consumer"] == "trailing_extrema"
+    assert emitted[0][1]["data"]["tail_gap_candles"] == 1
+    assert emitted[0][1]["data"]["consecutive_uses"] == 1
+
+    await bot.update_trailing_data()
+    assert bot._orchestrator_trailing_projection_contexts[symbol]["long"][
+        "consecutive_uses"
+    ] == 2
+    assert emitted[-1][1]["data"]["consecutive_uses"] == 2
+
+    # A delayed real candle replaces the prior projection on the next read.
+    returned = _make_candles(
+        [
+            (180_000, 100.0, 101.0, 99.0, 100.0, 1.0),
+            (240_000, 100.0, 120.0, 98.0, 110.0, 2.0),
+        ]
+    )
+    await bot.update_trailing_data()
+    assert bot.trailing_prices[symbol]["long"]["max_since_open"] == pytest.approx(
+        120.0
+    )
+    assert bot._orchestrator_trailing_projection_contexts == {}
+    assert bot._trailing_tail_projection_counts == {}
+    assert len(emitted) == 2
+
+
+@pytest.mark.asyncio
+async def test_trailing_extrema_rejects_open_tail_beyond_active_bound():
+    cfg = _dummy_config()
+    cfg["live"]["max_active_candle_tail_gap_minutes"] = 1
+    bot = _make_dummy_bot(cfg)
+    symbol = _set_basic_state(bot)
+    bot._pnls_manager = _DummyPnlsManager(
+        [_DummyFillEvent(symbol, "long", 120_000, "fill-1")]
+    )
+    bot.is_trailing = lambda sym, pside=None: pside == "long"
+    bot.get_exchange_time = lambda: 421_000
+
+    async def stale_candles(*args, **kwargs):
+        return _make_candles(
+            [(180_000, 100.0, 101.0, 99.0, 100.0, 1.0)]
+        )
+
+    bot.cm.get_candles = stale_candles
     await bot.update_trailing_data()
 
     assert bot.trailing_prices[symbol]["long"] == _trailing_default()
@@ -3003,6 +3280,15 @@ def _make_order(
 async def test_existing_unstuck_order_does_not_block_rust_emission(monkeypatch):
     cfg = _dummy_config()
     bot = _make_dummy_bot(cfg)
+    bot._bp_defaults.update(
+        {
+            "unstuck_enabled": True,
+            "unstuck_loss_allowance_pct": 0.01,
+            "unstuck_close_pct": 0.1,
+            "unstuck_threshold": 0.5,
+        }
+    )
+    bot._bot_value_defaults["total_wallet_exposure_limit"] = 0.5
     symbol = _set_basic_state(bot)
     import passivbot_rust as pbr
 

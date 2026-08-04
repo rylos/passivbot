@@ -109,11 +109,16 @@ async def refresh_authoritative_state_staged(bot) -> bool:
         bot._last_authoritative_degraded_pnl_count = int(
             snapshot.get("degraded_pnl_count", 0) or 0
         )
-        bot._last_authoritative_block_reason = (
-            "degraded_pnl"
-            if bot._last_authoritative_degraded_pnl_count
-            else "pending_pnl"
+        fill_refresh_block_reason = getattr(
+            bot, "_last_fill_refresh_block_reason", None
         )
+        if fill_refresh_block_reason == "fill_history_coverage":
+            bot._last_authoritative_block_reason = fill_refresh_block_reason
+        elif bot._live_risk_uses_authoritative_pnl():
+            if bot._last_authoritative_degraded_pnl_count:
+                bot._last_authoritative_block_reason = "degraded_pnl"
+            elif bot._last_authoritative_pending_pnl_count:
+                bot._last_authoritative_block_reason = "pending_pnl"
         return False
     prepared_balance_snapshot = None
     if "balance" in plan:
@@ -220,7 +225,7 @@ def authoritative_staged_refresh_plan(bot) -> set[str]:
     plan = {"balance", "positions", "open_orders", "fills"}
     if "fills" not in pending:
         coverage_ready = True
-        coverage_ready_fn = getattr(bot, "_pnl_history_coverage_ready_for_risk", None)
+        coverage_ready_fn = getattr(bot, "_fill_history_coverage_ready", None)
         if callable(coverage_ready_fn):
             coverage_ready = bool(coverage_ready_fn())
         if not coverage_ready:
@@ -391,7 +396,9 @@ def log_staged_refresh_timings(
     routine_without_fills = {"balance", "open_orders", "positions"}
     plan_set = set(plan)
     unusual_plan = plan_set not in (full_plan, routine_without_fills)
-    epoch_changed = set(getattr(bot, "_authoritative_refresh_epoch_changed", set()) or set())
+    epoch_changed = set(
+        bot._ensure_freshness_ledger().changed_surfaces_at_epoch()
+    )
     meaningful_surfaces = epoch_changed - {"balance"}
     if pending_confirmations and plan_set == {"open_orders"} and wall_ms < 2_000:
         meaningful_surfaces -= {"open_orders"}

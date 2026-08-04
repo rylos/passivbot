@@ -10,6 +10,7 @@ import ccxt.pro as ccxt_pro
 from config.access import require_live_value
 from exchanges.ccxt_bot import CCXTBot, format_exchange_config_response
 from exchanges.ipv4_transport import IPv4TransportMixin
+from live.diagnostic_safety import bounded_exchange_error_context
 from passivbot import logging
 from utils import symbol_to_coin
 
@@ -82,6 +83,8 @@ class WeexBot(CCXTBot):
 
     MAX_OPEN_ORDERS = 100
     CLIENT_ORDER_ID_PATTERN = re.compile(r"^[.A-Z:/a-z0-9_-]{1,36}$")
+    BROKER_ID_PATTERN = re.compile(r"^WEEX[0-9]{6}$")
+    PASSIVBOT_TYPE_MARKER_PATTERN = re.compile(r"0x[0-9A-Fa-f]{4}")
 
     def __init__(self, config: dict):
         super().__init__(config)
@@ -90,6 +93,11 @@ class WeexBot(CCXTBot):
         self.hedge_mode = True
 
     def create_ccxt_sessions(self):
+        # WEEX attributes API volume from the client-order-id prefix, not a
+        # session header or CCXT option. Validate at startup so an invalid
+        # registry entry cannot leave an apparently healthy but unattributed
+        # trading session.
+        self._broker_client_order_id_prefix()
         ccxt_config = self._build_ccxt_config()
         user_options = self.user_info.get("options", {})
 
@@ -109,6 +117,27 @@ class WeexBot(CCXTBot):
             self.ccp = None
             logging.info("weex: WebSocket disabled, using REST polling")
 
+    def _broker_client_order_id_prefix(self) -> str:
+        broker_id = str(self.broker_code or "")
+        if not self.BROKER_ID_PATTERN.fullmatch(broker_id):
+            raise ValueError(
+                "WEEX broker code must match WEEX followed by six digits"
+            )
+        return f"b-{broker_id}-"
+
+    def format_custom_id_single(self, order_type_id: int) -> str:
+        """Build WEEX's broker-prefixed ID while retaining Passivbot diagnostics."""
+        prefix = self._broker_client_order_id_prefix()
+        formatted = super().format_custom_id_single(order_type_id)
+        custom_id = (prefix + formatted)[: self.custom_id_max_length]
+        if not self.CLIENT_ORDER_ID_PATTERN.fullmatch(custom_id):
+            raise ValueError("generated invalid WEEX client order id")
+        if not self.PASSIVBOT_TYPE_MARKER_PATTERN.search(custom_id):
+            raise ValueError(
+                "WEEX client order id has no Passivbot order-type marker"
+            )
+        return custom_id
+
     async def update_exchange_config(self):
         """WEEX has no account-wide position-mode endpoint.
 
@@ -117,6 +146,36 @@ class WeexBot(CCXTBot):
         """
         logging.debug(
             "[config] weex position and margin mode are configured per symbol"
+        )
+
+    def _classify_exchange_symbol_unavailable_error(
+        self, exc: BaseException
+    ) -> str | None:
+        """Classify only WEEX's documented API-symbol suspension code.
+
+        Other exchanges must add their own exact code classifier rather than
+        reusing WEEX semantics or matching human-readable response text.
+        """
+        if bounded_exchange_error_context(exc).get("error_code") == "-1058":
+            return "weex_api_symbol_unavailable"
+        return None
+
+    def _order_requires_exchange_config_before_create(self, order: dict) -> bool:
+        """WEEX leverage setup is an entry prerequisite, not a close prerequisite."""
+        return self._extract_order_reduce_only(order) is not True
+
+    def _pending_exchange_config_consumes_error_budget(
+        self, blocked_orders: list[dict]
+    ) -> bool:
+        """Charge only WEEX configuration writes that failed in this executor cycle."""
+        failed_symbols = set(
+            getattr(self, "_last_exchange_config_failed_attempt_symbols", set())
+            or set()
+        )
+        return any(
+            str(order.get("symbol") or "") in failed_symbols
+            for order in blocked_orders
+            if isinstance(order, dict)
         )
 
     async def update_exchange_config_by_symbols(self, symbols: list[str]):
@@ -219,6 +278,14 @@ class WeexBot(CCXTBot):
         if not self.CLIENT_ORDER_ID_PATTERN.fullmatch(client_order_id):
             raise ValueError(
                 "WEEX client order id must match ^[.A-Z:/a-z0-9_-]{1,36}$"
+            )
+        if not client_order_id.startswith(self._broker_client_order_id_prefix()):
+            raise ValueError(
+                "WEEX client order id must start with the configured broker prefix"
+            )
+        if not self.PASSIVBOT_TYPE_MARKER_PATTERN.search(client_order_id):
+            raise ValueError(
+                "WEEX client order id must retain the Passivbot order-type marker"
             )
         params = {
             "positionSide": position_side.upper(),

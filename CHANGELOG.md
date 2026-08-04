@@ -4,6 +4,145 @@ All notable user-facing changes will be documented in this file.
 
 ## Unreleased
 
+- Recognize repeated exclusive switching between complete order cohorts as live
+  order-churn evidence. Alternating long/short or order-type intent can now use
+  the existing account-wide far-order allowance without merging position-side
+  identity; first appearances, isolated switches, uncertain history, and
+  recently stable orders remain fail-open. Switching duration stops advancing
+  when the current run begins, and a completed stable run prevents an older
+  switching episode from being resurrected by one later transition while
+  emitting the existing history-reset telemetry. Short switching intervals do
+  not mask later sustained price or quantity drift, and ladder cardinality must
+  remain consistent for every recurring cohort.
+- WEEX now recognizes exact structured error code `-1058` as a temporary per-symbol API-trading
+  suspension. The affected symbol enters a configurable RAM-only cooldown (six hours by default):
+  flat symbols use graceful stop, held symbols use TP-only while retaining close and panic
+  management, and protective closes bypass failed entry-only leverage setup. The initial failure
+  remains restart-budget-visible without charging skipped retry-backoff cycles; expiry retries
+  automatically, each repeated qualifying response refreshes the deadline, and bot restart retries
+  immediately. Cooldown duration validation is bounded so an extreme numeric value cannot overflow
+  and mask the original exchange failure.
+  The shared policy is available to future connectors only through their own exact exchange-code
+  classifiers.
+- Prevent symbols retained for existing positions or open-order reconciliation from becoming live
+  forager candidates after removal from a side's approved set. Disapproved symbols now remain in
+  graceful-stop or manual mode according to `live.auto_gs` while their existing state is managed.
+- Reduce peak memory during combined candle preparation by releasing exchange-candidate frames
+  after volume normalization and consuming selected frames as dense arrays are materialized.
+- Scope live candle/EMA readiness to the Rust actions that consume it instead of deferring the
+  entire planner cycle when one active symbol lacks a completed candle. Known missing EMA inputs
+  remain explicit and value-free; backtests and unannotated Rust inputs stay strict, stale resting
+  strategy orders are cancelled through normal Rust-authoritative reconciliation, entry and close
+  strategy branches remain independent when their input needs differ, and independent panic,
+  WEL, and TWEL reducers may continue when their own inputs are complete.
+
+- Harden combined-exchange HLCV preparation across independently downloaded datasets: equivalent
+  full-range sources now follow configured exchange priority instead of total volume, robust
+  complete-day median-log estimates replace arithmetic volume averaging, and underdetermined
+  normalization fails loudly. `backtest.volume_normalization` now controls scaling and cache
+  identity, while cache manifests and backtest dataset artifacts retain source-selection and
+  normalization provenance.
+- Reduce optimizer-suite startup time and peak memory by copying materialized candle datasets
+  directly into shared memory instead of creating a redundant full-size intermediate array.
+- Speed up combined backtest and optimizer-suite candle materialization by writing bounded
+  time-major chunks instead of repeatedly sweeping the full memmap once per coin.
+- Prevent unproven fill-history coverage from consuming the generic live restart budget; one reason-aware execution-loop backoff owns fill retries while planning remains fail-closed, and already-latched HSL RED supervision continues during coverage repair.
+- Stop refetching every account surface when a known fill only gains authoritative PnL or revised fee evidence, while retaining confirmation for new source identities or structural fill changes; validate realized-PnL history once per Rust planning cycle instead of rescanning it for unstuck eligibility.
+- Scope live fill-history readiness to enabled consumers: PnL risk keeps its configured lookback, entry cooldown proves only its structural-fill horizon, and bots without historical consumers use bounded recent ingestion.
+
+- Live fill-history coverage now has one canonical verdict owned by
+  `FillEventsManager`. Refresh, staged readiness, HSL replay, and realized-PnL
+  consumers no longer duplicate cache/gap interpretation. Metadata that claims
+  missing cached rows and malformed known-gap bounds fail closed and trigger
+  repair or deferral, while confirmed empty windows remain valid.
+- Prepared HLCV caches now key direction-agnostic candle data by the effective
+  long/short coin union, allowing long-only, short-only, and both-side runs with
+  matching data inputs to reuse one verified cache. Backtest artifacts report
+  the current run's side membership separately from cache-build provenance, and
+  optimizer data preparation derives reachable sides from optimization bounds
+  so fixed-bound starts and Pareto restarts resolve consistently.
+- Live fill readiness now separates proven structural fill history from realized-PnL
+  quality. Pending or synthetic PnL continues to block and repair before enabled HSL,
+  auto-unstuck, or realized-loss logic can run, but no longer defers all fill-dependent
+  planning when every authoritative-PnL consumer is disabled. Zero-exposure unstuck
+  configurations follow Rust's disabled behavior, monitor snapshots leave disabled
+  unstuck allowances unavailable instead of reading unsafe PnL, and coverage failures
+  retain their coverage-specific diagnostics and retry classification.
+- Live health-summary PnL now counts authoritative net realized PnL only.
+  Pending and synthetic fill estimates remain visible in fill diagnostics but
+  no longer create temporary fill-identity bookkeeping solely to correct the
+  uptime metric after enrichment.
+- Flat forager candidates can now persist proven-final public 1m WebSocket
+  candles through the canonical candle path, reducing routine candle REST
+  pressure while retaining REST for startup basis, gaps, reconnect recovery,
+  prolonged silence, and periodic integrity audits. CCXT cache provenance and
+  successor timestamps prove finality; each watcher session primes its first
+  snapshot without persisting replayed rows, integrity audits force a REST
+  overlap even when the WebSocket tail is fresh, and WebSocket silence never
+  creates a synthetic no-trade candle. Changed values may correct an existing
+  canonical timestamp, while extending the tail requires fresh-successor proof;
+  shard persistence is read-verified before a WebSocket candle is exposed to
+  cache and EMA readers, including on immutable legacy-backed days. Unstable
+  streams cool down to REST-only maintenance before retrying automatically, and
+  the subscription reconciler remains ready for runtime transitions into
+  forager mode.
+- Dynamic candle WebSocket removal now lets the owning watcher consume CCXT
+  Pro's unsubscribe wake-up before cancellation, avoiding orphaned-future error
+  spam, and reconciliation retires a removed symbol batch with one supported
+  bulk unsubscribe. Bulk and singleton unsubscribe calls, watcher cancellation,
+  and post-cancellation waits are hard-bounded even when connector coroutines
+  suppress cancellation. Removed watchers remain owned until retirement returns,
+  and abandoned watchers remain marked retiring until they actually stop.
+  Internal bot restarts delegate the single maintainer cancellation to outer cleanup,
+  then await teardown and close event,
+  monitor, and exchange-client resources before constructing the replacement
+  bot; cancellation-resistant tasks cannot extend cleanup beyond the bounded
+  grace deadline, and an incomplete event-pipeline shutdown no longer permits a
+  blocking monitor-publisher close to stall replacement. Correlated private
+  incident records retain bounded full frame chains at normal log level while
+  excluding exception text, locals, source lines, and credentials; hostile
+  traceback accessors degrade only the optional diagnostic projection.
+  Background forager refresh
+  also distinguishes currently fetchable missing candles from verified
+  no-trade continuity and retry-deferred gaps, preventing sparse KuCoin markets
+  from repeatedly consuming REST budget while raw coverage remains honestly
+  unavailable where proof is incomplete. Gap normalization preserves those
+  proof- and retry-epoch-specific ranges so adjacent unverified or newly
+  finalized minutes remain refreshable, using log-linear sweep normalization
+  for large sparse histories.
+- Coin-mode HSL startup now bounds and rebases `always`-policy held-pair
+  replay at a fill-proven current episode plus any cooldown-linked predecessor
+  episodes,
+  so exchanges with limited recent 1m history do not strand a protected open
+  position on irrelevant older closed episodes without carrying their realized
+  PnL into the current episode. Startup failures also retain a
+  correlated private bounded frame chain at normal log level while the console
+  remains compact.
+- Bitget UTA private order updates now use the native `holdSide` field for
+  hedge position attribution. Hyperliquid briefly retries a sparse order-open
+  event when a concurrent local create is still awaiting its exchange ID, then
+  accepts it only through the existing exact acknowledged-ID contract. These
+  fixes avoid unnecessary authoritative REST refreshes without weakening
+  foreign or ambiguous order handling.
+- Background forager candle refresh now charges its REST budget per attempted
+  symbol/timeframe fetch instead of reserving a whole batch before execution.
+  Wall-time or lock timeouts briefly defer only the affected surface, preventing
+  one slow symbol from consuming the batch budget and starving other candidates.
+  The remaining cycle time is also shared across the remaining selected surfaces,
+  so sparse-history pagination cannot consume the entire wall-time allowance before
+  later candidates receive a refresh attempt.
+- Added production Bitunix USDT perpetual-futures support through a native signed REST and
+  WebSocket connector, including complete market metadata and top-of-book coverage, live-candle
+  pagination, hedge-mode order and position reconciliation, account configuration, realized-PnL
+  fill events, long/short reduce-only order lifecycles, honest identifier-only market-order
+  acknowledgements, strict complete open-order pagination, and bounded REST ticker snapshots when
+  WebSockets are explicitly disabled. The connector rejects invalid order quantities and
+  case-insensitive authentication-header collisions, isolates malformed order-detail rows, retains
+  synthetic ticker provenance, refreshes public ticker subscriptions as markets change, times
+  ticker-cache freshness locally, reconciles malformed private-WebSocket rows, sends the venue's
+  JSON keepalive on idle private streams, supplies conservative documented VIP0 futures fees to
+  live planning, retries transient native market-discovery failures, and uses native public REST
+  market loading during cold-cache CLI startup instead of falling through to CCXT.
 - Fills sharing a single millisecond are now ordered by the position chain the exchange reports
   with each fill instead of by arbitrary response order. Hyperliquid executions retain their
   individual `startPosition` boundaries, and older coalesced cache rows are expanded back into those
@@ -31,8 +170,24 @@ All notable user-facing changes will be documented in this file.
   entry may set `scenario` to a named suite scenario, set it explicitly to `null` to use suite
   aggregation, and optionally set `aggregate` to `mean`, `min`, `max`, `std`, or `median`.
   Omitting `scenario` inherits `optimize.objective_scenario`; aggregate objectives without an
-  explicit reducer inherit the metric-specific or default `backtest.aggregate` rule. Limits remain
-  suite-aggregated.
+  explicit reducer inherit the metric-specific or default `backtest.aggregate` rule.
+- Optimizer suite limits may now select a named `scenario` independently of scoring. Limits with
+  an omitted or null `scenario` keep using suite aggregation and their explicit `stat` or
+  `backtest.aggregate` fallback. Named-scenario limits use that scenario's metric value and reject
+  an accompanying `stat`. Scenario labels are normalized consistently and retain generated labels
+  after filtering. Named-scenario limits are validated against the active labels before data
+  preparation, including when suite mode is disabled. The Pareto dashboard also applies forbidden
+  `inside_range` bands and optimizer-compatible `auto` directions to scenario-specific limit
+  columns, quotes scenario labels containing its boolean separator, honors disabled limits, and
+  parses generated not-equal filters. Pareto CLI filtering likewise resolves `auto` limits with
+  the optimizer's default metric directions. Iterative backtesting rejects unsupported
+  scenario-specific limits before loading markets or preparing datasets.
+- Optimizer starting configs may now be pre-filtered from stored Pareto metrics with
+  `--filter-starting-configs` and optionally reduced with the same `anchors-farthest` selection as
+  `pareto-compress` via `--compress-starting-configs N` (`--starting-configs-max N`). The optimizer
+  warns that stored metrics are not verified against the new run and fails loudly when metric
+  artifacts are missing, malformed, or all rejected. Active-scenario aggregate preselection matches
+  suite runtime behavior by aggregating each metric over the selected scenarios that emitted it.
 - Live EMA preparation now batches compatible spans per symbol and metric family, including bounded
   cache-only fallbacks for stale forager candidates, and complete candle windows bypass redundant
   Python gap reconstruction. A failed combined read retries each span through its primary reader
@@ -101,6 +256,14 @@ All notable user-facing changes will be documented in this file.
   transport health: unnormalizable rows are discarded with a bounded warning and force an
   authoritative account-state refresh, while valid rows in the same message are processed without
   reconnecting. Bitget side-attribution failures now use this path without logging raw payloads.
+- Hyperliquid sparse private order updates now recover mandatory one-way position-side and
+  close-only semantics by exact exchange order ID from the current authoritative REST open-order
+  snapshot. Orders already resting at bot startup therefore avoid repeated semantic-rejection REST
+  refreshes. A bounded recent copy covers terminal updates arriving just after reconciliation
+  removes the order. Exchange-ID and client-ID aliases must agree, authoritative contradictions
+  invalidate older cached semantics and cannot fall back to local acknowledgements, and
+  snapshot-recovered rows still force account refresh because the snapshot proves semantics rather
+  than local ownership. Missing, ambiguous, stale, and contradictory identities remain fail-closed.
 - Binance's explicit `MarginModeAlreadySet` response is now treated as a successful configuration
   no-op at DEBUG instead of an ERROR; unknown margin-mode failures retain their existing loud
   handling.
@@ -217,13 +380,29 @@ All notable user-facing changes will be documented in this file.
   restricted to a host's stable public IPv4 address are not rejected when the
   host also has IPv6 connectivity.
 
+- Simplified the live order-replacement churn gate to a recent Rust-ideal
+  behavior filter. It now requires sustained monotonic price or quantity drift,
+  measures stability from the current drift run, bounds the universal
+  order-match tolerance to 0% through 1% (default 0.02%), rejects malformed Rust
+  ideal orders before reconciliation, reuses the existing fresh market
+  snapshot, performs one final churn-admission pass after exchange configuration
+  and the fresh-market guard, then applies risk-first batch capacity only to
+  admitted candidates. Removed
+  account/config/list epochs, the wider tracking
+  tolerance, flow-cost optimization, Hyperliquid request-budget reservations,
+  and signed-action bookkeeping. Churn evidence remains economy-only: unmatched
+  actual orders are still cancelled and near-market or risk-critical orders are
+  never deferred. Symbols rotated out of the active universe release their RAM
+  history even when position normalization retains flat zero-sized placeholders.
+
 - Gate.io live configuration now accepts CCXT's `gate` exchange label as an alias,
   logs its normalization to Passivbot's canonical `gateio` identity, and consistently
   selects the dedicated Gate.io connector. Standalone market loading now also
   translates `gateio` to CCXT's renamed `gate` client without changing canonical
   cache, broker, event, or persisted-state paths. Gate's numeric REST account UID
-  is normalized to the string required by CCXT Pro, preventing private order
-  WebSocket reconnect loops after otherwise successful startup.
+  is normalized to the string required by CCXT Pro, while missing or invalid UIDs
+  remain unavailable instead of becoming a cached `"None"` placeholder, preventing
+  private order WebSocket reconnect loops after otherwise successful startup.
 
 - Scope cancel-first create deferral to the symbol and position side of stale-order cancellations
   in hedge mode, or the whole symbol in one-way mode, while retaining conservative account-wide
@@ -418,22 +597,15 @@ All notable user-facing changes will be documented in this file.
   effect and close-only effect from position side in effective one-way mode. UTA orders with an
   explicit `posSide` now derive close-only effect directly from the authoritative `side` plus
   `posSide` tuple.
-- Fixed multi-collateral quote-value movement continuously resetting live order-churn evidence.
-  The account epoch now follows the hysteresis-snapped sizing balance plus authoritative fills,
-  realized PnL, positions, and Rust-reported risk-phase transitions instead of exact raw
-  quote-valued balance. While a Rust risk-critical order or realized-loss block is active, churn
-  admission cannot defer any order for that symbol and position side.
 - Fixed live order-churn evidence treating the execution loop's normal 30-second scheduled wait as
   a provenance gap, which could prevent the account-wide churn gate from activating for slowly
   moving EMA-based orders.
 - Fixed WEEX V3 live reconciliation rejecting valid `COMBINED`-mode close orders when the response
   reported `reduceOnly=false`; WEEX close-only effect now follows its authoritative `side` plus
   `positionSide` action tuple. WEEX account equity is also normalized to realized wallet balance by
-  excluding unrealized PnL, restoring live/backtest risk-input parity and preventing mark-to-market
-  churn-history resets. Runtime forager/mode/list changes now invalidate churn evidence only for the
-  affected symbol, so a rotating empty forager slot cannot erase unrelated history account-wide.
-  Repeated unchanged churn deferrals and history-reset diagnostics now remain durable in structured
-  events while INFO output is summarized at most every five minutes.
+  excluding unrealized PnL, restoring live/backtest risk-input parity. Repeated unchanged churn
+  deferrals and history-reset diagnostics remain durable in structured events while INFO output is
+  summarized at most every five minutes.
 - Configs using the retired `live.initial_entry_exec_max_market_dist_pct` now migrate automatically
   to the account-wide replacement-churn gate. Positive values preserve the market-distance
   threshold and hydrate the other new settings from canonical defaults; null and non-positive values
@@ -445,20 +617,18 @@ All notable user-facing changes will be documented in this file.
   after sustained create traffic, while market, risk-critical, and near-market orders remain
   allowance-exempt. On audited supported connectors, stale actual orders are removed in managed
   modes, malformed account-critical open-order snapshots block exchange writes, and any
-  cancellation forces full authoritative refresh and Rust replanning before non-panic creation.
+  cancellation requests full authoritative confirmation while deferring ordinary creates in its
+  affected symbol/position scope until Rust replans.
   One-way position-side and native close-only normalization is now deterministic across the
   supported connectors, including OKX long/short mode, KuCoin open orders, and Gate.io's native
   `is_reduce_only` field. Supported hedge-mode adapters no longer substitute client-order metadata
   for a missing exchange-native position side, and untrusted Hyperliquid WebSocket order rows
-  trigger authoritative account-state refresh instead of reconnect churn. Hyperliquid admission
-  reserves required signed configuration actions with creates, and churn distance is rechecked from
-  a forced-fresh market read after configuration before any create call. A downstream churn
-  normalization failure now blocks account-wide non-panic creation when the affected symbol still
-  has actual orders or an authoritative nonzero position, while preserving only the dedicated
-  reduce-only market panic path. Missing or malformed position sides block every exchange write.
-  Hyperliquid carries ambiguous signed-action debits across `userRateLimit` refreshes, preventing
-  overlapping requests from overstating available action headroom, and failed required margin-mode
-  writes now leave dependent creates pending instead of marking the symbol configured.
+  trigger authoritative account-state refresh instead of reconnect churn. Churn distance is
+  rechecked from a still-valid cached market snapshot after configuration before any create call. Malformed
+  Rust ideal orders fail fatally before reconciliation or any exchange action; malformed
+  actual-order identity and missing or malformed position sides retain their account-critical
+  exchange-write barriers. Failed required margin-mode writes leave dependent creates pending
+  instead of marking the symbol configured.
 - Protective reducer arbitration now keeps the largest loss-admissible final absolute
   reduction among active panic, TWEL/WEL auto-reduce, and auto-unstuck intents for each position
   instead of using a fixed type priority or summing quantities. If the realized-loss gate blocks
@@ -2013,6 +2183,12 @@ All notable user-facing changes will be documented in this file.
   reasons and candidate error types in concise smoke output, making
   `cache_only_fetch_failed` vs `never_fetched_cache_only` visible without a
   separate event query.
+- Forager monitor readiness is now scoped to the exact symbols evaluated by the
+  latest EMA bundle, optional cache-only metric gaps are classified as
+  candidate health failures, and open-tail projection preserves log-range
+  inputs required by held or explicitly normal strategies. Completed-candle
+  forager ranking metrics now have a distinct Rust input channel so coincident
+  strategy and ranking spans cannot reuse projected values for coin selection.
 - `passivbot tool live-smoke-report` now reports timestamp/nonce
   `cycle.degraded` events recovered by a subsequent successful
   `exchange.time_sync` event as recovered problem events instead of hard smoke

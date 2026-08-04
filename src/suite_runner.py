@@ -202,6 +202,11 @@ def load_suite_override_config(suite_config_path: str | Path) -> Dict[str, Any]:
     )
 
 
+def _normalize_scenario_label(raw_label: Any, index: int) -> str:
+    label = str(raw_label).strip() if raw_label else ""
+    return label or f"scenario_{index:02d}"
+
+
 def filter_scenarios_by_label(
     scenarios: List[Dict[str, Any]],
     labels: List[str],
@@ -221,11 +226,21 @@ def filter_scenarios_by_label(
     if not labels:
         return scenarios
 
-    label_set = set(labels)
-    filtered = [s for s in scenarios if s.get("label") in label_set]
+    label_set = {str(label).strip() for label in labels}
+    filtered = []
+    for index, scenario in enumerate(scenarios, 1):
+        normalized_label = _normalize_scenario_label(scenario.get("label"), index)
+        if normalized_label not in label_set:
+            continue
+        normalized_scenario = dict(scenario)
+        normalized_scenario["label"] = normalized_label
+        filtered.append(normalized_scenario)
 
     if not filtered:
-        available = [s.get("label", f"<unnamed_{i}>") for i, s in enumerate(scenarios)]
+        available = [
+            _normalize_scenario_label(scenario.get("label"), index)
+            for index, scenario in enumerate(scenarios, 1)
+        ]
         raise ValueError(
             f"No scenarios match the requested labels {labels}. " f"Available labels: {available}"
         )
@@ -553,7 +568,7 @@ def build_scenarios(
         )
         scenarios.append(
             SuiteScenario(
-                label=str(raw.get("label") or f"scenario_{idx:02d}"),
+                label=_normalize_scenario_label(raw.get("label"), idx),
                 start_date=raw.get("start_date"),
                 end_date=raw.get("end_date"),
                 coins=scenario_coins,
@@ -735,8 +750,6 @@ async def prepare_master_datasets(
             coin: str(mss.get(coin, {}).get("exchange", exchange_name)) for coin in coins
         }
         available_exchanges = sorted(set(coin_exchange.values())) or [exchange_name]
-        hlcvs_array = np.array(hlcvs, dtype=np.float64, copy=True, order="C")
-        btc_array = np.array(btc_usd_prices, dtype=np.float64, copy=True, order="C")
         timestamps_array = (
             None
             if timestamps is None
@@ -744,14 +757,19 @@ async def prepare_master_datasets(
         )
         hlcvs_spec = None
         btc_spec = None
-        if shared_array_manager is not None:
-            # Copy to SharedMemory, then reassign to view (frees intermediate copy)
-            hlcvs_spec, hlcvs_view = shared_array_manager.create_from(hlcvs_array)
-            del hlcvs_array  # Free intermediate contiguous array
-            hlcvs_array = hlcvs_view
-            btc_spec, btc_view = shared_array_manager.create_from(btc_array)
-            del btc_array  # Free intermediate contiguous array
-            btc_array = btc_view
+        if shared_array_manager is None:
+            hlcvs_array = np.array(hlcvs, dtype=np.float64, copy=True, order="C")
+            btc_array = np.array(btc_usd_prices, dtype=np.float64, copy=True, order="C")
+        else:
+            # The materialized arrays are already float64 and contiguous in the normal
+            # suite path. Copy them directly into SharedMemory instead of first making
+            # another full-size process-local array.
+            hlcvs_spec, hlcvs_array = shared_array_manager.create_from(
+                np.ascontiguousarray(hlcvs, dtype=np.float64)
+            )
+            btc_spec, btc_array = shared_array_manager.create_from(
+                np.ascontiguousarray(btc_usd_prices, dtype=np.float64)
+            )
         release_materialized_payload(hlcvs)
         return ExchangeDataset(
             exchange=exchange_label,

@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, TypedDict
 
 import passivbot_rust as pbr
-from ccxt.base.errors import RateLimitExceeded
+from ccxt.base.errors import OrderNotFound, RateLimitExceeded
 from bitget_normalization import (
     deduce_side_pside,
     deduce_uta_side_pside as _deduce_uta_side_pside,
@@ -2247,9 +2247,12 @@ class FillEventCache:
         metadata["pnl_contract"] = PNL_CONTRACT_CURRENT
         self.save_metadata(metadata)
 
-    def mark_refreshed(self) -> None:
+    def mark_refreshed(self, *, reset_event_bounds: bool = False) -> None:
         """Persist a successful refresh timestamp even if no events exist."""
         metadata = self.load_metadata()
+        if reset_event_bounds:
+            metadata["oldest_event_ts"] = 0
+            metadata["newest_event_ts"] = 0
         metadata["last_refresh_ms"] = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
         metadata["pnl_contract"] = PNL_CONTRACT_CURRENT
         self.save_metadata(metadata)
@@ -4095,13 +4098,19 @@ class FillEventsManager:
         self,
         lifecycle: Dict[str, object],
         observation: PnlObservation,
-    ) -> Tuple[set[str], float, int]:
+    ) -> Tuple[set[str], float, int, bool]:
         close_fills = list(lifecycle["close_fills"])
         lifecycle_events = list(lifecycle.get("events") or [])
         lifecycle_fee_paid = sum(signed_fee_paid_from_payload(ev) for ev in lifecycle_events)
         gross_target = float(observation.realized_pnl) - lifecycle_fee_paid
         synthetic_total = sum(float(ev.get("pnl") or 0.0) for ev in close_fills)
         delta = gross_target - synthetic_total
+        pnl_changed = not math.isclose(
+            delta,
+            0.0,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        )
         weights = []
         for close in close_fills:
             signed_qty = _payload_signed_effective_qty(close)
@@ -4115,17 +4124,31 @@ class FillEventsManager:
             weights = [1.0 for _ in close_fills]
             total_weight = float(len(close_fills))
         for close, weight in zip(close_fills, weights):
-            close["pnl"] = float(close.get("pnl") or 0.0) + delta * (weight / total_weight)
+            if pnl_changed:
+                close["pnl"] = float(close.get("pnl") or 0.0) + delta * (
+                    weight / total_weight
+                )
         days_touched: set[str] = set()
+        metadata_changed = False
         for close in close_fills:
+            close_metadata_changed = bool(
+                close.get("pnl_status") != "complete"
+                or close.get("pnl_source")
+                != PNL_SOURCE_AUTHORITATIVE_CYCLE_RECONCILED
+                or close.get("pnl_synthetic_reason")
+            )
+            if close_metadata_changed:
+                metadata_changed = True
             close["pnl_status"] = "complete"
             close["pnl_source"] = PNL_SOURCE_AUTHORITATIVE_CYCLE_RECONCILED
             close["pnl_synthetic_reason"] = ""
-            try:
-                days_touched.add(_day_key(int(close["timestamp"])))
-            except (KeyError, TypeError, ValueError, OverflowError):
-                pass
-        return days_touched, delta, len(close_fills)
+            if pnl_changed or close_metadata_changed:
+                try:
+                    days_touched.add(_day_key(int(close["timestamp"])))
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    pass
+        changed = pnl_changed or metadata_changed
+        return days_touched, delta if pnl_changed else 0.0, len(close_fills), changed
 
     def _reconcile_pnl_observations(
         self,
@@ -4171,10 +4194,14 @@ class FillEventsManager:
             if len(candidates) != 1:
                 continue
             lifecycle = candidates[0]
-            touched, delta, fill_count = self._apply_cycle_observation(lifecycle, obs)
-            days_touched.update(touched)
+            touched, delta, fill_count, changed = self._apply_cycle_observation(
+                lifecycle, obs
+            )
             used_lifecycle_ids.add(id(lifecycle))
             matched_observation_ids.add(id(obs))
+            if not changed:
+                continue
+            days_touched.update(touched)
             reconciled_cycles += 1
             reconciled_fills += fill_count
             total_delta += delta
@@ -4970,7 +4997,11 @@ class FillEventsManager:
                     prev is not None
                     and event.pnl_pending
                     and not prev.pnl_pending
-                    and _is_synthetic_pnl_source(prev.pnl_source)
+                    and (
+                        _is_synthetic_pnl_source(prev.pnl_source)
+                        or prev.pnl_source
+                        == PNL_SOURCE_AUTHORITATIVE_CYCLE_RECONCILED
+                    )
                 ):
                     merged = event.to_dict()
                     merged["pnl"] = prev.pnl
@@ -5132,7 +5163,10 @@ class FillEventsManager:
                 self._events, mark_refreshed=mark_refreshed
             )
         elif mark_refreshed:
-            self.cache.mark_refreshed()
+            # A successful empty fetch proves that metadata-only event bounds
+            # are stale. Keeping them would leave coverage permanently blocked
+            # by a cache_metadata_event_mismatch verdict.
+            self.cache.mark_refreshed(reset_event_bounds=True)
         if fetched_bounded_range:
             # A successful bounded fetch proves the retried range even when the
             # exchange returns no new fills or only duplicates.
@@ -5439,43 +5473,14 @@ class FillEventsManager:
 
         coverage_end_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
 
-        def gap_bounds(gap: KnownGap) -> Optional[Tuple[int, int]]:
-            try:
-                gap_start = int(gap["start_ts"])
-                gap_end = int(gap["end_ts"])
-            except (KeyError, TypeError, ValueError):
-                return None
-            if gap_end <= gap_start:
-                return None
-            return gap_start, gap_end
-
-        def gap_confirmed_legitimate(gap: KnownGap) -> bool:
-            reason = str(gap.get("reason", "") or "").lower()
-            try:
-                confidence = float(gap.get("confidence", 0.0) or 0.0)
-            except (TypeError, ValueError):
-                confidence = 0.0
-            return reason == GAP_REASON_CONFIRMED or confidence >= GAP_CONFIDENCE_CONFIRMED
-
-        def blocking_known_gaps() -> List[KnownGap]:
-            gaps: List[KnownGap] = []
-            for gap in self.cache.get_known_gaps():
-                if gap_confirmed_legitimate(gap):
-                    continue
-                bounds = gap_bounds(gap)
-                if bounds is None:
-                    gaps.append(gap)
-                    continue
-                gap_start, gap_end = bounds
-                if gap_start < coverage_end_ms and gap_end > start_ms:
-                    gaps.append(gap)
-            return gaps
-
-        blocking_gaps = blocking_known_gaps()
+        blocking_gaps = self._blocking_known_gaps(
+            start_ms=start_ms,
+            end_ms=coverage_end_ms,
+        )
         if blocking_gaps:
             retried_ranges: List[Tuple[int, int]] = []
             for gap in blocking_gaps:
-                bounds = gap_bounds(gap)
+                bounds = self._known_gap_bounds(gap)
                 if bounds is None:
                     continue
                 if not force_refetch_gaps and not self.cache.should_retry_gap(gap):
@@ -5494,7 +5499,10 @@ class FillEventsManager:
                 await self.refresh(start_ms=retry_start, end_ms=retry_end)
             if retried_ranges:
                 await self.refresh_latest(overlap=overlap)
-                blocking_gaps = blocking_known_gaps()
+                blocking_gaps = self._blocking_known_gaps(
+                    start_ms=start_ms,
+                    end_ms=coverage_end_ms,
+                )
             if blocking_gaps:
                 if not retried_ranges:
                     # Historical coverage may remain blocked after its bounded
@@ -5503,45 +5511,30 @@ class FillEventsManager:
                     # cache current without weakening the PnL coverage gate.
                     await self.refresh_latest(overlap=overlap)
                 gap = blocking_gaps[0]
-                bounds = gap_bounds(gap)
+                bounds = self._known_gap_bounds(gap)
                 range_label = (
                     f"{_format_ms(bounds[0])}..{_format_ms(bounds[1])}"
                     if bounds is not None
                     else "unknown"
                 )
+                gap_info = gap if isinstance(gap, dict) else {}
                 logger.warning(
                     "[fills] lookback coverage remains unproven because known gap overlaps requested window | start=%s gap=%s reason=%s retry_count=%s confidence=%s",
                     _format_ms(start_ms),
                     range_label,
-                    str(gap.get("reason", "unknown")),
-                    str(gap.get("retry_count", "unknown")),
-                    str(gap.get("confidence", "unknown")),
+                    str(gap_info.get("reason", "malformed")),
+                    str(gap_info.get("retry_count", "unknown")),
+                    str(gap_info.get("confidence", "unknown")),
                 )
                 return True
 
-        metadata = self.cache.load_metadata()
-        covered_start_ms = int(metadata.get("covered_start_ms", 0) or 0)
+        coverage_status = self.get_coverage_status(
+            start_ms=start_ms,
+            end_ms=coverage_end_ms,
+        )
         oldest_event_ts = int(self._events[0].timestamp) if self._events else 0
-        metadata_oldest_event_ts = int(metadata.get("oldest_event_ts", 0) or 0)
-        metadata_newest_event_ts = int(metadata.get("newest_event_ts", 0) or 0)
-        metadata_indicates_no_cached_fills = (
-            metadata_oldest_event_ts <= 0 and metadata_newest_event_ts <= 0
-        )
-        metadata_claims_history_without_events = (
-            not self._events
-            and (metadata_oldest_event_ts > 0 or metadata_newest_event_ts > 0)
-            and covered_start_ms > 0
-            and covered_start_ms <= start_ms
-        )
-        lookback_covered = (
-            covered_start_ms > 0 and covered_start_ms <= start_ms and bool(self._events)
-        ) or (
-            covered_start_ms > 0
-            and covered_start_ms <= start_ms
-            and metadata_indicates_no_cached_fills
-        )
-
-        if lookback_covered:
+        covered_start_ms = int(coverage_status.get("covered_start_ms", 0) or 0)
+        if bool(coverage_status.get("ready", False)):
             logger.debug(
                 "[fills] lookback already covered from %s (covered_start=%s oldest_event=%s); refreshing latest",
                 _format_ms(start_ms),
@@ -5551,7 +5544,7 @@ class FillEventsManager:
             await self.refresh_latest(overlap=overlap)
             return True
 
-        if metadata_claims_history_without_events:
+        if coverage_status.get("reason") == "cache_metadata_event_mismatch":
             logger.warning(
                 "[fills] cache metadata claims lookback coverage from %s, but no cached events were loaded; rebuilding from requested lookback",
                 _format_ms(covered_start_ms),
@@ -5584,6 +5577,124 @@ class FillEventsManager:
 
         self.cache.mark_covered_start(start_ms)
         return True
+
+    @staticmethod
+    def _known_gap_bounds(gap: object) -> Optional[Tuple[int, int]]:
+        if not isinstance(gap, dict):
+            return None
+        try:
+            gap_start = int(gap["start_ts"])
+            gap_end = int(gap["end_ts"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if gap_end <= gap_start:
+            return None
+        return gap_start, gap_end
+
+    @staticmethod
+    def _known_gap_confirmed_legitimate(gap: object) -> bool:
+        if not isinstance(gap, dict):
+            return False
+        reason = str(gap.get("reason", "") or "").lower()
+        try:
+            confidence = float(gap.get("confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        return reason == GAP_REASON_CONFIRMED or confidence >= GAP_CONFIDENCE_CONFIRMED
+
+    def _blocking_known_gaps(
+        self,
+        *,
+        start_ms: Optional[int],
+        end_ms: Optional[int],
+    ) -> List[object]:
+        window_start = 0 if start_ms is None else int(start_ms)
+        window_end = (2**63 - 1) if end_ms is None else int(end_ms)
+        known_gaps = self.cache.get_known_gaps()
+        if not isinstance(known_gaps, list):
+            return [None]
+        blocking: List[object] = []
+        for gap in known_gaps:
+            bounds = FillEventsManager._known_gap_bounds(gap)
+            if bounds is None:
+                blocking.append(gap)
+                continue
+            if FillEventsManager._known_gap_confirmed_legitimate(gap):
+                continue
+            gap_start, gap_end = bounds
+            if gap_start < window_end and gap_end > window_start:
+                blocking.append(gap)
+        return blocking
+
+    def get_coverage_status(
+        self,
+        *,
+        start_ms: Optional[int],
+        end_ms: Optional[int] = None,
+    ) -> Dict[str, object]:
+        """Return the canonical fill-history coverage verdict.
+
+        Callers must load the manager before asking it to judge coverage.
+        """
+        metadata = self.cache.load_metadata()
+        history_scope = self.get_history_scope()
+        covered_start_ms = int(metadata.get("covered_start_ms", 0) or 0)
+        metadata_oldest = int(metadata.get("oldest_event_ts", 0) or 0)
+        metadata_newest = int(metadata.get("newest_event_ts", 0) or 0)
+        status: Dict[str, object] = {
+            "ready": False,
+            "reason": "cache_not_loaded",
+            "history_scope": history_scope,
+            "covered_start_ms": covered_start_ms,
+            "oldest_event_ts": metadata_oldest,
+        }
+        if getattr(self, "_loaded", True) is False:
+            return status
+
+        blocking_gaps = FillEventsManager._blocking_known_gaps(
+            self,
+            start_ms=start_ms,
+            end_ms=end_ms,
+        )
+        if blocking_gaps:
+            gap = blocking_gaps[0]
+            bounds = FillEventsManager._known_gap_bounds(gap)
+            status.update(
+                {
+                    "reason": (
+                        "malformed_known_gap"
+                        if bounds is None
+                        else "known_gap_overlaps_lookback"
+                    ),
+                    "gap_start_ts": bounds[0] if bounds is not None else 0,
+                    "gap_end_ts": bounds[1] if bounds is not None else 0,
+                    "gap_reason": (
+                        str(gap.get("reason", "unknown"))
+                        if isinstance(gap, dict)
+                        else "malformed"
+                    ),
+                }
+            )
+            return status
+
+        if not self._events and (metadata_oldest > 0 or metadata_newest > 0):
+            status["reason"] = "cache_metadata_event_mismatch"
+            return status
+
+        if history_scope == "all":
+            status.update({"ready": True, "reason": "full_history"})
+            return status
+
+        if start_ms is None:
+            status["reason"] = "full_history_scope_not_proven"
+            return status
+
+        if covered_start_ms > 0 and covered_start_ms <= int(start_ms):
+            status.update({"ready": True, "reason": "window_covered"})
+            return status
+
+        status["reason"] = "window_coverage_not_proven"
+        return status
 
     async def refresh_range(
         self,
@@ -6465,6 +6576,148 @@ class HyperliquidFetcher(BaseFetcher):
             "client_order_id": str(client_order_id or ""),
             "raw": [{"source": "fetch_my_trades", "data": trade}],
             "c_mult": float(info.get("contractMultiplier") or info.get("multiplier") or 1.0),
+        }
+
+
+class BitunixFetcher(BaseFetcher):
+    """Fetch canonical Bitunix futures fills from its native trade history."""
+
+    def __init__(self, api, *, trade_limit: int = 100) -> None:
+        self.api = api
+        self.trade_limit = max(1, min(100, int(trade_limit)))
+
+    async def fetch(
+        self,
+        since_ms: Optional[int],
+        until_ms: Optional[int],
+        detail_cache: Dict[str, Tuple[str, str]],
+        on_batch: Optional[Callable[[List[Dict[str, object]]], None]] = None,
+    ) -> List[Dict[str, object]]:
+        params = {}
+        if until_ms is not None:
+            params["until"] = int(until_ms)
+        trades = await self.api.fetch_my_trades(
+            symbol=None,
+            since=int(since_ms) if since_ms is not None else None,
+            limit=self.trade_limit,
+            params=params,
+        )
+        events = [self._normalize_trade(trade) for trade in trades]
+        events.sort(key=lambda event: event["timestamp"])
+        await self._enrich_client_order_ids(events, detail_cache)
+        if on_batch and events:
+            on_batch(events)
+        for event in events:
+            detail_cache[str(event["id"])] = (
+                str(event.get("client_order_id") or ""),
+                str(event.get("pb_order_type") or "unknown"),
+            )
+        return events
+
+    async def _enrich_client_order_ids(
+        self,
+        events: List[Dict[str, object]],
+        detail_cache: Dict[str, Tuple[str, str]],
+    ) -> None:
+        missing_by_order: Dict[
+            Tuple[str, str], List[Dict[str, object]]
+        ] = defaultdict(list)
+        for event in events:
+            cached = detail_cache.get(str(event["id"]))
+            if cached:
+                event["client_order_id"], event["pb_order_type"] = cached
+            elif not event.get("client_order_id"):
+                missing_by_order[
+                    (str(event["order_id"]), str(event["symbol"]))
+                ].append(event)
+
+        semaphore = asyncio.Semaphore(4)
+
+        async def fetch_detail(key: Tuple[str, str]):
+            order_id, symbol = key
+            try:
+                async with semaphore:
+                    order = await self.api.fetch_order(order_id, symbol)
+            except OrderNotFound:
+                return key, ""
+            info = order.get("info") if isinstance(order, dict) else {}
+            client_order_id = (
+                str(order.get("clientOrderId") or "")
+                if isinstance(order, dict)
+                else ""
+            )
+            if not client_order_id and isinstance(info, dict):
+                client_order_id = str(info.get("clientId") or "")
+            return key, client_order_id
+
+        if missing_by_order:
+            results = await asyncio.gather(
+                *(fetch_detail(key) for key in missing_by_order)
+            )
+            for key, client_order_id in results:
+                pb_order_type = (
+                    custom_id_to_snake(client_order_id)
+                    if client_order_id
+                    else "unknown"
+                )
+                for event in missing_by_order[key]:
+                    event["client_order_id"] = client_order_id
+                    event["pb_order_type"] = pb_order_type
+
+        for event in events:
+            if not event.get("pb_order_type"):
+                event["pb_order_type"] = "unknown"
+
+    @staticmethod
+    def _normalize_trade(trade: Dict[str, object]) -> Dict[str, object]:
+        info = trade.get("info") or {}
+        trade_id = str(trade.get("id") or info.get("tradeId") or "")
+        order_id = str(trade.get("order") or info.get("orderId") or "")
+        timestamp = int(trade.get("timestamp") or info.get("ctime") or 0)
+        symbol = str(trade.get("symbol") or "")
+        side = str(trade.get("side") or "").lower()
+        position_side = str(info.get("positionSide") or "").lower()
+        if not trade_id or not order_id or timestamp <= 0 or not symbol:
+            raise ValueError(
+                "Bitunix fill is missing id, order id, timestamp, or symbol"
+            )
+        if side not in {"buy", "sell"}:
+            raise ValueError(f"Bitunix fill has invalid side: {side!r}")
+        if position_side not in {"long", "short"}:
+            raise ValueError(
+                f"Bitunix fill has invalid positionSide: {position_side!r}"
+            )
+        qty = abs(float(trade.get("amount") or info.get("qty") or 0.0))
+        price = float(trade.get("price") or info.get("price") or 0.0)
+        if "realizedPNL" not in info:
+            raise ValueError("Bitunix fill is missing realizedPNL")
+        pnl = float(info["realizedPNL"])
+        if not all(math.isfinite(value) for value in (qty, price, pnl)):
+            raise ValueError("Bitunix fill has non-finite qty, price, or realizedPNL")
+        if qty <= 0.0 or price <= 0.0:
+            raise ValueError("Bitunix fill has non-positive qty or price")
+        client_order_id = str(
+            trade.get("clientOrderId") or info.get("clientId") or ""
+        )
+        pb_order_type = (
+            custom_id_to_snake(client_order_id) if client_order_id else "unknown"
+        )
+        return {
+            "id": trade_id,
+            "order_id": order_id,
+            "timestamp": timestamp,
+            "datetime": ts_to_date(timestamp),
+            "symbol": symbol,
+            "side": side,
+            "qty": qty,
+            "price": price,
+            "pnl": pnl,
+            "fees": trade.get("fees") or trade.get("fee"),
+            "pb_order_type": pb_order_type,
+            "position_side": position_side,
+            "client_order_id": client_order_id,
+            "raw": [{"source": "fetch_my_trades", "data": dict(trade)}],
+            "c_mult": 1.0,
         }
 
 
@@ -8045,6 +8298,7 @@ def normalize_uta_fill_payload(
 EXCHANGE_BOT_CLASSES: Dict[str, Tuple[str, str]] = {
     "binance": ("exchanges.binance", "BinanceBot"),
     "bitget": ("exchanges.bitget", "BitgetBot"),
+    "bitunix": ("exchanges.bitunix", "BitunixBot"),
     "bybit": ("exchanges.bybit", "BybitBot"),
     "fake": ("exchanges.fake", "FakeBot"),
     "hyperliquid": ("exchanges.hyperliquid", "HyperliquidBot"),
@@ -8194,6 +8448,8 @@ def _build_fetcher_for_bot(bot, symbols: List[str]) -> BaseFetcher:
             api=bot.cca,
             symbol_resolver=lambda value: resolver(value),
         )
+    if exchange == "bitunix":
+        return BitunixFetcher(api=bot.cca)
     if exchange == "bybit":
         return BybitFetcher(api=bot.cca)
     if exchange == "fake":
@@ -8213,7 +8469,9 @@ def _build_fetcher_for_bot(bot, symbols: List[str]) -> BaseFetcher:
         return OkxFetcher(api=bot.cca)
     if exchange == "weex":
         return WeexFetcher(api=bot.cca)
-    supported = "binance, bitget, bybit, fake, gateio, hyperliquid, kucoin, okx, weex"
+    supported = (
+        "binance, bitget, bitunix, bybit, fake, gateio, hyperliquid, kucoin, okx, weex"
+    )
     raise ValueError(
         f"Unsupported exchange '{exchange}' for live fill events; realized PnL, "
         f"unstuck accounting, and HSL replay require an exchange-specific fetcher. "

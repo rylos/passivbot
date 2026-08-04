@@ -11,6 +11,7 @@ from .bot import (
 )
 from .coerce import normalize_hsl_cooldown_position_policy, normalize_hsl_signal_mode
 from .shared_bot import get_grouped_bot_value
+from .schema import MAX_EXCHANGE_SYMBOL_UNAVAILABLE_COOLDOWN_HOURS
 from .strategy import (
     BOT_POSITION_SIDES,
     get_active_strategy_side,
@@ -151,6 +152,24 @@ def validate_config(
             "config.live.limit_order_create_max_market_dist_pct must be "
             "finite and >= 0.0 and < 1.0"
         )
+    order_match_tolerance_raw = config["live"]["order_match_tolerance_pct"]
+    if isinstance(order_match_tolerance_raw, bool):
+        raise TypeError("config.live.order_match_tolerance_pct must be numeric")
+    try:
+        order_match_tolerance = float(order_match_tolerance_raw)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            "config.live.order_match_tolerance_pct must be numeric"
+        ) from exc
+    if (
+        not math.isfinite(order_match_tolerance)
+        or order_match_tolerance < 0.0
+        or order_match_tolerance > 0.01
+    ):
+        raise ValueError(
+            "config.live.order_match_tolerance_pct must be finite and between "
+            "0.0 and 0.01 inclusive"
+        )
     try:
         active_tail_gap_minutes = float(
             config["live"]["max_active_candle_tail_gap_minutes"]
@@ -173,6 +192,25 @@ def validate_config(
         raise ValueError(
             "config.live.max_forager_candle_refresh_seconds must be finite and > 0.0"
         )
+    try:
+        ws_candle_audit_minutes = float(
+            config["live"]["forager_ws_candle_rest_audit_minutes"]
+        )
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            "config.live.forager_ws_candle_rest_audit_minutes must be numeric"
+        ) from exc
+    if (
+        not math.isfinite(ws_candle_audit_minutes)
+        or ws_candle_audit_minutes <= 0.0
+        or ws_candle_audit_minutes > 60.0
+    ):
+        raise ValueError(
+            "config.live.forager_ws_candle_rest_audit_minutes must be finite, "
+            "> 0.0 and <= 60.0"
+        )
+    if not isinstance(config["live"]["enable_forager_ws_candles"], bool):
+        raise TypeError("config.live.enable_forager_ws_candles must be a boolean")
     for key in ("fee_pct_fallback", "fee_pct_sanity_abs_max"):
         try:
             value = float(config["live"][key])
@@ -193,6 +231,35 @@ def validate_config(
         raise TypeError("config.live.fee_conversion_max_age_ms must be an integer")
     if fee_conversion_max_age_ms < 0:
         raise ValueError("config.live.fee_conversion_max_age_ms must be >= 0")
+    exchange_symbol_cooldown_raw = config["live"][
+        "exchange_symbol_unavailable_cooldown_hours"
+    ]
+    if isinstance(exchange_symbol_cooldown_raw, bool):
+        raise TypeError(
+            "config.live.exchange_symbol_unavailable_cooldown_hours must be numeric"
+        )
+    try:
+        exchange_symbol_cooldown_hours = float(exchange_symbol_cooldown_raw)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            "config.live.exchange_symbol_unavailable_cooldown_hours must be numeric"
+        ) from exc
+    if not math.isfinite(exchange_symbol_cooldown_hours):
+        raise ValueError(
+            "config.live.exchange_symbol_unavailable_cooldown_hours must be finite"
+        )
+    if exchange_symbol_cooldown_hours < 0.0:
+        raise ValueError(
+            "config.live.exchange_symbol_unavailable_cooldown_hours must be >= 0"
+        )
+    if (
+        exchange_symbol_cooldown_hours
+        > MAX_EXCHANGE_SYMBOL_UNAVAILABLE_COOLDOWN_HOURS
+    ):
+        raise ValueError(
+            "config.live.exchange_symbol_unavailable_cooldown_hours must be <= "
+            f"{MAX_EXCHANGE_SYMBOL_UNAVAILABLE_COOLDOWN_HOURS:g}"
+        )
     activation_raw = config["live"]["order_replacement_churn_gate_activation_count"]
     if isinstance(activation_raw, bool) or not isinstance(activation_raw, int):
         raise TypeError(
@@ -207,7 +274,6 @@ def validate_config(
         "order_replacement_churn_gate_window_minutes",
         "order_replacement_churn_gate_stability_minutes",
         "order_replacement_churn_gate_market_dist_pct",
-        "order_replacement_churn_gate_tracking_tolerance_pct",
     ):
         try:
             value = float(config["live"][key])
@@ -219,8 +285,6 @@ def validate_config(
     window = churn_numeric["order_replacement_churn_gate_window_minutes"]
     stability = churn_numeric["order_replacement_churn_gate_stability_minutes"]
     distance = churn_numeric["order_replacement_churn_gate_market_dist_pct"]
-    tracking = churn_numeric["order_replacement_churn_gate_tracking_tolerance_pct"]
-    tight = float(config["live"]["order_match_tolerance_pct"])
     if activation_raw > 0 and window <= 0.0:
         raise ValueError(
             "config.live.order_replacement_churn_gate_window_minutes must be > 0 when enabled"
@@ -232,10 +296,6 @@ def validate_config(
     if distance < 0.0 or distance >= 1.0:
         raise ValueError(
             "config.live.order_replacement_churn_gate_market_dist_pct must be >= 0 and < 1"
-        )
-    if tracking <= tight or tracking >= 1.0:
-        raise ValueError(
-            "config.live.order_replacement_churn_gate_tracking_tolerance_pct must be greater than order_match_tolerance_pct and < 1"
         )
     max_cancellations = int(config["live"]["max_n_cancellations_per_batch"])
     max_creations = int(config["live"]["max_n_creations_per_batch"])

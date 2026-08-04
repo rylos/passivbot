@@ -1,3 +1,4 @@
+import asyncio
 import importlib
 import logging as pylogging
 import sys
@@ -20,12 +21,18 @@ def stubbed_modules(monkeypatch):
     pr_module.order_type_id_to_snake = lambda *args, **kwargs: "unknown"
     pr_module.calc_min_entry_qty_py = lambda *args, **kwargs: 0.0
     pr_module.calc_min_close_qty_py = lambda *args, **kwargs: 0.0
+    pr_module.get_strategy_kinds = lambda: ["trailing_martingale", "ema_anchor"]
+    pr_module.get_strategy_spec = lambda _kind: {
+        "parameters": [],
+        "fixed_parameters": [],
+    }
     pr_module.__getattr__ = lambda name: (lambda *args, **kwargs: 0)
     monkeypatch.setitem(sys.modules, "passivbot_rust", pr_module)
 
     # Stub ccxt modules
     errors_module = types.ModuleType("ccxt.base.errors")
     errors_module.NetworkError = Exception
+    errors_module.OrderNotFound = Exception
     errors_module.RateLimitExceeded = Exception
     monkeypatch.setitem(sys.modules, "ccxt.base.errors", errors_module)
 
@@ -227,6 +234,451 @@ async def test_hyperliquid_ws_order_recovers_semantics_from_exact_acknowledged_i
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("side", "raw_side", "position_side", "reduce_only"),
+    [
+        ("buy", "B", "long", False),
+        ("sell", "A", "long", True),
+    ],
+)
+async def test_hyperliquid_ws_order_recovers_semantics_from_open_snapshot_after_restart(
+    stubbed_modules,
+    monkeypatch,
+    caplog,
+    side,
+    raw_side,
+    position_side,
+    reduce_only,
+):
+    hyperliquid_module = importlib.import_module("exchanges.hyperliquid")
+    HyperliquidBot = hyperliquid_module.HyperliquidBot
+    monkeypatch.setattr(hyperliquid_module.time, "monotonic", lambda: 100.0)
+    caplog.set_level(pylogging.WARNING)
+    bot = HyperliquidBot.__new__(HyperliquidBot)
+    bot.stop_websocket = False
+    bot._health_ws_reconnects = 0
+    bot._health_rate_limits = 0
+    bot._log_symbols = lambda symbols, limit=8: ",".join(symbols[:limit])
+    bot._hl_note_ws_symbols_for_dex_scope = lambda _orders: None
+    bot.orders_emitted_to_exchange = []
+    bot.open_orders = {
+        "BTC/USDC:USDC": [
+            {
+                "id": "123",
+                "symbol": "BTC/USDC:USDC",
+                "side": side,
+                "position_side": position_side,
+                "amount": 0.01,
+                "clientOrderId": "entry_initial_normal_long_local",
+                "info": {"oid": 123, "side": raw_side, "reduceOnly": reduce_only},
+            }
+        ]
+    }
+    bot._hl_note_authoritative_open_order_semantics(
+        bot.open_orders["BTC/USDC:USDC"]
+    )
+    # Reconciliation may remove the order before its terminal WS row arrives.
+    bot.open_orders = {}
+    handled = []
+    dirty = []
+    bot.handle_order_update = lambda orders: handled.append(orders)
+    bot._mark_account_critical_state_dirty = lambda **kwargs: dirty.append(kwargs)
+
+    watch_calls = 0
+
+    async def watch_orders():
+        nonlocal watch_calls
+        watch_calls += 1
+        if watch_calls == 2:
+            bot.stop_websocket = True
+        return [
+            {
+                "id": "123",
+                "symbol": "BTC/USDC:USDC",
+                "side": side,
+                "amount": 0.01,
+                "clientOrderId": "entry_initial_normal_long_local",
+                # Native WS omits reduceOnly; current CCXT synthesizes None.
+                "reduceOnly": None,
+                "info": {"oid": 123, "side": raw_side, "sz": "0.01"},
+            }
+        ]
+
+    bot.ccp = types.SimpleNamespace(watch_orders=watch_orders)
+
+    await bot.watch_orders()
+
+    assert dirty == []
+    assert len(handled) == 2
+    for [order] in handled:
+        assert order["position_side"] == position_side
+        assert order["reduceOnly"] is reduce_only
+        assert order["_pb_order_semantics_source"] == "authoritative_open_order_snapshot"
+        assert order["_pb_order_update_requires_authoritative_refresh"] is True
+    bot.order_matches_recent_execution = lambda _order: True
+    bot.order_matches_bot_cancellation = lambda _order: True
+    for batch in handled:
+        assert bot._ws_order_update_is_self_echo(batch) is False
+    assert not any(
+        "lacked authoritative order semantics" in rec.message
+        for rec in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_hyperliquid_ws_order_rejects_ambiguous_open_snapshot_identity(
+    stubbed_modules,
+):
+    HyperliquidBot = importlib.import_module("exchanges.hyperliquid").HyperliquidBot
+    bot = HyperliquidBot.__new__(HyperliquidBot)
+    bot.open_orders = {
+        "BTC/USDC:USDC": [
+            {
+                "id": "123",
+                "side": "buy",
+                "position_side": "long",
+                "info": {"reduceOnly": False},
+            },
+            {
+                "id": "123",
+                "side": "buy",
+                "position_side": "long",
+                "info": {"reduceOnly": False},
+            },
+        ]
+    }
+    sparse = {
+        "id": "123",
+        "side": "buy",
+        "info": {"oid": 123, "side": "B"},
+    }
+    bot.orders_emitted_to_exchange = [
+        {
+            "exchange_id": "123",
+            "side": "buy",
+            "position_side": "long",
+            "reduce_only": False,
+            "status": "acknowledged",
+        }
+    ]
+
+    assert bot._hl_open_snapshot_ws_order_semantics(sparse) is None
+    assert bot._hl_recover_ws_order_semantics(sparse) is None
+
+
+@pytest.mark.asyncio
+async def test_hyperliquid_ws_order_rejects_open_snapshot_semantic_contradiction(
+    stubbed_modules,
+):
+    HyperliquidBot = importlib.import_module("exchanges.hyperliquid").HyperliquidBot
+    bot = HyperliquidBot.__new__(HyperliquidBot)
+    bot.open_orders = {
+        "BTC/USDC:USDC": [
+            {
+                "id": "123",
+                "side": "buy",
+                "position_side": "long",
+                "info": {"reduceOnly": False},
+            }
+        ]
+    }
+    sparse = {
+        "id": "123",
+        "side": "buy",
+        "info": {"oid": 123, "side": "B", "reduceOnly": True},
+    }
+    bot.orders_emitted_to_exchange = [
+        {
+            "exchange_id": "123",
+            "side": "buy",
+            "position_side": "long",
+            "reduce_only": False,
+            "status": "acknowledged",
+        }
+    ]
+
+    assert bot._hl_open_snapshot_ws_order_semantics(sparse) is None
+    assert bot._hl_recover_ws_order_semantics(sparse) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_recent_cache", [False, True])
+async def test_hyperliquid_ws_order_rejects_snapshot_client_id_contradiction(
+    stubbed_modules,
+    use_recent_cache,
+):
+    HyperliquidBot = importlib.import_module("exchanges.hyperliquid").HyperliquidBot
+    bot = HyperliquidBot.__new__(HyperliquidBot)
+    existing = {
+        "id": "123",
+        "side": "buy",
+        "position_side": "long",
+        "clientOrderId": "entry_initial_normal_long_local",
+        "info": {"oid": 123, "side": "B", "reduceOnly": False},
+    }
+    bot.open_orders = {"BTC/USDC:USDC": [existing]}
+    if use_recent_cache:
+        bot._hl_note_authoritative_open_order_semantics([existing])
+        bot.open_orders = {}
+    sparse = {
+        "id": "123",
+        "side": "buy",
+        "clientOrderId": "entry_initial_normal_long_different",
+        "info": {"oid": 123, "side": "B"},
+    }
+
+    snapshot_state, recovered = (
+        bot._hl_open_snapshot_ws_order_semantics_evidence(sparse)
+    )
+
+    assert snapshot_state == "invalid"
+    assert recovered is None
+
+
+@pytest.mark.asyncio
+async def test_hyperliquid_ws_order_rejects_snapshot_exchange_id_contradiction(
+    stubbed_modules,
+):
+    HyperliquidBot = importlib.import_module("exchanges.hyperliquid").HyperliquidBot
+    bot = HyperliquidBot.__new__(HyperliquidBot)
+    bot.open_orders = {
+        "BTC/USDC:USDC": [
+            {
+                "id": "123",
+                "side": "buy",
+                "position_side": "long",
+                "info": {"oid": 456, "side": "B", "reduceOnly": False},
+            }
+        ]
+    }
+    bot._hl_open_order_semantics_by_exchange_id = {
+        "123": {
+            "side": "buy",
+            "position_side": "long",
+            "reduce_only": False,
+            "client_id": "",
+            "last_seen_ms": 1,
+        }
+    }
+    bot.orders_emitted_to_exchange = [
+        {
+            "exchange_id": "123",
+            "side": "buy",
+            "position_side": "long",
+            "reduce_only": False,
+            "status": "acknowledged",
+        }
+    ]
+    sparse = {
+        "id": "123",
+        "side": "buy",
+        "info": {"oid": 123, "side": "B"},
+    }
+
+    snapshot_state, recovered = (
+        bot._hl_open_snapshot_ws_order_semantics_evidence(sparse)
+    )
+
+    assert snapshot_state == "invalid"
+    assert recovered is None
+    assert bot._hl_recover_ws_order_semantics(sparse) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("contradiction", ["client_id", "exchange_id"])
+async def test_hyperliquid_authoritative_snapshot_contradiction_invalidates_cache(
+    stubbed_modules,
+    contradiction,
+):
+    HyperliquidBot = importlib.import_module("exchanges.hyperliquid").HyperliquidBot
+    bot = HyperliquidBot.__new__(HyperliquidBot)
+    valid = {
+        "id": "123",
+        "side": "buy",
+        "position_side": "long",
+        "clientOrderId": "entry_initial_normal_long_local",
+        "info": {"oid": 123, "side": "B", "reduceOnly": False},
+    }
+    bot._hl_note_authoritative_open_order_semantics([valid])
+    contradictory = dict(valid)
+    contradictory["info"] = dict(valid["info"])
+    if contradiction == "client_id":
+        contradictory["info"]["cloid"] = "entry_initial_normal_long_different"
+    else:
+        contradictory["info"]["oid"] = 456
+
+    bot._hl_note_authoritative_open_order_semantics([contradictory])
+
+    assert "123" not in bot._hl_open_order_semantics_by_exchange_id
+
+
+@pytest.mark.asyncio
+async def test_hyperliquid_ws_order_rejects_expired_open_snapshot_semantics(
+    stubbed_modules,
+    monkeypatch,
+):
+    hyperliquid_module = importlib.import_module("exchanges.hyperliquid")
+    HyperliquidBot = hyperliquid_module.HyperliquidBot
+    now = {"ms": 1_000_000}
+    monkeypatch.setattr(hyperliquid_module, "utc_ms", lambda: now["ms"])
+    bot = HyperliquidBot.__new__(HyperliquidBot)
+    bot.open_orders = {}
+    bot._hl_note_authoritative_open_order_semantics(
+        [
+            {
+                "id": "123",
+                "side": "buy",
+                "position_side": "long",
+                "info": {"reduceOnly": False},
+            }
+        ]
+    )
+    now["ms"] += bot.ORDER_WS_OPEN_SNAPSHOT_SEMANTICS_TTL_MS + 1
+    sparse = {
+        "id": "123",
+        "side": "buy",
+        "info": {"oid": 123, "side": "B"},
+    }
+
+    assert bot._hl_open_snapshot_ws_order_semantics(sparse) is None
+
+
+@pytest.mark.asyncio
+async def test_hyperliquid_ws_open_race_waits_for_exact_create_ack(
+    stubbed_modules, monkeypatch, caplog
+):
+    hyperliquid_module = importlib.import_module("exchanges.hyperliquid")
+    HyperliquidBot = hyperliquid_module.HyperliquidBot
+    caplog.set_level(pylogging.WARNING)
+    bot = HyperliquidBot.__new__(HyperliquidBot)
+    bot.stop_websocket = False
+    bot._health_ws_reconnects = 0
+    bot._health_rate_limits = 0
+    bot._log_symbols = lambda symbols, limit=8: ",".join(symbols[:limit])
+    bot._hl_note_ws_symbols_for_dex_scope = lambda _orders: None
+    bot.get_exchange_time = lambda: 1_000
+    submitted = {
+        "timestamp": 900,
+        "exchange_id": "",
+        "side": "buy",
+        "position_side": "long",
+        "reduce_only": False,
+        "pb_type": "entry_initial_normal_long",
+        "status": "submitted",
+    }
+    bot.orders_emitted_to_exchange = [submitted]
+    handled = []
+    dirty = []
+    bot.handle_order_update = lambda orders: handled.append(orders)
+    bot._mark_account_critical_state_dirty = lambda **kwargs: dirty.append(kwargs)
+    delays = []
+
+    async def acknowledge_during_grace(delay):
+        delays.append(delay)
+        submitted["exchange_id"] = "123"
+        submitted["status"] = "acknowledged"
+
+    monkeypatch.setattr(hyperliquid_module.asyncio, "sleep", acknowledge_during_grace)
+
+    async def watch_orders():
+        bot.stop_websocket = True
+        return [
+            {
+                "id": "123",
+                "symbol": "BTC/USDC:USDC",
+                "status": "open",
+                "side": "buy",
+                "amount": 0.01,
+                "info": {"oid": 123, "side": "B", "sz": "0.01"},
+            }
+        ]
+
+    bot.ccp = types.SimpleNamespace(watch_orders=watch_orders)
+
+    await bot.watch_orders()
+
+    assert delays == [bot.ORDER_WS_CREATE_ACK_GRACE_SECONDS]
+    assert dirty == []
+    assert len(handled) == 1
+    assert handled[0][0]["position_side"] == "long"
+    assert (
+        handled[0][0]["_pb_order_semantics_source"]
+        == "acknowledged_exchange_order_id"
+    )
+    assert not any(
+        "lacked authoritative order semantics" in rec.message
+        for rec in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_hyperliquid_create_records_fast_ack_before_slow_sibling_finishes(
+    stubbed_modules,
+):
+    HyperliquidBot = importlib.import_module("exchanges.hyperliquid").HyperliquidBot
+    bot = HyperliquidBot.__new__(HyperliquidBot)
+    slow_release = asyncio.Event()
+    fast_finished = asyncio.Event()
+    recorded = []
+
+    async def execute_order(order):
+        if order["symbol"] == "SLOW/USDC:USDC":
+            await slow_release.wait()
+        else:
+            fast_finished.set()
+        return {
+            "id": order["exchange_id"],
+            "status": "open",
+            "info": {"resting": {}},
+        }
+
+    async def handle_failures(_failures):
+        return None
+
+    bot.execute_order = execute_order
+    bot._handle_order_write_failures = handle_failures
+    bot._record_emitted_order_custom_id = lambda order, **_kwargs: recorded.append(
+        dict(order)
+    )
+    orders = [
+        {
+            "symbol": "SLOW/USDC:USDC",
+            "exchange_id": "1",
+            "side": "buy",
+            "position_side": "long",
+            "reduce_only": False,
+        },
+        {
+            "symbol": "FAST/USDC:USDC",
+            "exchange_id": "2",
+            "side": "buy",
+            "position_side": "long",
+            "reduce_only": False,
+        },
+    ]
+
+    batch = asyncio.create_task(bot.execute_orders(orders))
+    await fast_finished.wait()
+    await asyncio.sleep(0)
+
+    assert not batch.done()
+    assert recorded == [
+        {
+            "id": "2",
+            "status": "open",
+            "info": {"resting": {}},
+            **orders[1],
+        }
+    ]
+
+    slow_release.set()
+    results = await batch
+
+    assert [result["id"] for result in results] == ["1", "2"]
+    assert [order["id"] for order in recorded] == ["2", "1"]
+
+
 def test_hyperliquid_ws_order_rejects_ambiguous_acknowledged_id(stubbed_modules):
     HyperliquidBot = importlib.import_module("exchanges.hyperliquid").HyperliquidBot
     bot = HyperliquidBot.__new__(HyperliquidBot)
@@ -241,6 +693,29 @@ def test_hyperliquid_ws_order_rejects_ambiguous_acknowledged_id(stubbed_modules)
             "status": "acknowledged",
         }
         for timestamp in (1, 2)
+    ]
+
+    assert (
+        bot._hl_acknowledged_ws_order_semantics(
+            {"id": "123", "side": "buy", "amount": 0.01}
+        )
+        is None
+    )
+
+
+def test_hyperliquid_ws_order_rejects_unacknowledged_submitted_id(stubbed_modules):
+    HyperliquidBot = importlib.import_module("exchanges.hyperliquid").HyperliquidBot
+    bot = HyperliquidBot.__new__(HyperliquidBot)
+    bot.orders_emitted_to_exchange = [
+        {
+            "timestamp": 1,
+            "exchange_id": "123",
+            "side": "buy",
+            "position_side": "long",
+            "reduce_only": False,
+            "pb_type": "entry_initial_normal_long",
+            "status": "submitted",
+        }
     ]
 
     assert (
@@ -1335,11 +1810,6 @@ async def test_refresh_authoritative_state_staged_hyperliquid_publishes_final_ba
     bot.positions = {}
     bot.fetched_positions = []
     bot.fetched_open_orders = []
-    bot._authoritative_surface_signatures = {}
-    bot._authoritative_surface_generations = {}
-    bot._authoritative_refresh_epoch = 0
-    bot._authoritative_refresh_epoch_fresh = set()
-    bot._authoritative_refresh_epoch_changed = set()
     bot.state_change_detected_by_symbol = set()
     bot.execution_scheduled = False
     bot.recent_order_cancellations = []

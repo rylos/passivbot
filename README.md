@@ -1,6 +1,6 @@
 ![Passivbot](docs/images/pbot_logo_full.svg)
 
-# Trading bot running on Bybit, OKX, Bitget, GateIO, Binance, Kucoin, Hyperliquid and WEEX
+# Trading bot running on Bybit, OKX, Bitget, Bitunix, GateIO, Binance, Kucoin, Hyperliquid and WEEX
 
 :warning: **Used at one's own risk** :warning:
 
@@ -252,6 +252,7 @@ https://partner.bitget.com/bg/Y8FU1W
 https://www.okx.com/join/PASSIVBOT  
 https://app.hyperliquid.xyz/join/PASSIVBOT  
 https://www.kucoin.com/r/broker/CX8QZQJX  
+https://www.weex.com/en/register?vipCode=ppc8
 
 **Note on Binance**  
 To support continued Passivbot development, please use a Binance account which  

@@ -67,9 +67,8 @@ instructions. At the baseline, the problem was fragmentation, not absence:
    `planning_unavailable` a typed path into monitor events, but the envelope is
    narrow: `kind`, `tags`, `payload`, `ts_ms`, `symbol`, `pside`.
 4. Structured freshness/planning models in `src/live/`.
-   `DataPacketMetadata`, `FreshnessLedger`, `PlanningSnapshot`, and
-   `PlanningAvailability` already model much of the information a proper event
-   stream needs.
+   `DataPacketMetadata`, `FreshnessLedger`, and `PlanningSnapshot` already model
+   much of the information a proper event stream needs.
 5. Domain-specific instrumentation hooks.
    `CandlestickManager` has remote fetch callback hooks. Fill refresh has fetch
    timing and coverage metadata. Order waves, staged refresh, HSL, EMA readiness,
@@ -161,7 +160,8 @@ Compatibility mapping:
 - Current monitor `kind` maps to `event_type`.
 - Current monitor `payload` maps to `data`.
 - Current text tags map to `tags`.
-- `_authoritative_refresh_epoch` should become or feed `cycle_id`.
+- `FreshnessLedger.epoch` feeds authoritative cohort diagnostics; `cycle_id`
+  remains the separate execution-loop lifecycle correlation id.
 - `PlanningSnapshot.snapshot_id` should pass through unchanged.
 
 ## Event Registry
@@ -191,7 +191,6 @@ stable names:
 - `snapshot.built`
 - `planning.unavailable`
 - `planning.defer_summary`
-- `planning.symbol_state`
 - `forager.selection`
 - `forager.feature_unavailable`
 - `ema.bundle.started`
@@ -408,8 +407,6 @@ The call to Rust should become a first-class event chain:
   Bounded summary plus hash for the full input payload, which is not persisted.
 - `rust_orchestrator.returned`
   Bounded summary plus hash for the output.
-- `planning.symbol_state`
-  Per-symbol non-tradable/deferred/reason state, compacted and throttled.
 - `action.planned`
   Per order or compact batch summary with reason and source.
 
@@ -572,8 +569,8 @@ After the event bus exists.
   captured with input digest.
 - Gatekeeper tests: stale market snapshot defers normal creates, panic close can
   use its reduced freshness contract, candidate-only stale EMA excludes the
-  candidate, and active/normal stale required EMA fails or defers loudly according
-  to its contract.
+  candidate, and active-symbol EMA absence is visible at the Rust consumer scope
+  without globally deferring independent actions.
 - Executor tests: partial create response emits an ambiguous event, terminal
   rejection emits a non-ambiguous rejected event, and confirmation requested is
   emitted before confirmation refresh.

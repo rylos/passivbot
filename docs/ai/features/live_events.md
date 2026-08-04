@@ -295,12 +295,16 @@ When the structured console is disabled or unavailable, the same bounded count r
 The account-wide replacement-churn policy emits structured, monitor-only summaries:
 
 - `order.churn_evidence` reports one bounded per-plan aggregation of RAM-history association
-  reasons, churn-evidenced order count, tracked symbol count, generation, and epoch resets.
-- `order.churn_admission` reports one bounded final-admission aggregation, including rolling action
-  count, threshold, decision reasons, and sampled market distances.
-- `order.churn_actions_accounted` records the action kind and number of logical creates or required
-  connector configuration writes debited immediately before each connector call, plus the resulting
-  rolling count. Cancellations are excluded from the generic window.
+  reasons, churn-evidenced order count, tracked symbol count, generation, and RAM-history clearing.
+  History starts empty and is cleared after planning failure, gate disablement, or a symbol leaving
+  the current ideal/active/open-order/nonzero-position universe. Flat position placeholders retained
+  by account-state normalization do not keep a departed symbol's churn history alive.
+- `order.churn_admission` reports one bounded final-admission aggregation after exchange
+  configuration and the final fresh-market check, including rolling create-attempt count, threshold,
+  decision reasons, and sampled market distances.
+- `order.churn_actions_accounted` records logical create attempts debited immediately before the
+  connector create call, plus the resulting rolling count. Configuration writes and cancellations
+  are excluded from the window; the retained `action_kind` field is therefore `create`.
 - `execution.cancel_first_barrier` reports create deferral after a stale-order cancellation. In
   effective hedge mode the scope is symbol and position side; in one-way mode it is the whole
   symbol because long and short share one net exchange position. Unrelated scopes may continue in
@@ -353,7 +357,6 @@ Stable per-record reason-count values are:
 - `conversion_zero_or_duplicate`
 - `debug_mode`
 - `exact_reconciliation_match`
-- `freshness_creation_guardrail`
 - `hsl_replay_pending`
 - `account_cancel_first_barrier`
 - `limit_order_create_market_distance`
@@ -407,10 +410,29 @@ The fixed fields are `action=create|cancel`,
 
 Terminal and ambiguous execution-order outcome events retain their existing envelope correlation,
 status, reason, action, bounded order metadata, result summaries, and optional bounded debug
-profiles. When an outcome carries an exception object or result, its payload retains only a bounded
-`error_type`; it omits exception text, unsafe exception class metadata, URLs, credentials, tokens,
-raw responses, and tracebacks. This diagnostic redaction does not alter event routing, emitter
-isolation, executor retries or re-raises, exchange calls, or trading behavior.
+profiles. When an outcome carries an exception object or result, its payload may retain bounded
+`error_type`, numeric status/code, a constrained exchange error label, and a bounded sanitized
+reason extracted from a structured exchange error payload. Exact top-level mappings, their
+`info` mapping, and up to eight exact OKX per-order `data` mappings use the same sanitizer;
+per-order `sCode`/`sMsg` takes precedence over a generic OKX envelope code/message. This
+structured rejection extraction applies only to failed or ambiguous/degraded outcomes; successful
+outcomes must not project connector-native success codes or messages as errors. This operator-facing reason is
+deliberately retained because the exchange's rejection explanation is often required to repair a
+live order failure. It omits raw response envelopes, unsafe exception class metadata, URLs,
+credentials, sensitive-marked values, long token-like values, and tracebacks. Live event and text
+logs remain private operational artifacts and must not be published without review. This
+diagnostic projection does not alter event routing, emitter isolation, executor retries or
+re-raises, exchange calls, or trading behavior.
+
+## Fill Confirmation Fallbacks
+
+`fill.position_price_tolerance_used` records the accepted bounded numeric difference
+between a reconstructed fill after-state price and the authoritative exchange position
+price. It includes the effective connector-aware price tick, absolute delta, delta in
+ticks, and applied tolerance; it contains no raw fill or exchange payload. The event is
+published only after identity, size, refresh-generation, and price predicates clear.
+The existing warning remains the console/text projection, so the structured event itself
+does not produce a second console line.
 
 ## HSL Replay Timing
 
@@ -439,6 +461,12 @@ terminal event.
 
 `forager.eligibility_changed` is a bounded structured/monitor-only record of approved/ignored
 membership changes. It does not retain config paths, raw sources, or full lists.
+Monitor market entries label a forager candidate only when the same live
+`is_approved` predicate admits its coin and position side, including minimum
+market age. Ranking-feature unavailability is refreshed from the active
+orchestrator EMA preparation path on every bundle load. Candidate-only EMA
+failures remain distinct from flat active/normal-symbol degradation; monitor
+tradability must not relabel the latter as a candidate-only failure.
 
 `config.market_compatibility` records configured symbols removed by existing market filters.
 Approved-symbol incompatibility is degraded; ignored-symbol incompatibility is skipped. HIP-3
@@ -489,11 +517,19 @@ helper apply the same type-only boundary.
 
 ## Execution-Loop Incidents
 
-An execution-loop failure publishes a bounded `error.bot` record and an equivalent first-occurrence
-operator signature. The stable diagnostic fields are operation/source, exception type, optional
-bounded status/code and endpoint, action, and cycle. This family excludes raw exception text,
-request URLs, response payloads, and traceback values. Stack frames may be retained only in the
-protected DEBUG text path and must not include the exception value.
+An execution-loop or startup failure publishes a bounded `error.bot` record and an equivalent
+operator signature. The stable diagnostic fields are incident id, operation/source, exception
+type, optional bounded status/code and endpoint, stage, innermost origin, action, and cycle. A
+companion private `error.bot.detail` record uses the same incident id and retains the bounded full
+exception-chain frame sequence at normal logging levels so a rare failure remains diagnosable
+without a DEBUG restart. The detail contains normalized file/function/line values but no exception
+text, locals, source lines, request URLs, or response payloads. Startup records use the exact
+pre-wrapper exception, including deterministic validation failures later wrapped as fatal process
+errors. The normal console keeps only the compact operator signature; its omission of the frame
+chain is a readability and volume decision, not a public/privacy boundary. Traceback projection is
+entirely observability-only: hostile or malformed exception accessors produce a bounded
+`projection_failed` detail instead of replacing the original error, its counter update,
+restart-threshold handling, startup propagation, or backoff.
 
 Equivalent repeats use `health.summary` with the execution-error-burst reason. Its latest-failure
 fields are `latest_error_type`, optional `latest_status`, `latest_code`, and `latest_endpoint`; it

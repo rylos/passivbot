@@ -39,6 +39,17 @@
    and update-only position timestamps do not establish this boundary. Successful use
    emits a warning and a structured fallback diagnostic only after every confirmation
    predicate, including the required post-snapshot fill generation, has cleared.
+   Ordinary recorded after-state price comparison accepts at most one effective
+   executable price tick because exchanges may round or truncate a sub-tick reconstructed
+   VWAP. The effective tick is connector-aware, including Hyperliquid's decimal and
+   significant-digit price ladder. It is derived from both compared prices so the
+   narrower, lower-side interval governs discrepancies that cross a power-of-ten
+   boundary; the inclusive boundary admits only floating-point representation slack.
+   Quantity and fill identity remain strict. The explicit position-opening replay retains
+   the ordinary half-tick comparison because it has no reconstructed VWAP rounding
+   evidence. Acceptance outside that comparison but within one full tick emits one
+   warning and `fill.position_price_tolerance_used` with bounded numeric discrepancy
+   context after confirmation clears; larger discrepancies remain pending.
 10. A degraded synthetic PnL row inside the configured live risk lookback is not
     authoritative merely because cache metadata proves time coverage. Refetch bounded
     windows around each such row, preserving the pre-repair incremental checkpoint and
@@ -47,15 +58,33 @@
     starve the others. Connectors whose authoritative PnL endpoint uses a timestamp
     different from execution time must search that timestamp independently in bounded,
     advancing windows while retaining the narrow execution lookup. Preserve ordinary
-    recent-fill overlap for routine ingestion, and defer risk planning without consuming
-    restart budget until every in-lookback row is authoritatively replaced. Report every
-    successful replacement before attempting later fallible fetches. Uptime health adds
-    the full authoritative net PnL when the previous cached value was not counted by this
-    process, and applies a delta against the exact net PnL previously counted for an
-    outstanding runtime synthetic row. Discard that temporary accounting after
-    enrichment; authoritative fills must not accumulate identity state. Structured
-    `cycle.degraded` diagnostics preserve bounded `pending_pnl_count` and
+    recent-fill overlap for routine ingestion. When an enabled PnL consumer requires
+    authoritative history, defer that planning without consuming restart budget until
+    every in-lookback row is authoritatively replaced. Report every successful
+    replacement before attempting later fallible fetches. Uptime health PnL counts
+    authoritative net realized PnL only: pending and synthetic values remain visible in
+    fill diagnostics but do not enter the health counter, and later enrichment adds the
+    full authoritative amount without retaining fill-identity accounting state.
+    PnL- or fee-only enrichment changes local accounting evidence and does not request
+    another account-wide confirmation. New source identities and structural fill changes
+    still confirm account surfaces because they may represent a new exchange-state transition.
+    Structured `cycle.degraded` diagnostics preserve bounded `pending_pnl_count` and
     `degraded_pnl_count` fields through the centralized payload sanitizer.
+11. `FillEventsManager` owns the canonical fill-history coverage verdict used by
+    refresh, staged readiness, HSL replay, and realized-PnL consumers. Orchestration
+    may choose retry timing or whether a proven-incomplete history is explicitly
+    allowed, but it must not reinterpret cache metadata or known gaps. Metadata
+    claiming cached rows when no rows loaded, and malformed known-gap bounds, are
+    contradictory cache evidence: they are unavailable rather than proof of
+    coverage. A window with no fills remains valid when zero oldest/newest metadata
+    and `covered_start_ms` prove that empty result.
+12. Live coverage requirements follow the enabled consumer. Realized-PnL risk
+    features require the configured PnL lookback and authoritative PnL quality.
+    Entry cooldown without a PnL consumer requires structural fill coverage only
+    across its maximum configured cooldown horizon. Trailing reconstruction retains
+    its symbol/position-side confirmation and bounded recovery. With no historical
+    consumer enabled, routine ingestion starts from a bounded recent fetch rather
+    than proving an unrelated PnL window.
 
 ## Runtime Provenance
 
@@ -98,13 +127,19 @@ logs, runtime windows, and immutable manifests.
    rather than silently treated as complete.
 5. Old synthetic rows remain outside ordinary recent-fill overlap to avoid repeatedly
    widening every routine refresh. Risk-blocking degraded rows use a separate bounded
-   repair path so proven coverage cannot strand an otherwise recoverable authoritative
-   exchange record. Repair-only calls do not advance `last_refresh_ms`; the subsequent
+   repair path when an enabled HSL, auto-unstuck, or realized-loss consumer requires
+   authoritative PnL. With all such consumers disabled, covered structural fill history
+   remains ready while degraded rows stay visible for later repair. Repair-only calls do
+   not advance `last_refresh_ms`; the subsequent
    ordinary recent refresh must still cover downtime from the prior successful
    checkpoint. Bybit keeps the execution-time range narrow while rotating a separate
    closed-PnL `updatedTime` range toward the present; each auxiliary range spans at most
    one day.
-6. Fills sharing one millisecond carry no execution order in exchange responses or caches, yet
+6. KuCoin position-history PnL is authoritative for a completed position cycle. Overlapping trade
+   refreshes may return the same close as pending again; they must preserve an already reconciled
+   cycle value. Reapplying an unchanged cycle observation is a no-op, while a changed authoritative
+   total is redistributed across that lifecycle and persisted.
+7. Fills sharing one millisecond carry no execution order in exchange responses or caches, yet
    position reconstruction replays them in list order. When the exchange reports the position size
    preceding each fill (Hyperliquid `startPosition`), retain each execution boundary and reorder an
    unambiguous cohort along that chain before annotation. Expand older coalesced Hyperliquid cache
@@ -133,6 +168,13 @@ Exchange fetch methods propagate endpoint failures. The manager or caller may re
 quarantine, rebuild, or defer according to `../error_contract.md`; it must not attach neutral PnL
 merely because an auxiliary endpoint failed.
 
+Unproven required coverage is a controlled live-planning deferral. The execution loop owns its
+bounded, reason-aware retry cadence, and persistent coverage gaps do not consume the generic
+process-restart budget. A change between coverage and PnL block reasons restarts that reason's
+backoff at its configured base. Already-latched HSL RED supervisors continue protective management
+without fills while coverage repair proceeds. Manager-owned known-gap state remains evidence about
+coverage, not a second orchestration timer.
+
 ## Validation
 
 1. Deduplication correctness.
@@ -140,8 +182,13 @@ merely because an auxiliary endpoint failed.
 3. PnL attachment behavior when auxiliary endpoints fail.
 4. Provenance round-trip, preservation during refresh/deduplication, and legacy
    rows remaining unattributed.
-5. Old degraded synthetic PnL is refetched in bounded windows, authoritative
-   replacement is persisted, and unresolved rows defer live planning without restarts.
+5. Old degraded synthetic PnL is refetched in bounded windows when an enabled
+   authoritative-PnL consumer requires it, authoritative replacement is persisted, and
+   unresolved rows defer those consumers without restarts. With every PnL consumer
+   disabled, unresolved PnL does not block covered structural fill history.
+6. Coverage verdicts fail closed for contradictory metadata and malformed gaps,
+   while confirmed-legitimate gaps and proven empty windows retain their explicit
+   semantics.
 
 ## Key Code
 

@@ -6,6 +6,10 @@ from .strategy import get_all_strategy_defaults
 
 CONFIG_SCHEMA_VERSION = "v8.0.0"
 DEFAULT_EXAMPLE_CONFIG_PATH = "configs/examples/default_trailing_martingale_long.json"
+# A symbol suspension is temporary policy, not an indefinite timestamp. This
+# generous bound also keeps hours-to-milliseconds conversion finite and well
+# within the integer ranges used by persisted/structured timestamp consumers.
+MAX_EXCHANGE_SYMBOL_UNAVAILABLE_COOLDOWN_HOURS = 24.0 * 365.25 * 100.0
 
 
 def _get_shared_bot_defaults():
@@ -403,7 +407,9 @@ def get_template_config():
                 "custom_endpoints_path": None,
                 "defer_broad_candle_warmup": True,
                 "enable_archive_candle_fetch": False,
+                "enable_forager_ws_candles": True,
                 "execution_delay_seconds": 2,
+                "exchange_symbol_unavailable_cooldown_hours": 6.0,
                 "fee_conversion_max_age_ms": 86400000,
                 "fee_pct_fallback": 0.0002,
                 "fee_pct_sanity_abs_max": 0.001,
@@ -411,6 +417,7 @@ def get_template_config():
                 "fills_recent_overlap_minutes": 10,
                 "filter_by_min_effective_cost": True,
                 "forager_score_hysteresis_pct": 0.02,
+                "forager_ws_candle_rest_audit_minutes": 30,
                 "force_cold_startup": False,
                 "forced_mode_long": "",
                 "forced_mode_short": "",
@@ -446,7 +453,6 @@ def get_template_config():
                 "order_replacement_churn_gate_activation_count": 10,
                 "order_replacement_churn_gate_market_dist_pct": 0.005,
                 "order_replacement_churn_gate_stability_minutes": 2.0,
-                "order_replacement_churn_gate_tracking_tolerance_pct": 0.002,
                 "order_replacement_churn_gate_window_minutes": 10.0,
                 "pnls_max_lookback_days": 30.0,
                 "recv_window_ms": 5000,

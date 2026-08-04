@@ -5,7 +5,7 @@ from types import MethodType, SimpleNamespace
 
 import pytest
 
-from fill_events_manager import FillEvent
+from fill_events_manager import FillEvent, FillEventsManager
 from passivbot import Passivbot
 from passivbot_exceptions import RestartBotException
 from live.event_bus import ReasonCodes
@@ -193,9 +193,17 @@ def test_hsl_event_emitter_failure_logs_type_without_secret(caplog):
 
 
 class FakeRiskCache:
-    def __init__(self, covered_start_ms=1, history_scope="all"):
+    def __init__(
+        self,
+        covered_start_ms=1,
+        history_scope="all",
+        oldest_event_ts=0,
+        newest_event_ts=0,
+    ):
         self.covered_start_ms = covered_start_ms
         self.history_scope = history_scope
+        self.oldest_event_ts = oldest_event_ts
+        self.newest_event_ts = newest_event_ts
 
     def get_known_gaps(self):
         return []
@@ -211,18 +219,30 @@ class FakeRiskCache:
             "known_gaps": [],
             "covered_start_ms": self.covered_start_ms,
             "history_scope": self.history_scope,
-            "oldest_event_ts": self.covered_start_ms,
-            "newest_event_ts": 0,
+            "oldest_event_ts": self.oldest_event_ts,
+            "newest_event_ts": self.newest_event_ts,
         }
 
 
 def make_fake_pnls_manager(events, *, covered_start_ms=1, history_scope="all"):
-    cache = FakeRiskCache(covered_start_ms=covered_start_ms, history_scope=history_scope)
-    return SimpleNamespace(
+    timestamps = [int(getattr(event, "timestamp", 0) or 0) for event in events]
+    cache = FakeRiskCache(
+        covered_start_ms=covered_start_ms,
+        history_scope=history_scope,
+        oldest_event_ts=min(timestamps, default=0),
+        newest_event_ts=max(timestamps, default=0),
+    )
+    manager = SimpleNamespace(
+        _events=list(events),
         get_events=lambda: events,
         cache=cache,
         get_history_scope=cache.get_history_scope,
     )
+    manager.get_coverage_status = MethodType(
+        FillEventsManager.get_coverage_status,
+        manager,
+    )
+    return manager
 
 
 def test_hsl_signal_mode_requires_normalized_live_config():
@@ -2208,10 +2228,7 @@ def bind_hsl_methods(bot):
         setattr(bot, name, MethodType(getattr(hsl, name), bot))
     for name in (
         "_assert_no_pending_pnl_events",
-        "_pnl_history_coverage_status",
-        "_pnl_blocking_known_gaps",
-        "_pnl_gap_is_confirmed_legitimate",
-        "_pnl_gap_overlaps",
+        "_fill_history_coverage_status",
         "_pnl_event_preview",
         "_assert_pnl_history_safe_for_risk",
         "_assert_pnl_history_coverage_for_risk",
@@ -3711,12 +3728,9 @@ def _bind_reuse_support(bot, tmp_path, monkeypatch, *, fills, covered_start_ms=1
     bot.market_type = "swap"
     bot.qty_steps = {}
     bot.init_pnls = AsyncMock()
-    bot._pnl_history_coverage_status = MethodType(
-        Passivbot._pnl_history_coverage_status, bot
+    bot._fill_history_coverage_status = MethodType(
+        Passivbot._fill_history_coverage_status, bot
     )
-    bot._pnl_blocking_known_gaps = MethodType(Passivbot._pnl_blocking_known_gaps, bot)
-    bot._pnl_gap_is_confirmed_legitimate = Passivbot._pnl_gap_is_confirmed_legitimate
-    bot._pnl_gap_overlaps = Passivbot._pnl_gap_overlaps
     bot._hsl_extract_fill_events = MethodType(Passivbot._hsl_extract_fill_events, bot)
     bot._hsl_normalize_fill_symbol = MethodType(
         Passivbot._hsl_normalize_fill_symbol, bot
@@ -3734,6 +3748,9 @@ def _bind_reuse_support(bot, tmp_path, monkeypatch, *, fills, covered_start_ms=1
         def load_metadata(self):
             return {"covered_start_ms": covered_start_ms, "oldest_event_ts": 1}
 
+        def get_known_gaps(self):
+            return []
+
         def get_covered_start_ms(self):
             return covered_start_ms
 
@@ -3750,6 +3767,11 @@ def _bind_reuse_support(bot, tmp_path, monkeypatch, *, fills, covered_start_ms=1
             return "all"
 
     bot._pnls_manager = _StubPnlsManager()
+    bot._pnls_manager._events = bot._pnls_manager.get_events()
+    bot._pnls_manager.get_coverage_status = MethodType(
+        FillEventsManager.get_coverage_status,
+        bot._pnls_manager,
+    )
     return bot
 
 
@@ -3835,6 +3857,9 @@ async def _reuse_collection_history(monkeypatch, *, n_minutes, fills, positions,
         def load_metadata(self):
             return {"covered_start_ms": 1, "oldest_event_ts": 1}
 
+        def get_known_gaps(self):
+            return []
+
         def get_covered_start_ms(self):
             return 1
 
@@ -3854,6 +3879,11 @@ async def _reuse_collection_history(monkeypatch, *, n_minutes, fills, positions,
             return "all"
 
     bot._pnls_manager = _StubPnlsManager(fills)
+    bot._pnls_manager._events = bot._pnls_manager.get_events()
+    bot._pnls_manager.get_coverage_status = MethodType(
+        FillEventsManager.get_coverage_status,
+        bot._pnls_manager,
+    )
     history = await bot.get_balance_equity_history(
         current_balance=100.0,
         hsl_replay_signal_mode=signal_mode,
@@ -5144,6 +5174,125 @@ async def test_compact_replay_resets_flat_episode_when_historical_upnl_is_omitte
     assert state["last_metrics"]["tier"] == "green"
     assert state["last_metrics"]["realized_pnl"] == pytest.approx(0.0)
     assert symbol not in bot._runtime_forced_modes["long"]
+
+
+@pytest.mark.parametrize(
+    ("restart_policy", "cooldown_minutes", "should_raise"),
+    [
+        ("always", 5.0, False),
+        ("always", 20.0, True),
+        ("threshold", 5.0, True),
+    ],
+)
+@pytest.mark.asyncio
+async def test_held_coin_replay_bounds_missing_prices_only_after_proven_cooldown_gap(
+    restart_policy, cooldown_minutes, should_raise
+):
+    """Old closed episodes must not strand an ``always`` held position.
+
+    GateIO exposes only a recent 1m window.  A held pair may therefore have
+    fill/PnL history for an old closed episode whose candles are no longer
+    fetchable, while its current episode has complete price history.  The old
+    episode is irrelevant only when a proven flat gap exceeds every possible
+    cooldown bridge.
+    """
+    import numpy as np
+
+    symbol = "UNI/USDT:USDT"
+    timestamps = np.arange(1, 21, dtype=np.int64) * 60_000
+    old_entry_ts = 60_001
+    old_flatten_ts = 120_001
+    current_entry_ts = 900_001
+    old_entry_fee = -5.0
+    old_close_pnl = -55.0
+    old_realized_pnl = -60.0
+    realized = np.zeros(len(timestamps), dtype=np.float64)
+    realized[0] = old_entry_fee
+    realized[1:] = old_realized_pnl
+    balances = np.full(len(timestamps), 100.0, dtype=np.float64)
+    balances[0] = 100.0 - old_close_pnl
+    unrealized = np.zeros(len(timestamps), dtype=np.float64)
+    unrealized[0] = np.nan
+    unrealized[14:] = -1.0
+    history = {
+        "hsl_coin_compact_replay": {
+            "timestamps": timestamps,
+            "balances": balances,
+            "realized_pnl": realized,
+            "pair_values": {
+                ("long", symbol): {
+                    "realized_pnl": realized,
+                    "unrealized_pnl": unrealized,
+                }
+            },
+        },
+        "panic_flatten_events": [],
+        "fill_events": [
+            {
+                "timestamp": old_entry_ts,
+                "symbol": symbol,
+                "pside": "long",
+                "action": "increase",
+                "qty": 1.0,
+                "pnl": 0.0,
+                "fee_paid": old_entry_fee,
+            },
+            {
+                "timestamp": old_flatten_ts,
+                "symbol": symbol,
+                "pside": "long",
+                "action": "decrease",
+                "qty": 1.0,
+                "pnl": old_close_pnl,
+            },
+            {
+                "timestamp": current_entry_ts,
+                "symbol": symbol,
+                "pside": "long",
+                "action": "increase",
+                "qty": 1.0,
+                "pnl": 0.0,
+            },
+        ],
+    }
+    bot = make_coin_bot()
+    bot.positions = {
+        symbol: {
+            "long": {"size": 1.0, "price": 100.0},
+            "short": {"size": 0.0, "price": 0.0},
+        }
+    }
+    bot.hsl["long"]["restart_after_red_policy"] = restart_policy
+    bot.hsl["long"]["cooldown_minutes_after_red"] = cooldown_minutes
+    bot.get_exchange_time = lambda: int(timestamps[-1])
+
+    async def current_upnl(pside=None, symbol=None):
+        return -1.0 if pside == "long" and symbol == "UNI/USDT:USDT" else 0.0
+
+    bot._calc_upnl_sum_strict = current_upnl
+
+    async def fake_history(current_balance=None, **kwargs):
+        return history
+
+    bot.get_balance_equity_history = fake_history
+
+    if should_raise:
+        with pytest.raises(
+            ValueError,
+            match="missing required unrealized_pnl_by_coin_pside value",
+        ):
+            await bot._equity_hard_stop_initialize_coin_from_history()
+        return
+
+    await bot._equity_hard_stop_initialize_coin_from_history()
+
+    state = bot._hsl_coin_state("long", symbol)
+    assert state["halted"] is False
+    assert state["last_metrics"]["timestamp_ms"] == int(timestamps[-1])
+    assert state["last_metrics"]["realized_pnl"] == pytest.approx(0.0)
+    assert state["last_metrics"]["unrealized_pnl"] == pytest.approx(-1.0)
+    assert state["last_metrics"]["tier"] == "green"
+    assert state["pnl_reset_timestamp_ms"] is None
 
 
 @pytest.mark.asyncio

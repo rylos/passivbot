@@ -187,6 +187,19 @@ class TestCacheHashIndependence:
 
         assert hash_a != hash_b
 
+    def test_same_coin_union_across_sides_has_same_hash(self):
+        cfg_long = _base_config()
+        cfg_short = copy.deepcopy(cfg_long)
+        cfg_short["bot"]["long"]["total_wallet_exposure_limit"] = 0.0
+        cfg_short["bot"]["short"]["total_wallet_exposure_limit"] = 1.0
+        cfg_short["bot"]["short"]["n_positions"] = 1
+        cfg_short["live"]["approved_coins"] = {
+            "long": [],
+            "short": ["BTC/USDT:USDT"],
+        }
+
+        assert get_cache_hash(cfg_long, "binance") == get_cache_hash(cfg_short, "binance")
+
     def test_different_dates_different_hash(self):
         """Changing start_date still produces a different hash."""
         cfg_a = _base_config()
@@ -197,6 +210,16 @@ class TestCacheHashIndependence:
         hash_b = get_cache_hash(cfg_b, "binance")
 
         assert hash_a != hash_b
+
+    def test_volume_normalization_mode_changes_hash(self):
+        cfg_enabled = _base_config()
+        cfg_disabled = copy.deepcopy(cfg_enabled)
+        cfg_enabled["backtest"]["volume_normalization"] = True
+        cfg_disabled["backtest"]["volume_normalization"] = False
+
+        assert get_cache_hash(cfg_enabled, "combined") != get_cache_hash(
+            cfg_disabled, "combined"
+        )
 
 
 # ============================================================================

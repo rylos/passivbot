@@ -102,6 +102,7 @@ from pure_funcs import (
 import pprint
 from copy import deepcopy
 from hlcv_preparation import (
+    HLCV_PREPARATION_ALGORITHM_VERSION,
     prepare_hlcvs,
     prepare_hlcvs_combined,
     try_prepare_hlcvs_v2_local,
@@ -1493,7 +1494,7 @@ def check_keys(dict0, dict1):
 
 def get_cache_hash(config, exchange):
     exchanges_cfg = require_config_value(config, "backtest.exchanges")
-    approved_coins = effective_backtest_approved_coins_by_side(config)
+    data_coins = effective_backtest_data_coins(config)
     minimum_coin_age = require_live_value(config, "minimum_coin_age_days")
     coin_sources = config.get("backtest", {}).get("coin_sources") or {}
     coin_sources_sorted = sorted((str(k), str(v)) for k, v in coin_sources.items())
@@ -1502,7 +1503,7 @@ def get_cache_hash(config, exchange):
         (str(k), str(v)) for k, v in market_settings_sources.items()
     )
     to_hash = {
-        "coins": approved_coins,
+        "coins": data_coins,
         "end_date": format_end_date(require_config_value(config, "backtest.end_date")),
         "start_date": require_config_value(config, "backtest.start_date"),
         "exchange": exchanges_cfg if exchange == "combined" else exchange,
@@ -1514,6 +1515,11 @@ def get_cache_hash(config, exchange):
         "coin_sources": coin_sources_sorted,
         "market_settings_sources": market_settings_sources_sorted,
     }
+    if exchange == "combined":
+        to_hash["volume_normalization"] = bool(
+            config.get("backtest", {}).get("volume_normalization", True)
+        )
+        to_hash["hlcv_preparation_algorithm_version"] = HLCV_PREPARATION_ALGORITHM_VERSION
     return calc_hash(to_hash)
 
 

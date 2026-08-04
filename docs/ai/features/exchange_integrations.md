@@ -5,8 +5,9 @@ requires explicit user approval; prefer offline request-construction tests.
 
 ## Supported Live-Exchange Boundary
 
-The supported production live connectors are Binance, Bybit, Bitget, OKX, Gate.io, KuCoin,
-Hyperliquid, and WEEX. The fake connector is an offline deterministic test harness, not an exchange.
+The supported production live connectors are Binance, Bybit, Bitget, Bitunix, OKX, Gate.io,
+KuCoin, Hyperliquid, and WEEX. The fake connector is an offline deterministic test harness, not an
+exchange.
 
 Defx is deliberately unsupported. `src/exchanges/defx.py` and the `setup_bot()` routing branch are
 stale legacy placeholders retained only until a separate cleanup removes them. Their presence does
@@ -29,6 +30,78 @@ reconciliation/tolerance path until that venue receives a connector-specific con
 separate global retirement of the old initial-entry-only distance gate does not enable the new
 churn policy there.
 
+### Temporary exchange-side symbol suspension
+
+Some venues reject otherwise valid authenticated writes because API trading for one symbol is
+temporarily unavailable. This is a connector-owned classification boundary: the shared runtime
+must never infer a suspension from exception text or a portable-looking numeric code. A supported
+connector may opt in only with an exact structured exchange code and a fixture-backed regression
+test.
+
+On a proven suspension, `live.exchange_symbol_unavailable_cooldown_hours` starts a per-symbol,
+RAM-only cooldown (default `6.0` hours; `0` disables it; maximum `876600` hours). Values outside
+that bounded conversion domain are rejected during configuration and cannot mask the original
+exchange failure. A flat affected symbol is nontradable for
+new planning through `graceful_stop`. An affected symbol with a position uses `tp_only`, overriding
+`normal` or `graceful_stop`, so all further entries are suppressed while ordinary closes remain
+available without successful leverage refresh. Explicit `panic` and `manual` modes remain stronger.
+The initial failed entry/configuration write retains the normal execution failure/restart-budget
+consequences. Retry-backoff cycles with no authenticated write do not count as additional failures;
+the cooldown prevents repeated futile entry writes rather than hiding the fault.
+Expiry restores on-demand attempts, another classified response starts a new cooldown, and process
+restart deliberately clears the state and retries immediately.
+
+Future connectors encountering an equivalent venue rule must add their own exact classifier. Do
+not generalize one exchange's code, match human-readable messages, persist cooldowns across runs, or
+make held positions wholly nontradable.
+
+## Private Order Websocket Normalization
+
+Authoritative REST open-order reconciliation remains strict. Binance and KuCoin
+private websocket notifications for Passivbot-owned orders may omit native
+long/short metadata; only that hint path may recover `position_side`, only in
+effective hedge mode, and only when a valid Passivbot client-order marker has
+no conflicting native position-side field and every supplied exchange/client
+identity matches the same record in this process's emitted-order registry.
+Acknowledged emitted identities remain registered for as long as the
+corresponding order is present in the bot's authoritative open-order state,
+even beyond the normal foreign-writer lookback. Recovered rows always force an
+authoritative account refresh. Sparse foreign, explicitly one-way,
+identity-conflicting, or unmarked notifications remain rejected.
+
+Bitget UTA websocket rows use the exchange-native `holdSide` field for hedge
+position attribution, while classic rows use `posSide`. Hyperliquid may deliver
+an order-open websocket row before the concurrent create request returns its
+exchange order ID. While a create is still freshly submitted, the connector may
+briefly yield for that acknowledgement and retry the row, but recovery still
+requires the exact acknowledged exchange ID and all existing contradiction
+checks. Sparse Hyperliquid rows for orders already resting at process startup may
+instead recover side, `position_side`, and close-only intent from one exact
+exchange-ID match in the current authoritative REST open-order snapshot. A
+bounded five-minute in-memory copy of those exact semantics covers terminal
+updates which arrive just after reconciliation removes the order; it is rebuilt
+from REST after restart and does not preserve ownership or trading intent.
+Every supplied exchange-ID and client-ID alias must agree with the canonical
+identity retained by the snapshot or its bounded copy. A contradictory current
+snapshot row invalidates any older cached semantics for its exchange-ID aliases.
+Missing, duplicate, expired, or contradictory matches remain rejected and
+trigger a fresh account-state read;
+authoritative snapshot contradictions must not fall back to process-local
+acknowledgement evidence. A unified `reduceOnly` value of `false` or `null` is
+treated as a CCXT placeholder only when the native row omits that field; an
+explicit native value still must agree with the recovered semantics. All
+snapshot-recovered rows request authoritative refresh because an exact exchange
+ID proves semantics but not local ownership. Price, quantity, side, or order
+shape alone never prove ownership.
+
+A successful private-websocket read and a valid individual order row are separate health
+boundaries. When a supported CCXT connector receives a row whose mandatory side, position-side,
+quantity, or close-only semantics cannot be normalized, it discards that row, requests an
+authoritative account-state refresh, and emits a bounded warning. Other valid rows from the same
+websocket message remain usable. A semantic row rejection must not be reported as a transport
+disconnect or consume the websocket reconnect budget; actual watch/read failures retain the
+bounded reconnect backoff.
+
 ## Broker Agreement Attribution
 
 Problem:
@@ -44,6 +117,16 @@ Handling in Passivbot:
 3. Broker-code registry loading must fail loudly on missing/invalid registry data and unknown exchange names.
 4. For each broker-agreement exchange, verify the actual signed CCXT/raw request includes the required broker field/header/tag.
 5. Add regression tests at the request-construction boundary when changing exchange sessions, signing, or order payload code.
+
+### WEEX broker client-order IDs
+
+WEEX attributes both Spot and Futures API volume when `newClientOrderId` starts with
+`b-{brokerId}-`. Passivbot's WEEX connector is Futures-only and the V3 Futures order endpoint
+limits this field to 36 characters, so every generated ID uses
+`b-{brokerId}-0xTTTT{random}` within that limit. The `0xTTTT` Passivbot order-type marker must
+remain intact for ownership, reconciliation, and fill-event diagnostics. Reject invalid or
+unattributed IDs before submission; do not rely on CCXT's WEEX `partner` default because CCXT
+ignores it when the caller supplies a client order ID.
 
 ## Exchange Hedge Mode Versus Strategy Hedge Mode
 
@@ -109,21 +192,43 @@ Handling:
 
 1. Treat current same-mode success as success (`code=200000`, `data.positionMode=1`).
 2. Let unknown `set_position_mode` failures raise unless a verified KuCoin no-op code is added with a targeted test.
-3. Never infer a resting order's position side from the current position. Require explicit
-   `info.positionSide`/`info.posSide` in hedge mode; in effective one-way mode, derive and verify
-   `position_side` from the authoritative order side plus `reduceOnly` tuple.
+3. The connector keeps the exchange account in hedge mode even when `live.hedge_mode=false`
+   disables simultaneous strategy exposure. Normalize order updates against that actual exchange
+   mode, not the strategy flag.
+4. Never infer a resting order's position side from the current position. Require explicit
+   `info.positionSide`/`info.posSide` in exchange hedge mode; only when the exchange capability is
+   actually one-way may `position_side` be derived and verified from the authoritative order side
+   plus `reduceOnly` tuple.
+5. In exchange hedge mode, derive entry/close-only effect from the authoritative buy/sell plus
+   long/short tuple when KuCoin omits native `reduceOnly`.
 
 ### OHLCV limit behavior + sparse-minute markets
 
 Problem:
 
 1. Effective page size is 200 rows.
-2. Illiquid symbols legitimately have missing trade minutes.
+2. KuCoin documents that kline data is omitted for intervals with no ticks, including native
+   higher-timeframe buckets.
 
 Handling:
 
 1. Page with `limit=200`.
 2. Overlap page boundaries by 1 candle to validate inter-page gaps.
+3. For native timeframes above 1m, synthesize a flat zero-volume no-trade bucket only when the gap
+   is bounded by two real candles in the same successful payload and its timestamp is absent from
+   the raw payload, and only up to the fixed 120-minute live connector policy. The simulation-only
+   `backtest.gap_tolerance_ohlcvs_minutes` setting does not alter live readiness. A raw bucket
+   rejected by candle validation remains unavailable and evicts any older cached sparse placeholder
+   at that timestamp. An unidentifiable rejected row invalidates cached placeholders between the
+   accepted page bounds, or across the remaining requested range when fewer than two accepted
+   timestamps exist. Eviction recomputes the cached timeframe's derived index bounds. Do not
+   synthesize leading, trailing, failed-fetch, oversized, or unproven between-page gaps.
+4. For an unresolved 1m gap already bounded by cached real rows, retry with both boundary rows in
+   the requested range. Promote the exact omission to verified no-trade continuity only if one
+   successful raw payload returns both boundaries and no row inside the gap. This contextual proof
+   may repair an older persistent `fetch_failed` gap. Empty, one-sided, malformed, or partially
+   recovered responses remain unavailable, preserve persistent gap status, and restart the
+   persistent retry cooldown rather than issuing another contextual request on every candle read.
 
 ## Bitget Futures
 
@@ -203,7 +308,58 @@ For compatibility, `api-keys.json` may specify either `"exchange": "gateio"` or
 migration. Only CCXT REST and WebSocket client construction translates `gateio` to
 `gate`; do not add parallel `gate` identities to internal registries or state paths.
 Normalize Gate's numeric REST account `user` value to a string before assigning it
-as CCXT Pro's private futures subscription UID.
+as CCXT Pro's private futures subscription UID. Reject missing, null, empty, or
+non-string/non-integer identifiers before conversion; never cache a placeholder
+such as `"None"` as durable subscription state.
+
+### Multi-currency balance semantics
+
+Gate's `cross_available` is spendable margin, not stable account equity. Resting
+orders move value between `cross_available` and `cross_order_margin`, while open
+positions use `cross_initial_margin`. For multi-currency margin accounts, derive
+the strategy balance from the same authoritative futures-account row as
+`cross_available + cross_order_margin + cross_initial_margin -
+cross_unrealised_pnl`. Require all four finite fields. Removing unrealized PnL
+preserves wallet-balance semantics because Passivbot adds position PnL separately
+when deriving equity. Do not feed `cross_available` alone to Rust, because
+ordinary order reservation would then resize ideal orders and create
+reconciliation churn. Classic accounts continue using CCXT's quote-currency
+total.
+
+### Per-symbol leverage initializes the position risk limit
+
+Problem:
+
+1. Gate derives a position's current risk limit from its configured leverage.
+2. A contract risk-table update can leave a previously configured leverage above
+   the new maximum. Gate then reports a zero risk limit and rejects every opening
+   order with `RISK_LIMIT_EXCEEDED`.
+3. Gate's leverage endpoint also controls margin mode: nonzero `leverage` selects
+   isolated mode, while cross mode requires `leverage=0` plus
+   `cross_leverage_limit`.
+
+Handling:
+
+1. Configure every symbol before its first order creation in a bot process.
+2. Use the leverage capped by current market metadata and the configured margin
+   preference.
+3. Call CCXT `set_leverage` with an explicit `marginMode`; CCXT then produces the
+   correct Gate parameter tuple without accidentally switching margin mode.
+4. Propagate configuration failures and keep exposure-increasing creations deferred
+   until configuration succeeds. Existing-position reduce-only closes do not depend
+   on leverage initialization and remain eligible. Missing or invalid leverage-cap
+   metadata is a symbol-scoped configuration failure: invalidate any prior configured
+   marker, do not guess a cap or issue `set_leverage`, and continue market initialization
+   so reduce-only closes for that symbol can still execute.
+5. Every failed cycle containing a blocked entry advances the existing execution
+   error/restart budget. The failure and blocked-entry scope remain visible in
+   operator logs and structured events; close-only operation must not look healthy
+   while entries are failing.
+6. Reserve and debit the one-time signed leverage write in the account-wide order
+   churn allowance before admitting the symbol's first entry creation. The
+   reservation decision and configuration execution must use the same
+    retry-eligibility timestamp: a backoff expiring later in that creation wave
+    is deferred until the next wave rather than issuing an unreserved write.
 
 ### Contract order text must start with `t-`
 
@@ -227,6 +383,139 @@ Handling:
 1. Do not pass CCXT `until`; page forward by `since + limit`.
 2. Clip 1m historical fetches to the recent-window bound and mark older spans as `no_archive`.
 3. Require external OHLCV source data or another candle source for older Gate.io backtests.
+
+## Hyperliquid
+
+### Delayed sparse-tail candles
+
+Hyperliquid may initially omit a recent no-trade minute and later publish an
+authoritative flat candle with zero volume for that same timestamp. Passivbot
+must not synthesize or permanently classify the initially absent row. Recent
+tail gaps use time-spaced retries, remain unavailable meanwhile, and are removed
+from `known_gaps` as soon as the authoritative row is persisted.
+
+### Candle retention and held trailing positions
+
+Hyperliquid's `candleSnapshot` endpoint exposes only the most recent 5,000
+candles. A trailing position whose latest fill predates that 1m window therefore
+cannot reconstruct its extrema from a fresh host. Preserve and transfer the
+existing 1m candle cache when migrating such a live position. Passivbot must
+keep trailing state unavailable if the exact range from the first whole minute
+after the fill is not locally present; wider-timeframe candles or an
+earliest-available reset are not parity-safe substitutes. Once that range is
+dense, only the bounded non-persistent open-tail projection described in the
+candlestick-manager contract may bridge delayed current candles.
+
+## Bitunix Futures
+
+### Native connector and authentication
+
+Bitunix is not available in the pinned CCXT release, so the production connector is a narrow
+native async REST/WebSocket implementation rather than a generic `CCXTBot` exchange class.
+It retains the CCXT-compatible object boundary consumed by Passivbot while implementing only the
+futures operations required by live trading. Cold-cache standalone market preloads use this native
+public REST client as well; they must never fall through to CCXT before the bot is constructed.
+Native market records use Bitunix's documented VIP0 futures maker/taker fees as conservative
+planning inputs because the trading-pairs endpoint does not publish account fee tiers.
+
+Handling:
+
+1. Sign private REST requests with Bitunix's documented double SHA-256 scheme. Sort query keys for
+   signing, and sign the exact compact JSON body bytes sent on POST.
+2. Supply `marginCoin=USDT` to account and symbol-configuration requests. Successful account data
+   may be either an object or a singleton list; accept exactly those shapes.
+3. Map business error envelopes to CCXT exception classes and propagate unknown failures. Keep
+   request spacing below the venue's documented UID/IP rolling limit. Treat the observed
+   `code=1, msg=Network Error` envelope like documented network error `10001`, and retry native
+   market discovery with bounded backoff so a transient cold-start response is not permanent.
+4. Authenticate the private WebSocket with its seconds-based signature, subscribe to `order`, and
+   send Bitunix's application-level JSON ping while idle; transport-level WebSocket heartbeats do
+   not replace the venue keepalive. Enrich each order notification from REST detail before
+   publishing it. The raw push lacks enough durable close-only metadata for authoritative
+   reconciliation. If REST reports that the order is not found or returns semantically invalid
+   order detail, publish only that raw row as untrusted so the generic watcher requests an
+   authoritative account-state refresh instead of silently discarding the transition. Treat
+   non-object pushes and rows without an order ID the same way instead of dropping them before
+   reconciliation. Transport failures still fail the batch and reconnect.
+5. Apply custom endpoint domain rewrites and `rest.url_overrides.api` to the native REST base, and
+   merge `rest.extra_headers` into every request. Reject authentication header names
+   case-insensitively in configured headers so proxy or user headers cannot collide with generated
+   signatures. Honor `disable_ws` for both private orders and public tickers: use REST order
+   polling and request only explicit, bounded symbol sets through REST depth.
+6. Keep `bitunix: null` explicit in `broker_codes.hjson`; there is no Passivbot broker payload for
+   this connector.
+
+Primary references: [Bitunix REST authentication](https://www.bitunix.com/api-docs/futures/common/sign.html),
+[WebSocket login](https://www.bitunix.com/api-docs/futures/websocket/prepare/WebSocket.html), and
+[order channel](https://www.bitunix.com/api-docs/futures/websocket/private/Order%20Channel.html).
+
+### Hedge orders, positions, and fills
+
+Bitunix's hedge placement request uses a venue-specific side contract:
+`BUY + OPEN` opens long, `SELL + OPEN` opens short, `BUY + CLOSE` closes long, and
+`SELL + CLOSE` closes short. A close additionally requires the live `positionId`. Order-detail and
+fill responses instead expose the actual buy/sell action.
+
+Handling:
+
+1. Keep the exchange account in `HEDGE` mode. Translate Passivbot's explicit `position_side` into
+   the placement-side tuple and send `reduceOnly=true` plus the cached authoritative `positionId`
+   on every close.
+2. Treat response `side` as the actual action. Derive long/short from action plus the boolean
+   `reduceOnly`; never reuse placement-side semantics while parsing a response.
+3. Accept both documented `LONG`/`SHORT` and observed `BUY`/`SELL` aliases on position rows. Keep
+   all other position-side values invalid.
+4. Require a positive finite quantity on every normalized order and a positive finite request
+   price for every limit order and every open order. Only terminal market-order detail may omit the
+   request price.
+5. Bitunix has emitted `NEW_` on live order detail although its schema documents `NEW`. Normalize
+   only trailing underscore padding before applying the closed order-status allowlist.
+6. Page pending orders by `skip` to the required, stable reported total under one fixed `endTime`
+   snapshot. Reject missing, changing, truncated, or duplicate pagination results before treating
+   the account-critical open-order set as authoritative.
+7. Page trade history by `skip` to the required, stable reported total under one fixed `endTime`
+   snapshot. Reject missing, changing, truncated, or duplicate pagination results. Preserve
+   `realizedPNL` and the fee sign so maker rebates remain positive balance impacts. Enrich empty
+   fill `clientId` values through order detail, but retain the exchange-truth fill with unknown
+   attribution when terminal order detail has expired. This is the canonical fill source for
+   realized PnL, unstuck accounting, and HSL replay.
+8. Reconstruct realized wallet balance as
+   `available + frozen + margin - crossUnrealizedPNL - isolationUnrealizedPNL`; do not feed
+   mark-to-market equity into Rust sizing.
+
+Primary references: [place order](https://www.bitunix.com/api-docs/futures/trade/place_order.html),
+[pending positions](https://www.bitunix.com/api-docs/futures/position/get_pending_positions.html),
+[order detail](https://www.bitunix.com/api-docs/futures/trade/get_order_detail.html), and
+[history trades](https://www.bitunix.com/api-docs/futures/trade/get_history_trades.html).
+
+### Live quotes and candles
+
+The bulk REST ticker omits bid and ask. Use the official public `tickers` WebSocket for
+authoritative top-of-book and last price, splitting the active market set across connections
+because Bitunix permits at most 300 subscriptions per connection. Refresh those subscriptions when
+the active market-ID set changes. Determine cache freshness from the bounded local receipt time;
+retain exchange timestamps only as quote provenance so future-skewed venue timestamps cannot keep a
+stale quote eligible. A targeted ticker request may use one-row REST depth for at most eight missing
+symbols as a bounded startup fallback, with the bid/ask midpoint labeled as its synthetic last
+through ticker normalization and into snapshot provenance. Broad operation must fail instead of
+fanning out one depth request per market or substituting bid/ask for a last trade. When WebSockets
+are explicitly disabled, live market snapshots select this targeted REST path directly without
+opening or waiting for a public ticker socket; unbounded bulk requests and requests above the
+eight-symbol limit fail closed.
+
+Bitunix klines return at most 200 rows. The live field names are inverted relative to their units:
+`quoteVol` is base quantity and `baseVol` is quote notional; normalize `quoteVol` as CCXT base
+volume so Passivbot's generic quote-volume calculation remains dimensionally correct. Missing,
+non-finite, or negative base volume is invalid; an explicit zero remains valid. In live behavior,
+`startTime` does not anchor a response; the venue tail-anchors at `endTime`. Derive each forward
+page's `endTime` from `since + limit * timeframe`, filter to the requested bounds, sort ascending,
+and deduplicate. This pagination supports live warmup, restart reconstruction, and runtime
+indicators only. Bulk historical Bitunix data for backtesting or optimization is not a supported
+source.
+
+Primary references: [ticker WebSocket](https://www.bitunix.com/api-docs/futures/websocket/public/Tickers%20Channel.html),
+[REST depth](https://www.bitunix.com/api-docs/futures/market/get_depth.html), and
+[kline API](https://www.bitunix.com/api-docs/futures/market/get_kline.html).
 
 ## WEEX Futures
 
@@ -289,6 +578,14 @@ failure.
 
 Primary references: [WEEX V3 error codes](https://www.weex.com/api-doc/contract/ExampleOfErrorCode)
 and [WEEX API integration preparation](https://www.weex.com/api-doc/spot/QuickStart/IntegrationPreparation).
+
+### API-unsupported symbols
+
+WEEX error code `-1058` means that the trading pair is not supported through the API. The WEEX
+connector classifies only this exact structured response for the shared temporary symbol-suspension
+policy. It must not classify raw message text, nearby codes such as `-1056`, or generic permission
+errors. After the configured cooldown expires, the next required exchange configuration or order
+write retries the symbol; another `-1058` begins a fresh cooldown.
 
 ### Market data and CCXT compatibility
 

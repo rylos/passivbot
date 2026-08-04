@@ -8,6 +8,7 @@ from passivbot_exceptions import FatalBotException
 import asyncio
 import random
 import re
+from ccxt.base.errors import MarginModeAlreadySet
 from utils import symbol_to_coin, ts_to_date, utc_ms
 from pure_funcs import flatten
 from procedures import load_broker_code
@@ -98,6 +99,34 @@ class BinanceBot(CCXTBot):
         if normalized_side in {"long", "short"}:
             return normalized_side
         raise ValueError("binance order missing authoritative position-side semantics")
+
+    def _normalize_order_update(self, order: dict) -> dict:
+        """Recover owned hedge-mode websocket rows with sparse pside metadata."""
+        try:
+            return super()._normalize_order_update(order)
+        except ValueError:
+            if not bool(getattr(self, "hedge_mode", True)):
+                raise
+            info = order.get("info") or {}
+            if any(
+                value not in (None, "")
+                for value in (
+                    order.get("position_side"),
+                    order.get("positionSide"),
+                    info.get("positionSide"),
+                    info.get("ps"),
+                )
+            ):
+                raise
+            if not self._sparse_ws_order_has_emitted_identity(order):
+                raise
+            position_side = self._durable_order_position_side(order)
+            if position_side not in {"long", "short"}:
+                raise
+            order["position_side"] = position_side
+            order["qty"] = order["amount"]
+            order["_pb_order_update_requires_authoritative_refresh"] = True
+            return order
 
     def _canonical_open_order_reduce_only(self, order: dict) -> bool:
         """Normalize Binance hedge action semantics; reduceOnly is not submitted in hedge mode."""
@@ -596,6 +625,11 @@ class BinanceBot(CCXTBot):
             try:
                 res_margin = await coros_to_call_margin_mode[symbol]
                 to_print += f"margin={format_exchange_config_response(res_margin)}"
+            except MarginModeAlreadySet:
+                logging.debug(
+                    "[config] %s margin mode unchanged | error_type=MarginModeAlreadySet",
+                    log_symbol,
+                )
             except Exception as e:
                 logging.error(
                     "[config] %s cross-margin update failed | %s",

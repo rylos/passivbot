@@ -12,6 +12,7 @@ from ccxt_contracts import build_contract_bot, get_bot_class
 from exchanges.weex import AsyncWeex, ProWeex, WeexBot
 from fill_events_manager import WeexFetcher, _build_fetcher_for_bot
 from market_snapshot import MarketSnapshotProvider
+from passivbot import custom_id_has_explicit_passivbot_marker, custom_id_to_snake
 
 
 SYMBOL = "BTC/USDT:USDT"
@@ -58,6 +59,9 @@ def _ccxt_exchange() -> ccxt.weex:
 def _bot(*, time_in_force: str = "gtc") -> WeexBot:
     bot = build_contract_bot("weex")
     bot.config["live"]["time_in_force"] = time_in_force
+    bot.config["live"]["exchange_symbol_unavailable_cooldown_hours"] = 6.0
+    bot.broker_code = "WEEX111164"
+    bot.custom_id_max_length = 36
     return bot
 
 
@@ -105,6 +109,148 @@ def test_weex_client_accepts_only_documented_success_envelope():
             {},
             "{}",
         )
+
+
+def test_weex_classifies_only_exact_api_symbol_unavailable_code():
+    bot = _bot()
+    unavailable = ccxt.PermissionDenied(
+        'weex {"code":-1058,"msg":"The trading pair is not supported via the API"}'
+    )
+    other = ccxt.PermissionDenied(
+        'weex {"code":-1056,"msg":"illegal IP"}'
+    )
+
+    assert (
+        bot._classify_exchange_symbol_unavailable_error(unavailable)
+        == "weex_api_symbol_unavailable"
+    )
+    assert bot._classify_exchange_symbol_unavailable_error(other) is None
+    assert (
+        bot._classify_exchange_symbol_unavailable_error(
+            ccxt.PermissionDenied("contains -1058 but no structured code")
+        )
+        is None
+    )
+
+
+def test_weex_symbol_unavailable_cooldown_is_ram_only_scoped_and_expires(caplog):
+    bot = _bot()
+    bot._exchange_config_retry_after_ms = {}
+    bot._exchange_config_retry_attempts = {SYMBOL: 3}
+    bot.has_position = lambda symbol=None: False
+    error = ccxt.PermissionDenied(
+        'weex {"code":-1058,"msg":"The trading pair is not supported via the API"}'
+    )
+    now_ms = 1_000_000
+
+    assert bot._activate_exchange_symbol_unavailable_cooldown(
+        SYMBOL, error, now_ms=now_ms
+    )
+    expected_until = now_ms + 6 * 60 * 60 * 1000
+    assert bot._exchange_symbol_unavailable_until_ms == {SYMBOL: expected_until}
+    assert bot._exchange_config_retry_after_ms == {SYMBOL: expected_until}
+    assert bot._activate_exchange_symbol_unavailable_cooldown(
+        SYMBOL, error, now_ms=now_ms + 60_000
+    )
+    refreshed_until = expected_until + 60_000
+    assert bot._exchange_symbol_unavailable_until_ms == {SYMBOL: refreshed_until}
+    assert bot._exchange_config_retry_after_ms == {SYMBOL: refreshed_until}
+    assert "action=refresh_entry_block_until_retry" in caplog.text
+
+    modes = {"long": {SYMBOL: None}, "short": {SYMBOL: "panic"}}
+    active = bot._apply_exchange_symbol_unavailable_planning_policy(
+        [SYMBOL], modes, now_ms=now_ms + 1
+    )
+    assert active == {SYMBOL}
+    assert modes == {
+        "long": {SYMBOL: "graceful_stop"},
+        "short": {SYMBOL: "panic"},
+    }
+    assert bot._exchange_symbol_cooldown_blocks_tradability(SYMBOL, active)
+
+    bot.has_position = lambda symbol=None: True
+    held_modes = {
+        "long": {SYMBOL: "graceful_stop"},
+        "short": {SYMBOL: "manual"},
+    }
+    assert bot._apply_exchange_symbol_unavailable_planning_policy(
+        [SYMBOL], held_modes, now_ms=now_ms + 2
+    ) == {SYMBOL}
+    assert held_modes == {
+        "long": {SYMBOL: "tp_only"},
+        "short": {SYMBOL: "manual"},
+    }
+    assert not bot._exchange_symbol_cooldown_blocks_tradability(SYMBOL, active)
+
+    with caplog.at_level("INFO"):
+        assert bot._active_exchange_symbol_unavailable_cooldowns(
+            [SYMBOL], now_ms=expected_until
+        ) == {SYMBOL: refreshed_until}
+        assert bot._active_exchange_symbol_unavailable_cooldowns(
+            [SYMBOL], now_ms=refreshed_until
+        ) == {}
+    assert bot._exchange_symbol_unavailable_until_ms == {}
+    assert bot._exchange_config_retry_after_ms == {}
+    assert bot._exchange_config_retry_attempts == {}
+    assert "cooldown expired" in caplog.text
+
+    assert bot._activate_exchange_symbol_unavailable_cooldown(
+        SYMBOL, error, now_ms=refreshed_until + 1
+    )
+    assert bot._exchange_symbol_unavailable_until_ms == {
+        SYMBOL: refreshed_until + 1 + 6 * 60 * 60 * 1000
+    }
+
+
+def test_weex_symbol_unavailable_cooldown_can_be_disabled():
+    bot = _bot()
+    bot.config["live"]["exchange_symbol_unavailable_cooldown_hours"] = 0.0
+    error = ccxt.PermissionDenied(
+        'weex {"code":-1058,"msg":"The trading pair is not supported via the API"}'
+    )
+
+    assert not bot._activate_exchange_symbol_unavailable_cooldown(
+        SYMBOL, error, now_ms=1_000_000
+    )
+    assert getattr(bot, "_exchange_symbol_unavailable_until_ms", {}) == {}
+
+
+def test_weex_symbol_unavailable_cooldown_rejects_unsafe_runtime_value(caplog):
+    bot = _bot()
+    bot.config["live"]["exchange_symbol_unavailable_cooldown_hours"] = 1e308
+
+    with caplog.at_level("ERROR"):
+        activated = bot._activate_exchange_symbol_unavailable_cooldown(
+            SYMBOL,
+            ccxt.PermissionDenied(
+                'weex {"code":-1058,"msg":"The trading pair is not supported via the API"}'
+            ),
+            now_ms=1_000,
+        )
+
+    assert activated is False
+    assert getattr(bot, "_exchange_symbol_unavailable_until_ms", {}) == {}
+    assert "action=preserve_original_exchange_failure" in caplog.text
+
+
+def test_weex_symbol_config_gates_entries_but_not_protective_closes():
+    bot = _bot()
+
+    assert bot._order_requires_exchange_config_before_create(
+        {"reduce_only": False}
+    )
+    assert not bot._order_requires_exchange_config_before_create(
+        {"reduce_only": True}
+    )
+    bot._last_exchange_config_failed_attempt_symbols = {SYMBOL}
+    assert bot._pending_exchange_config_consumes_error_budget(
+        [{"symbol": SYMBOL, "reduce_only": False}]
+    )
+    bot._last_exchange_config_failed_attempt_symbols = set()
+    assert not bot._pending_exchange_config_consumes_error_budget(
+        [{"symbol": SYMBOL, "reduce_only": False}]
+    )
+    assert not bot._pending_exchange_config_consumes_error_budget([])
 
 
 def test_weex_balance_excludes_unrealized_pnl_from_equity():
@@ -192,19 +338,20 @@ def test_weex_order_websocket_does_not_hide_malformed_order_event():
 
 def test_weex_order_params_match_v3_hedge_contract():
     bot = _bot(time_in_force="post_only")
+    custom_id = "b-WEEX111164-0x0007abc123"
     params = bot._build_order_params(
         {
             "symbol": SYMBOL,
             "type": "limit",
             "position_side": "long",
             "reduce_only": True,
-            "custom_id": "close_grid_long_01",
+            "custom_id": custom_id,
         }
     )
 
     assert params == {
         "positionSide": "LONG",
-        "clientOrderId": "close_grid_long_01",
+        "clientOrderId": custom_id,
         "timeInForce": "POST_ONLY",
     }
     assert "reduceOnly" not in params
@@ -219,6 +366,9 @@ def test_weex_order_params_match_v3_hedge_contract():
         ("custom_id", ""),
         ("custom_id", "x" * 37),
         ("custom_id", "invalid id"),
+        ("custom_id", "0x0004validbutunattributed"),
+        ("custom_id", "b-WEEX999999-0x0004wrongbroker"),
+        ("custom_id", "b-WEEX111164-without-marker"),
     ],
 )
 def test_weex_order_params_reject_ambiguous_side_or_invalid_client_id(field, value):
@@ -228,7 +378,7 @@ def test_weex_order_params_reject_ambiguous_side_or_invalid_client_id(field, val
         "type": "limit",
         "position_side": "long",
         "reduce_only": False,
-        "custom_id": "entry_grid_long_01",
+        "custom_id": "b-WEEX111164-0x0004abc123",
     }
     order[field] = value
 
@@ -249,13 +399,14 @@ def test_weex_order_params_survive_ccxt_request_construction(
     side: str, position_side: str, reduce_only: bool
 ):
     bot = _bot(time_in_force="post_only")
+    custom_id = f"b-WEEX111164-0x0007{position_side}{int(reduce_only)}"
     params = bot._build_order_params(
         {
             "symbol": SYMBOL,
             "type": "limit",
             "position_side": position_side,
             "reduce_only": reduce_only,
-            "custom_id": f"pb_{position_side}_{int(reduce_only)}",
+            "custom_id": custom_id,
         }
     )
     exchange = _ccxt_exchange()
@@ -269,9 +420,57 @@ def test_weex_order_params_survive_ccxt_request_construction(
     assert request["positionSide"] == position_side.upper()
     assert "positionId" not in request
     assert request["timeInForce"] == "POST_ONLY"
-    assert request["newClientOrderId"] == f"pb_{position_side}_{int(reduce_only)}"
+    assert request["newClientOrderId"] == custom_id
     assert "reduceOnly" not in request
     assert "postOnly" not in request
+
+
+def test_weex_generated_client_id_attributes_broker_and_preserves_diagnostics():
+    bot = _bot()
+
+    first = bot.format_custom_id_single(0x0007)
+    second = bot.format_custom_id_single(0x0007)
+
+    assert first.startswith("b-WEEX111164-0x0007")
+    assert len(first) == 36
+    assert first != second
+    assert bot.CLIENT_ORDER_ID_PATTERN.fullmatch(first)
+    assert custom_id_has_explicit_passivbot_marker(first)
+    assert custom_id_to_snake(first) == "close_grid_long"
+
+
+def test_weex_market_order_keeps_broker_client_id_without_limit_fields():
+    bot = _bot()
+    custom_id = bot.format_custom_id_single(0x0007)
+    params = bot._build_order_params(
+        {
+            "symbol": SYMBOL,
+            "type": "market",
+            "position_side": "long",
+            "reduce_only": True,
+            "custom_id": custom_id,
+        }
+    )
+    request = _ccxt_exchange().create_contract_order_request(
+        SYMBOL, "market", "sell", 0.0001, None, params
+    )
+
+    assert request["newClientOrderId"] == custom_id
+    assert request["positionSide"] == "LONG"
+    assert "timeInForce" not in request
+    assert "price" not in request
+    assert "reduceOnly" not in request
+
+
+@pytest.mark.parametrize(
+    "broker_code", ["", "WEEX11116", "WEEX1111640", "weex111164"]
+)
+def test_weex_rejects_invalid_broker_code_before_session_creation(broker_code):
+    bot = _bot()
+    bot.broker_code = broker_code
+
+    with pytest.raises(ValueError, match="WEEX broker code"):
+        bot.create_ccxt_sessions()
 
 
 @pytest.mark.parametrize(
@@ -307,13 +506,14 @@ def test_weex_open_order_rejects_missing_or_ambiguous_position_side(raw_info):
 def test_weex_signed_order_contains_required_auth_and_no_reduce_only():
     bot = _bot(time_in_force="gtc")
     exchange = _ccxt_exchange()
+    custom_id = "b-WEEX111164-0x0007signed01"
     params = bot._build_order_params(
         {
             "symbol": SYMBOL,
             "type": "limit",
             "position_side": "short",
             "reduce_only": True,
-            "custom_id": "close_grid_short_01",
+            "custom_id": custom_id,
         }
     )
     request = exchange.create_contract_order_request(
@@ -327,6 +527,7 @@ def test_weex_signed_order_contains_required_auth_and_no_reduce_only():
 
     assert body["positionSide"] == "SHORT"
     assert body["timeInForce"] == "GTC"
+    assert body["newClientOrderId"] == custom_id
     assert "reduceOnly" not in body
     assert signed["headers"]["ACCESS-KEY"] == "key"
     assert signed["headers"]["ACCESS-PASSPHRASE"] == "passphrase"
@@ -567,7 +768,10 @@ class _FakeWeexApi:
 
     async def fetch_order(self, order_id, symbol):
         self.order_calls.append((order_id, symbol))
-        return {"clientOrderId": f"entry_grid_long_{order_id}", "info": {}}
+        return {
+            "clientOrderId": f"b-WEEX111164-0x0004{order_id}",
+            "info": {},
+        }
 
 
 def _trade(trade_id: str, order_id: str, timestamp: int, *, position_side="LONG"):
@@ -612,7 +816,11 @@ async def test_weex_fetcher_windows_paginates_normalizes_and_enriches():
     assert all(event["position_side"] == "long" for event in events)
     assert all(event["pnl"] == pytest.approx(1.25) for event in events)
     assert all(event["c_mult"] == 1.0 for event in events)
-    assert all(event["client_order_id"].startswith("entry_grid_long_") for event in events)
+    assert all(
+        event["client_order_id"].startswith("b-WEEX111164-0x0004")
+        for event in events
+    )
+    assert all(event["pb_order_type"] == "entry_grid_normal_long" for event in events)
     assert len(api.order_calls) == 4
     assert all(call["params"]["type"] == "swap" for call in api.trade_calls)
     assert all(

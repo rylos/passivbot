@@ -257,6 +257,11 @@ FIELD_RUNTIME_RULES = {
             "optimize": "Coin Selection",
         },
     },
+    "live.exchange_symbol_unavailable_cooldown_hours": {
+        "owner": "live",
+        "consumed_by": {"live"},
+        "cli_exposed_on": {"live"},
+    },
     "live.order_replacement_churn_gate_activation_count": {
         "owner": "live",
         "consumed_by": {"live"},
@@ -268,11 +273,6 @@ FIELD_RUNTIME_RULES = {
         "cli_exposed_on": {"live"},
     },
     "live.order_replacement_churn_gate_stability_minutes": {
-        "owner": "live",
-        "consumed_by": {"live"},
-        "cli_exposed_on": {"live"},
-    },
-    "live.order_replacement_churn_gate_tracking_tolerance_pct": {
         "owner": "live",
         "consumed_by": {"live"},
         "cli_exposed_on": {"live"},
@@ -1023,6 +1023,22 @@ RESERVED_CLI_ARGS = {
         },
         "help": "Forager incumbent score tolerance. Keeps an already-selected flat forager coin when a challenger score is within this fractional normalized-score gap.",
     },
+    "live.exchange_symbol_unavailable_cooldown_hours": {
+        "visible": ["--exchange-symbol-unavailable-cooldown-hours"],
+        "hidden": [
+            "--live.exchange_symbol_unavailable_cooldown_hours",
+            "--live_exchange_symbol_unavailable_cooldown_hours",
+        ],
+        "type": float,
+        "metavar": "FLOAT",
+        "commands": {"live"},
+        "group": {"live": "Behavior"},
+        "help": (
+            "Hours to suppress new entries for a symbol after a connector proves "
+            "that the venue has temporarily disabled API trading for it. The "
+            "RAM-only cooldown resets on bot restart; 0 disables this suppression."
+        ),
+    },
     "live.order_replacement_churn_gate_activation_count": {
         "visible": ["--order-replacement-churn-gate-activation-count"],
         "hidden": [
@@ -1057,19 +1073,7 @@ RESERVED_CLI_ARGS = {
         "metavar": "FLOAT",
         "commands": {"live"},
         "group": {"live": "Behavior"},
-        "help": "Newest contiguous tight-match duration required to clear older churn evidence.",
-    },
-    "live.order_replacement_churn_gate_tracking_tolerance_pct": {
-        "visible": ["--order-replacement-churn-gate-tracking-tolerance-pct"],
-        "hidden": [
-            "--live.order_replacement_churn_gate_tracking_tolerance_pct",
-            "--live_order_replacement_churn_gate_tracking_tolerance_pct",
-        ],
-        "type": float,
-        "metavar": "FLOAT",
-        "commands": {"live"},
-        "group": {"live": "Behavior"},
-        "help": "Wider price/quantity tolerance used only for historical churn evidence.",
+        "help": "Minimum sustained drift duration; the same tight-match duration clears older evidence.",
     },
     "live.order_replacement_churn_gate_window_minutes": {
         "visible": ["--order-replacement-churn-gate-window-minutes"],
@@ -1440,8 +1444,8 @@ RESERVED_CLI_ARGS = {
         "commands": {"optimize"},
         "group": {"optimize": "Optimizer"},
         "help": (
-            "Use one suite scenario for scoring objectives while keeping optimize.limits "
-            "evaluated against suite aggregates."
+            "Default suite scenario for scoring objectives. Per-objective scenario selectors "
+            "may override it; optimize.limits remain suite-aggregated."
         ),
     },
     "optimize.population_size": {
@@ -1617,8 +1621,8 @@ CLI_HELP_OVERRIDES = {
     ),
     "backtest.base_dir": "Directory where standalone backtest results are written.",
     "backtest.volume_normalization": (
-        "Normalize volume across exchanges for combined datasets. Leave enabled "
-        "for comparable combined-exchange backtests."
+        "Normalize combined-exchange volume with robust complete-day, cross-coin "
+        "estimates. Disable to preserve each selected exchange's native volume."
     ),
     "backtest.liquidation_threshold": (
         "Early-stop equity floor as a fraction of starting balance. Must "
@@ -1734,6 +1738,7 @@ def _classify_live_argument(full_name: str, help_all: bool) -> Optional[str]:
         "live.forced_mode_long",
         "live.forced_mode_short",
         "live.hedge_mode",
+        "live.exchange_symbol_unavailable_cooldown_hours",
         "live.leverage",
         "live.market_orders_allowed",
         "live.max_realized_loss_pct",
@@ -1742,7 +1747,6 @@ def _classify_live_argument(full_name: str, help_all: bool) -> Optional[str]:
         "live.order_replacement_churn_gate_activation_count",
         "live.order_replacement_churn_gate_market_dist_pct",
         "live.order_replacement_churn_gate_stability_minutes",
-        "live.order_replacement_churn_gate_tracking_tolerance_pct",
         "live.order_replacement_churn_gate_window_minutes",
     }
     runtime = {
