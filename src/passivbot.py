@@ -16588,6 +16588,16 @@ class Passivbot:
             "risk_twel_enforcer_policy",
             "risk_we_excess_allowance_mode",
         }
+        # Fail-closed fallbacks: a config without the rylos_4rsi group behaves
+        # exactly like upstream (gate disabled), same as backtest.py.
+        rylos_defaults = {
+            "rylos_4rsi_enabled": False,
+            "rylos_osc_entry_threshold": -10.028,
+            "rylos_entry_stoch_threshold": 36.222,
+            "rylos_osc_exit_threshold": 24.845,
+            "rylos_exit_stoch_threshold": 73.05,
+            "rylos_exit_min_gain": 0.0103,
+        }
         strategy_keys = {
             "close_grid_qty_pct",
             "close_trailing_retracement_pct",
@@ -16673,11 +16683,16 @@ class Passivbot:
                 else:
                     val = self.bp(pside, key, symbol) if symbol is not None else self.bp(pside, key)
             else:
-                val = (
-                    self.bp(pside, key, symbol)
-                    if symbol is not None
-                    else self.bp(pside, key)
-                )
+                try:
+                    val = (
+                        self.bp(pside, key, symbol)
+                        if symbol is not None
+                        else self.bp(pside, key)
+                    )
+                except KeyError:
+                    if key not in rylos_defaults:
+                        raise
+                    val = rylos_defaults[key]
             out_key = key
             if key == "forager_volatility_ema_span_1m":
                 out_key = "filter_volatility_ema_span_1m"

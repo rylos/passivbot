@@ -102,6 +102,7 @@ def test_default_example_config_loads_with_grouped_shape_and_live_execution_sett
         "forager",
         "hsl",
         "risk",
+        "rylos_4rsi",
         "strategy",
         "unstuck",
     }
@@ -109,6 +110,7 @@ def test_default_example_config_loads_with_grouped_shape_and_live_execution_sett
         "forager",
         "hsl",
         "risk",
+        "rylos_4rsi",
         "strategy",
         "unstuck",
     }
@@ -143,6 +145,7 @@ def test_shipped_example_configs_load_with_grouped_canonical_shape():
             "forager",
             "hsl",
             "risk",
+            "rylos_4rsi",
             "strategy",
             "unstuck",
         }
@@ -150,6 +153,7 @@ def test_shipped_example_configs_load_with_grouped_canonical_shape():
             "forager",
             "hsl",
             "risk",
+            "rylos_4rsi",
             "strategy",
             "unstuck",
         }
@@ -157,6 +161,7 @@ def test_shipped_example_configs_load_with_grouped_canonical_shape():
             "forager",
             "hsl",
             "risk",
+            "rylos_4rsi",
             "strategy",
             "unstuck",
         }
@@ -164,6 +169,7 @@ def test_shipped_example_configs_load_with_grouped_canonical_shape():
             "forager",
             "hsl",
             "risk",
+            "rylos_4rsi",
             "strategy",
             "unstuck",
         }
