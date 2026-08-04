@@ -397,3 +397,6 @@ Cargo.lock
 
 # Fake-live/monitor test artifacts
 /monitor/
+
+# Editor/agent backups
+*.bak
