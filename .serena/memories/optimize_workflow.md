@@ -13,4 +13,6 @@ Note operative:
 - Monitoraggio: `tmux capture-pane -pt opt -S -N` + grep "Iter:"; ~600-730 iter/min con 26 cpu su 722 giorni HYPE → 500k iter ≈ 12-14h.
 - ATTENZIONE pgrep via ssh: `pgrep -af pattern` matcha la propria shell ssh — usare `pgrep -f '^python...'` o verificare il comando.
 - Backtest fino a oggi: serve `end_date` esplicita (default = oggi−2gg).
-- I file in `pareto/` contengono anche `metrics.stats.*` → confronto candidati senza rifare backtest.
+- I file in `pareto/` contengono anche `metrics.stats.*` → confronto candidati senza rifare backtest. ⚠️ Lì le metriche sono dict `{mean,min,max}`, non scalari: per confronti automatici usare `metrics.objectives`. Vedi `mem:monitoring_alerting` per il monitor che avvisa su Telegram quando un candidato batte la config live.
+- Run r3 (2026-08-04, `configs/hype_4rsi_long_v8_refine20_r3_to20260804.json`): stessi bounds del r2 ma finestra estesa a 733 giorni con candele fino al 04/08.
+- ⚠️ Il backtest **non scarica** le candele mancanti quando si estende `end_date`: costruisce il dataset da quello che ha e lo marca `partial_window`. Scaricare prima con `PYTHONPATH=src python src/ohlcv_download.py <config> -s HYPE -e binance,bybit -ed <data>`, poi cancellare l'eventuale dataset combinato stale in `caches/hlcvs_data/` e rilanciare.

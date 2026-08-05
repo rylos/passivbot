@@ -1,8 +1,12 @@
-# Deploy live e stato corrente (aggiornato 2026-07-26)
+# Deploy live e stato corrente (aggiornato 2026-08-05)
 
 ## Stato
-- **ry-hl** (Hyperliquid, user `hyperliquid_vault`, tmux `ry-hl` su amazon): branch `rylos-4rsi-proto` @ `1fbe9dae`, config `configs/live/config_hl_4rsi.json` = candidato **7b05e3b7** (full: `7b05e3b743c566054193b980043b1808268e99745797e5deebed01c9a56c26e9`, run refinement `2026-07-25T02_49_45_..._65796f56` su debian). TWE 3.0; entry osc<−23.77/stoch<12.79; exit osc>19.97/stoch>87.16, gain>0.606%. Prima uscita 4RSI live: 2026-07-26 04:15 ora italiana, +97.79 USDC.
-- **ry** (Bybit, user `bybit_02`, tmux `ry` su amazon): master upstream `5726b901`, bot FERMO per scelta di Marco (config `configs/live/config.json`).
+- **ry-hl** (Hyperliquid, user `hyperliquid_vault`, tmux `ry-hl` su amazon): branch `rylos-4rsi-proto` @ `b9a71bed` (merge upstream fino a `24081f14` del 2026-08-03 + fix branch-local), config `configs/live/config_hl_4rsi.json` = **candidato `afe61aed`** del run r3 (`optimize_results/2026-08-04T13_29_26_combined_733days_HYPE_f8459165/pareto/afe61aed*.json` su debian), live dal 2026-08-04 20:22 ora italiana. TWE **2.93**, `risk.total_exposure_enforcer_threshold` forzato a **1.01** (il candidato aveva 1.003: anti-chattering TWEL, fenomeno live-only invisibile al backtest). Entry osc<−23.8698/stoch<12.703; exit osc>19.304/stoch>87.183, gain>0.646%.
+  - Metriche di riferimento (backtest 733gg, candele al 04/08, `backtests/combined/2026-08-04T18_22_09/analysis.json` su debian — è anche il baseline del monitor): adg 0.010105, adg_w 0.006020, drawdown_worst 0.2804, dd_1pct 0.2585, recovery_days_max 4.70, position_held_days_max 3.99, sortino 0.2072.
+  - Storico deploy del 04/08: `7b05e3b7` (precedente) → `61d1986b` alle 17:26 → `afe61aed` alle 20:22. Backup progressivi in `configs/live/config_hl_4rsi.json.pre-*`. Il run r3 completo (500k iter) non ha prodotto nulla di meglio: zero dominanti, zero sopra la soglia del 3% (vedi `mem:deploy-autonomo-vincitore-netto`).
+  - I contatori ordini/fills nella riga `[health]` ripartono da zero a ogni restart.
+- **ry** (Bybit, user `bybit_02`, tmux `ry` su amazon): master upstream `5726b901`, bot FERMO per scelta di Marco (config `configs/live/config.json`). NON aggiornato al merge del 04/08.
+- **debian** (`/opt/passivbot`): stesso commit `b9a71bed`, Rust ricompilata, nessun optimize in corso.
 
 ## Procedura swap config da candidato optimize (CRITICA)
 1. Backup della config attuale (`cp ... .pre-<tag>-<data>`).
@@ -12,7 +16,12 @@
 5. Verifica: banner TWEL atteso, `[pos]` riconciliata (prende in carico posizioni aperte), warning trailing warmup sparisce in ~5 min, nessun traceback.
 
 ## Procedura aggiornamento codice (repo + Rust)
-git fetch + merge --ff-only → `export PATH=$HOME/.cargo/bin:$PATH && source venv/bin/activate && cd passivbot-rust && maturin develop --release` → restart. Requirements solo se cambiati: `venv/bin/python -m pip install -r requirements-live.txt` (MAI `venv/bin/pip` su amazon). Preferire i riavvii quando il bot è flat.
+Su amazon-hl il remote del fork è **`fork`** (`origin` = enarjord); su debian e pc-work è `origin`.
+`git fetch fork rylos-4rsi-proto && git merge --ff-only fork/rylos-4rsi-proto` → `export PATH=$HOME/.cargo/bin:$PATH && source venv/bin/activate && cd passivbot-rust && maturin develop --release` → restart. Requirements solo se cambiati: `venv/bin/python -m pip install -r requirements-live.txt` (MAI `venv/bin/pip` su amazon). Preferire i riavvii quando il bot è flat.
+- Verifica post-deploy OBBLIGATORIA: banner `[runtime] python=<hash>` = commit del fix (ricompilare il Rust NON deploya il Python) e `grep -c rylos_4rsi_enabled <venv>/lib/python3.12/site-packages/passivbot_rust/passivbot_rust.abi3.so` → 3 su hl, 0 su bybit.
+- Pre-check utile prima del restart: `python -c` con `load_config(<config live>)` per verificare che il codice nuovo accetti la config in produzione.
+- Nota: dopo `maturin develop` il bot al primo avvio segnala comunque "Rust extension is stale" e ricompila (~30s); serve cargo nel PATH.
 
-## Notifiche
-Telegram a Marco: token+chat_id nel campo `telegram` di `~/dev/freqtrade/user_data/config.json` (pc-work). Orari SEMPRE in Europe/Rome nei report.
+## Notifiche e sorveglianza
+Telegram a Marco: bot **Claude RyLoS Bot** (token in `~/.claude/channels/telegram/.env` su pc-work, chat_id 46772914) — NON il bot del config freqtrade. Orari SEMPRE in Europe/Rome nei report.
+Watchdog automatico su ry-hl attivo dal 2026-08-04 (cron ogni 10 min su amazon) + controllo agentico ogni 30 min con autorizzazione di Marco a fixare e riavviare: dettagli in `mem:monitoring_alerting`.
