@@ -11,6 +11,7 @@
 ## Procedura swap config da candidato optimize (CRITICA)
 1. Backup della config attuale (`cp ... .pre-<tag>-<data>`).
 2. **Sostituire la sezione `live` del candidato con quella di produzione** — il candidato porta `live.user` dell'ambiente optimize (es. `bybit_02`), MAI usarlo su ry-hl. `coin_overrides` = quelli di produzione.
+2b. ⚠️ Dal 2026-08-06 PRIMA di fermare il bot: `touch ~/watchdog/hl_maintenance` (senza, il watchdog lo rimette su entro 10 minuti mentre ci lavori) e `rm ~/watchdog/hl_maintenance` a fine intervento.
 3. Stop pulito: `kill -INT <pid>` (pid via `pgrep -f '^python src/main.py'`), attendere "Bot stopped via signal".
 4. Restart: `tmux send-keys -t <sessione>.0 'python src/main.py configs/live/<cfg>.json' C-m`.
 5. Verifica: banner TWEL atteso, `[pos]` riconciliata (prende in carico posizioni aperte), warning trailing warmup sparisce in ~5 min, nessun traceback.
@@ -24,4 +25,4 @@ Su amazon-hl il remote del fork è **`fork`** (`origin` = enarjord); su debian e
 
 ## Notifiche e sorveglianza
 Telegram a Marco: bot **Claude RyLoS Bot** (token in `~/.claude/channels/telegram/.env` su pc-work, chat_id 46772914) — NON il bot del config freqtrade. Orari SEMPRE in Europe/Rome nei report.
-Watchdog automatico su ry-hl attivo dal 2026-08-04 (cron ogni 10 min su amazon) + controllo agentico ogni 30 min con autorizzazione di Marco a fixare e riavviare: dettagli in `mem:monitoring_alerting`.
+Watchdog automatico su ry-hl attivo dal 2026-08-04 (cron ogni 10 min su amazon), **dal 2026-08-06 riavvia da solo il bot se il processo è assente** (vedi il punto 2b della procedura di restart: file di manutenzione obbligatorio prima di ogni fermata voluta) + controllo agentico ogni 30 min con autorizzazione di Marco a fixare e riavviare: dettagli in `mem:monitoring_alerting`.
