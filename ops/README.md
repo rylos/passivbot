@@ -7,6 +7,15 @@ sopravvivere a una ricostruzione del server e a versionare le modifiche.
 |---|---|---|
 | `watchdog_ry_hl.py` | amazon, `~/watchdog/watchdog.py` | `*/10 * * * *` |
 
+Dopo ogni modifica qui, ricopiare sul server e verificare che l'md5 combaci:
+
+```bash
+scp ops/watchdog_ry_hl.py amazon.ziliani.net:'~/watchdog/watchdog.py'
+ssh amazon.ziliani.net 'python3 ~/watchdog/watchdog.py; echo exit=$?'
+```
+
+Il gemello per il bot freqtrade sta nell'altro repo, `freqtrade/ops/watchdog_freqtrade.py`.
+
 ## watchdog_ry_hl.py
 
 Sorveglia il bot live **ry-hl** (Hyperliquid, prototipo 4RSI) leggendo
