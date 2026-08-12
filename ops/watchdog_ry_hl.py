@@ -189,7 +189,13 @@ def alert(state: dict, kind: str, text: str) -> None:
 
 def bot_pid() -> str | None:
     r = subprocess.run(
-        ["pgrep", "-f", "^python src/main.py"], capture_output=True, text=True
+        # Il pattern deve reggere sia "python src/main.py" sia
+        # "venv/bin/python src/main.py" (BOT_CMD usa il python del venv):
+        # un pattern ancorato a ^python non vedeva il bot avviato dal venv e
+        # il watchdog lo avrebbe considerato assente, avviandone un secondo.
+        ["pgrep", "-f", r"python src/main\.py configs/live/config_hl_4rsi\.json"],
+        capture_output=True,
+        text=True,
     )
     pids = [p for p in r.stdout.split() if p.strip()]
     return pids[0] if pids else None

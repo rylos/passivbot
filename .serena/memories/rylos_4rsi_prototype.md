@@ -17,6 +17,13 @@ Porta in passivbot v8 l'entry della strategia RyLoS Classic di freqtrade (`~/dev
 - `enabled: false` (default) ≡ comportamento master identico, verificato.
 - Cache indicatori nell'optimizer: `_rylos_indicators_cache` module-level in `src/backtest.py` (chiave: id hlcvs + shape + primo ts + config).
 
+## Patch reconciler (dal merge upstream del 2026-08-13, commit `d1b352eb`)
+Upstream valida ogni ordine prodotto da Rust contro l'input inviato e rifiuta la famiglia `close_panic_*` quando la modalità del lato non è `panic` (`src/live/reconciler.py`, `_validate_rust_order_family_for_submitted_mode`) → `FatalBotException`, processo morto. Siccome l'uscita 4RSI usa `calc_panic_close` restando in modalità normale, senza patch il bot muore **al primo segnale di uscita** (non all'avvio: invisibile ai test e allo smoke test di deploy).
+- Fix: il reconciler legge `rylos_4rsi_enabled` dai `bot_params` già inviati a Rust (`_bot_params_to_rust_dict`) e accetta la famiglia panic fuori da modalità panic solo per quel symbol/side, nelle modalità `normal`/`graceful_stop`/`tp_only` (Rust emette l'uscita per ogni modalità non-manual). Restano attivi tutti gli altri invarianti panic: quantità = posizione intera, prezzo limite verificato contro il book.
+- Test: `tests/test_rylos_4rsi_panic_close.py` (5 casi, incluso "panic close ancora rifiutato con 4RSI spento").
+- ⚠️ `reconciler.py` è un file che upstream tocca spesso: aspettarsi attrito a ogni merge futuro. Se i test di quel file falliscono dopo un merge, guardare prima lì.
+- Valutata e scartata una famiglia d'ordine dedicata (`close_rylos_*`): richiederebbe enum Rust + mappa custom_id + tutti i validatori per prefisso + contabilità fill in backtest/analysis, e perderebbe i comportamenti impliciti di `_order_is_panic` (priorità `risk_critical`, esenzione churn gate). Più superficie di divergenza, non meno.
+
 ## Vincoli noti
 - `candle_interval_minutes` deve restare 1.
 - `exit_min_gain` è sul PREZZO (0.0103 ≈ min_profit 4.1% / leva 4 di freqtrade).
