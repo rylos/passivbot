@@ -1,5 +1,11 @@
 # Workflow optimize + refinement (server debian, tmux "opt")
 
+## ⚠️ PRIMO PASSO DEL PROSSIMO RUN (in sospeso dal 2026-08-13)
+Prima di lanciare il prossimo optimize va riarmato il monitor del fronte di Pareto su debian: il suo baseline è del 04/08 ed è stato prodotto col tick di HYPE vecchio (0.001), quindi confronterebbe candidati calcolati in regimi di tick diversi. Tre cose:
+1. **Baseline** = `analysis.json` di un backtest della config live, prodotto **sullo stesso dataset del run** (stessa finestra, stessa `end_date`, stessi metadati di mercato), copiato su `~/pareto_monitor/baseline_live.json`. Se la finestra arriva a oggi servono prima le candele (`src/ohlcv_download.py`, poi cancellare il dataset combinato stale in `caches/hlcvs_data/`). Config pronta: `configs/bt_verify_merge_20260813.json` (è la config live, basta aggiornare `end_date`).
+2. **`RUN_DIR`** in `~/pareto_monitor/monitor.py` (riga ~18) è hardcoded e punta ancora al run r3 del 04/08: va fatto puntare alla nuova directory di run.
+3. **`~/pareto_monitor/state.json`** va azzerato: contiene `finished: true` (il monitor esce subito) e gli hash dei candidati già notificati.
+
 Metodologia consolidata (dettagli e storico nel wiki Joplin, nota "passivbot"):
 
 1. **Run full-range**: bounds da `get_optimize_bounds_defaults()` con pin strutturali (n_positions [1,1], entry_cooldown [0,0], TWE [2.5,3]) e bounds rylos allargati. 500k iter, 26 cpu, `pareto_max_size` 1000. Esempio: `configs/hype_4rsi_long_v8_r1.json` → run `2026-07-24T09_03_41_..._f1f124cd`.
