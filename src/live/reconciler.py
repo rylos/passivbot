@@ -1109,6 +1109,7 @@ def _validate_rust_order_family_for_submitted_mode(
     submitted_position_size: float,
     submitted_flat_side_eligible: bool,
     context: str,
+    rylos_panic_close_allowed: bool = False,
 ) -> None:
     """Reject order families Rust cannot emit for the submitted mode and eligibility."""
     mode = "normal" if input_mode is None else input_mode
@@ -1117,10 +1118,20 @@ def _validate_rust_order_family_for_submitted_mode(
     is_panic_close = order_type.rsplit("_", 1)[0] == "close_panic"
     if not (is_entry or is_close):
         raise FatalBotException(f"{context} has unsupported order family")
+    # rylos 4RSI (fork-local): the 4RSI exit emits a full-position panic close
+    # while the side is in a normal generating mode. Rust emits it for every
+    # non-manual mode (orchestrator.rs: rylos_exit). Every other panic
+    # invariant (full quantity, limit price from the submitted book) still
+    # applies.
+    rylos_normal_panic = (
+        rylos_panic_close_allowed
+        and is_panic_close
+        and mode in {"normal", "graceful_stop", "tp_only"}
+    )
     invalid = (
         mode == "manual"
         or (mode == "panic" and not is_panic_close)
-        or (mode != "panic" and is_panic_close)
+        or (mode != "panic" and is_panic_close and not rylos_normal_panic)
         or (mode == "tp_only" and is_entry)
         or (
             is_entry
@@ -1480,6 +1491,7 @@ def _submitted_rust_input_context(
     entry_sequential_staging: dict[tuple[int, str], bool] = {}
     close_retracement_enabled: dict[tuple[int, str], bool] = {}
     hsl_execution_policy: dict[tuple[int, str], tuple[bool, str]] = {}
+    rylos_4rsi_enabled: dict[tuple[int, str], bool] = {}
     timestamp_ms = _validated_rust_u64(
         orchestrator_input.get("timestamp_ms", 0), "input has invalid timestamp_ms"
     )
@@ -1669,6 +1681,16 @@ def _submitted_rust_input_context(
                 hsl_enabled,
                 panic_close_order_type,
             )
+            # rylos 4RSI (fork-local): the exit signal closes the full position
+            # through Rust's panic-close path while the side stays in a normal
+            # generating mode, so the panic family must be accepted outside
+            # panic mode for this symbol/side only.
+            rylos_flag = bot_params.get("rylos_4rsi_enabled", False)
+            if not isinstance(rylos_flag, bool):
+                raise FatalBotException(
+                    f"Rust orchestrator symbol input {input_idx} has invalid {pside} rylos_4rsi_enabled"
+                )
+            rylos_4rsi_enabled[(symbol_idx, pside)] = rylos_flag
             cooldown_minutes = _validated_rust_finite_number(
                 bot_params.get("risk_entry_cooldown_minutes", 0.0),
                 f"symbol input {input_idx} has invalid {pside} risk_entry_cooldown_minutes",
@@ -1787,6 +1809,7 @@ def _submitted_rust_input_context(
         entry_sequential_staging,
         close_retracement_enabled,
         hsl_execution_policy,
+        rylos_4rsi_enabled,
     )
 
 
@@ -1869,6 +1892,7 @@ def validate_rust_orchestrator_output(
         submitted_entry_sequential_staging,
         submitted_close_retracement_enabled,
         submitted_hsl_execution_policy,
+        submitted_rylos_4rsi_enabled,
     ) = _submitted_rust_input_context(orchestrator_input, expected_symbol_idxs)
     seen_conversion_identities: dict[tuple[object, float, float, str], int] = {}
     aggregate_close_qty: dict[tuple[int, str], float] = {}
@@ -1951,6 +1975,7 @@ def validate_rust_orchestrator_output(
             submitted_symbol_side_eligibility[pair]
             and submitted_global_side_enablement[pside],
             f"Rust orchestrator order {order_idx}",
+            rylos_panic_close_allowed=submitted_rylos_4rsi_enabled[pair],
         )
         _validate_rust_order_family_for_submitted_strategy(
             order_type,
