@@ -268,6 +268,14 @@ Handling in Passivbot:
    does not report that tuple, require an authoritative native `reduceOnly` value.
 4. Keep classic Bitget v2/mix `tradeSide`/`reduceOnly` handling separate.
 
+### UTA public candle history routing
+
+Bitget account-mode detection enables UTA routing for authenticated account and order calls. Public
+OHLCV history is account-independent and must explicitly use classic futures market-data routing;
+the UTA candle endpoint may expose a shorter history and return an empty prefix which is available
+from the public v2 futures history endpoint. Pass `uta=false` only on Bitget OHLCV requests. Do not
+disable UTA on the shared CCXT session or on private account/order requests.
+
 ### `since` is effectively exclusive for OHLCV paging
 
 Problem: naive paging can miss first candle in each page.
@@ -316,8 +324,13 @@ such as `"None"` as durable subscription state.
 
 Gate's `cross_available` is spendable margin, not stable account equity. Resting
 orders move value between `cross_available` and `cross_order_margin`, while open
-positions use `cross_initial_margin`. For multi-currency margin accounts, derive
-the strategy balance from the same authoritative futures-account row as
+positions use `cross_initial_margin`. For multi-currency margin accounts, select
+the unique futures-account row whose settle `currency` matches the bot quote
+(CCXT wraps Gate's single-account response as `info=[account]`; never prefer an
+unrelated first row when currency-matched candidates exist). A singleton row is
+accepted only when `currency` is omitted; an explicit mismatched currency fails
+closed. Derive the strategy
+wallet balance from that same authoritative row as
 `cross_available + cross_order_margin + cross_initial_margin -
 cross_unrealised_pnl`. Require all four finite fields. Removing unrealized PnL
 preserves wallet-balance semantics because Passivbot adds position PnL separately
@@ -325,6 +338,12 @@ when deriving equity. Do not feed `cross_available` alone to Rust, because
 ordinary order reservation would then resize ideal orders and create
 reconciliation churn. Classic accounts continue using CCXT's quote-currency
 total.
+
+Balance-change events may publish a bounded Gate composition diagnostic for the
+settle currency: reconstructed wallet amount, available margin
+(`cross_available`), reserved margin (`cross_initial_margin +
+cross_order_margin`), and unrealized PnL. Composition is observability-only and
+must not replace the trading wallet balance.
 
 ### Per-symbol leverage initializes the position risk limit
 
@@ -629,9 +648,9 @@ Handling in Passivbot:
    finalized tail covers the remaining range.
 2. Exclude the forming candle and require exact finalized-candle coverage before
    publishing close, volume, quote-volume, or volatility EMAs.
-3. Require exact 1m coverage before rebuilding trailing extrema or extending an
-   HSL replay cache. Missing coverage marks trailing state unavailable or makes
-   HSL fall back to its authoritative full replay path.
+3. Require exact 1m coverage before rebuilding trailing extrema. HSL restart reconstruction uses
+   the documented 1m/5m/15m/1h resolution ladder for the older leading prefix and remains
+   authoritative for fill timestamps, realized PnL, fees, and episode boundaries.
 4. Keep bulk historical WEEX backtest downloading out of scope; this bounded
    paging exists for live warmup, restart reconstruction, and runtime indicators.
 

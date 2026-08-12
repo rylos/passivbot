@@ -248,7 +248,6 @@ class EventTypes:
     HSL_REPLAY_PROGRESS = "hsl.replay.progress"
     HSL_REPLAY_COMPLETED = "hsl.replay.completed"
     HSL_REPLAY_FAILED = "hsl.replay.failed"
-    HSL_REPLAY_CACHE = "hsl.replay.cache"
     HSL_RED_TRIGGERED = "hsl.red_triggered"
     HSL_RED_FINALIZED_WITHOUT_ORDER = "hsl.red_finalized_without_order"
     HSL_COOLDOWN_STARTED = "hsl.cooldown_started"
@@ -388,11 +387,6 @@ class ReasonCodes:
         "hsl_price_history_symbol_fetch_completed"
     )
     HSL_PRICE_HISTORY_SYMBOL_FETCH_STARTED = "hsl_price_history_symbol_fetch_started"
-    HSL_REPLAY_CACHE_HIT = "hsl_replay_cache_hit"
-    HSL_REPLAY_CACHE_MISS = "hsl_replay_cache_miss"
-    HSL_REPLAY_CACHE_REJECTED = "hsl_replay_cache_rejected"
-    HSL_REPLAY_CACHE_WRITTEN = "hsl_replay_cache_written"
-    HSL_REPLAY_CACHE_WRITE_FAILED = "hsl_replay_cache_write_failed"
     HSL_REPLAY_PENDING = "hsl_replay_pending"
     HSL_RAW_RED_PENDING_EMA_CONFIRMATION = "hsl_raw_red_pending_ema_confirmation"
     HSL_RED_FINALIZED_WITHOUT_EXCHANGE_ORDER = (
@@ -584,7 +578,6 @@ PHASE1_EVENT_TYPES = {
     EventTypes.HSL_REPLAY_PROGRESS,
     EventTypes.HSL_REPLAY_COMPLETED,
     EventTypes.HSL_REPLAY_FAILED,
-    EventTypes.HSL_REPLAY_CACHE,
     EventTypes.HSL_RED_TRIGGERED,
     EventTypes.HSL_RED_FINALIZED_WITHOUT_ORDER,
     EventTypes.HSL_COOLDOWN_STARTED,
@@ -646,6 +639,7 @@ _SENSITIVE_KEY_FRAGMENTS = {
     "wallet-address",
     "x-mbx-apikey",
 }
+_NON_SENSITIVE_KEY_EXACT = {"authoritative_epoch"}
 
 
 def utc_ms() -> int:
@@ -692,6 +686,8 @@ def payload_hash_raw(payload: bytes | str) -> str:
 
 def _is_sensitive_key(key: object) -> bool:
     cleaned = "".join(ch for ch in str(key).lower() if ch.isalnum() or ch in "_-")
+    if cleaned in _NON_SENSITIVE_KEY_EXACT:
+        return False
     compact = cleaned.replace("-", "").replace("_", "")
     return any(
         fragment in cleaned or fragment.replace("-", "").replace("_", "") in compact
@@ -1407,7 +1403,6 @@ DEFAULT_ROUTES: dict[str, EventRoute] = {
     EventTypes.HSL_REPLAY_PROGRESS: EventRoute(console=False, text=False),
     EventTypes.HSL_REPLAY_COMPLETED: EventRoute(console=False, text=False),
     EventTypes.HSL_REPLAY_FAILED: EventRoute(console=False, text=False),
-    EventTypes.HSL_REPLAY_CACHE: EventRoute(console=False, text=False),
     EventTypes.HSL_RED_TRIGGERED: EventRoute(console=False, text=False),
     EventTypes.HSL_RED_FINALIZED_WITHOUT_ORDER: EventRoute(console=False, text=False),
     EventTypes.HSL_COOLDOWN_STARTED: EventRoute(console=False, text=False),

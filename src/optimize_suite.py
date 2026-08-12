@@ -24,7 +24,6 @@ from shared_arrays import attach_shared_array
 from suite_runner import (
     SuiteScenario,
     extract_suite_config,
-    aggregate_metrics,
     apply_scenario,
     build_scenarios,
     collect_suite_coin_sources,
@@ -36,8 +35,15 @@ from suite_runner import (
     _compute_slice_indices,
     _normalize_date_to_ts,
     _determine_needed_individual_exchanges,
+    _coalesce_master_coins,
 )
-from utils import format_approved_ignored_coins, load_markets, ts_to_date, utc_ms
+from utils import (
+    format_approved_ignored_coins,
+    load_markets,
+    reject_cross_exchange_market_identifier_collisions,
+    ts_to_date,
+    utc_ms,
+)
 
 
 @dataclass
@@ -70,7 +76,7 @@ async def prepare_suite_contexts(
     """Prepare datasets and configs for every optimizer suite scenario."""
 
     base_exchanges = require_config_value(config, "backtest.exchanges")
-    scenarios, aggregate_cfg = build_scenarios(suite_cfg, base_exchanges=base_exchanges)
+    scenarios, reducer_cfg = build_scenarios(suite_cfg, base_exchanges=base_exchanges)
 
     # Determine which individual exchange datasets are needed for single-exchange scenarios
     needed_individual = _determine_needed_individual_exchanges(scenarios, base_exchanges)
@@ -84,10 +90,19 @@ async def prepare_suite_contexts(
             sorted(added_exchanges),
         )
 
-    for exchange in exchanges_list:
+    suite_coin_sources = collect_suite_coin_sources(config, scenarios)
+    identity_exchanges = sorted(
+        set(exchanges_list) | set(suite_coin_sources.values())
+    )
+    for exchange in identity_exchanges:
         await load_markets(exchange, verbose=False)
-    await format_approved_ignored_coins(config, exchanges_list, verbose=False)
-    validate_suite_side_coin_lists(config)
+    await format_approved_ignored_coins(
+        config,
+        exchanges_list,
+        verbose=False,
+        prefer_backtest_coin_source_keys=True,
+    )
+    validate_suite_side_coin_lists(config, exchanges_list)
 
     base_start = require_config_value(config, "backtest.start_date")
     base_end = require_config_value(config, "backtest.end_date")
@@ -109,8 +124,6 @@ async def prepare_suite_contexts(
     else:
         base_ignored_list = []
 
-    suite_coin_sources = collect_suite_coin_sources(config, scenarios)
-
     # Match suite_runner: scenario-specific coins extend the base universe, they do not replace it.
     master_coins = set(base_coins_list)
     master_ignored = set(base_ignored_list)
@@ -119,10 +132,15 @@ async def prepare_suite_contexts(
             master_coins.update(scenario.coins)
         if scenario.ignored_coins:
             master_ignored.update(scenario.ignored_coins)
-    master_coins.update(suite_coin_sources.keys())
-
-    master_coins_list = sorted(master_coins)
+    master_coins_list = _coalesce_master_coins(
+        sorted(master_coins), suite_coin_sources, identity_exchanges
+    )
     master_ignored_list = sorted(master_ignored)
+    await reject_cross_exchange_market_identifier_collisions(
+        [*master_coins_list, *master_ignored_list, *suite_coin_sources.keys()],
+        identity_exchanges,
+        verbose=False,
+    )
 
     base_config = deepcopy(config)
     if isinstance(base_config["live"]["approved_coins"], dict):
@@ -509,7 +527,7 @@ async def prepare_suite_contexts(
     if not contexts:
         raise ValueError("Suite configuration produced no runnable scenarios after filtering.")
 
-    return contexts, aggregate_cfg
+    return contexts, reducer_cfg
 
 
 def ensure_suite_config(config_path: Path, suite_path: Optional[Path]) -> Dict[str, Any]:

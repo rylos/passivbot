@@ -107,7 +107,12 @@ async def run_optimizer_replay(config: Dict[str, Any]) -> Dict[str, Any]:
 
     cfg = deepcopy(config)
     backtest_exchanges = require_config_value(cfg, "backtest.exchanges")
-    await format_approved_ignored_coins(cfg, backtest_exchanges, verbose=False)
+    await format_approved_ignored_coins(
+        cfg,
+        backtest_exchanges,
+        verbose=False,
+        prefer_backtest_coin_source_keys=True,
+    )
     cfg["backtest"]["coins"] = {}
     suite_cfg = extract_suite_config(cfg, None)
     suite_enabled = bool(suite_cfg.get("enabled"))
@@ -176,7 +181,7 @@ async def run_optimizer_replay(config: Dict[str, Any]) -> Dict[str, Any]:
         "metrics_payload": metrics_payload or {},
         "selected_coins": selected,
         "coin_sources": source_map,
-        "aggregate_cfg": None,
+        "reducer_cfg": None,
     }
 
 
@@ -186,7 +191,12 @@ async def run_backtest_replay(config: Dict[str, Any]) -> Dict[str, Any]:
 
     cfg = deepcopy(config)
     backtest_exchanges = require_config_value(cfg, "backtest.exchanges")
-    await format_approved_ignored_coins(cfg, backtest_exchanges, verbose=False)
+    await format_approved_ignored_coins(
+        cfg,
+        backtest_exchanges,
+        verbose=False,
+        prefer_backtest_coin_source_keys=True,
+    )
     cfg["backtest"]["coins"] = {}
     cfg["backtest"]["cache_dir"] = {}
     suite_cfg = extract_suite_config(cfg, None)

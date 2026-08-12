@@ -27,6 +27,10 @@ to the caller. It does not mean every failed symbol fetch must crash the whole b
    source, bounds, observability, and tests.
 5. If an allowed fallback source is itself unavailable, fail closed or propagate according to the
    consumer boundary.
+6. Validate a produced trading decision before downstream policy consumes it. A malformed Rust
+   ideal-order batch is fatal before reconciliation; prior ideals, actual orders, and partial output
+   are not fallbacks. When submitted inputs deterministically define an output field, validate the
+   exact result against the full input policy rather than checking only a coarse permission flag.
 
 ## Forbidden Patterns
 
@@ -36,6 +40,9 @@ In trading-critical paths, do not:
 - catch and return neutral defaults such as `0.0`, `None`, `{}`, `[]`, or `False` for required data
 - use `dict.get(required_key, default)` to hide a missing required configuration or input
 - pass fabricated defaults to Rust, reconciliation, a risk gate, or the executor
+- reinterpret malformed or partial Rust output as current strategy intent
+- treat a producer-echoed diagnostic as independent proof of a field that is deterministic from the
+  submitted input; validate the echo and the decision against that input
 
 These shapes may be valid in optional or observability-only code. Classify the consumer before
 changing a match.
@@ -53,15 +60,19 @@ order classes whose strategy or risk decision consumes them. Stale flat-symbol c
 block protective management of held symbols.
 
 A failed urgent candle refresh is therefore an availability observation, not an account-wide
-planning barrier. Live Python may explicitly mark a symbol's known missing EMA inputs as
-unavailable and pass no invented values. Rust remains strict by default, including backtests, and
-may scope only that explicit live absence to forager selection, one-way arbitration, strategy, or
-unstuck consumers that need it.
+planning barrier. Live Python may explicitly mark a symbol's known missing EMA inputs or one
+position side's trailing extrema as unavailable. Rust remains strict by default, including
+backtests, and may scope only that explicit live absence to forager selection, one-way arbitration,
+strategy, or unstuck consumers that need it. A structurally required trailing bundle paired with
+`trailing_available=false` is inert transport data and must be rejected before any consuming
+strategy branch can read it.
 Missing ordinary strategy input produces no ideal orders for the entry or close branch that
 consumes it, so normal Rust-authoritative reconciliation removes any now-stale resting orders from
 that branch. The other strategy branch, independent Rust risk reducers, and panic actions continue
 when their own inputs are complete. Malformed or non-finite producer output is never covered by
-this degradation and remains fatal.
+this degradation and remains fatal. Here, producer output means the Rust ideal-order/result
+envelope. A documented live input-reader availability sentinel must be classified before its
+strategy consumer and retains only its explicitly bounded recovery and scoped-defer policies.
 
 For candle-dependent actions, gate on canonical strategy-input readiness rather than raw REST
 candle arrival. A proven no-trade gap may use explicitly synthesized zero-volume continuity when
@@ -72,8 +83,12 @@ flat zero-volume rows for active strategy inputs while authoritative overlap rep
 Trailing-extrema reconstruction may use the same projection only for a still-open tail after dense
 post-fill coverage; it must not bridge a missing reset boundary or internal minute, and the
 projected rows must be discarded after that read so delayed authoritative highs and lows replace
-them immediately. Forager ranking quote-volume and log-range inputs retain their narrower
-carry-forward contract.
+them immediately. Forager ranking quote-volume and log-range inputs may bridge a later-bounded
+internal gap only after the current planning bundle records a successful authoritative refresh for
+that symbol; remote fetch permission alone is not refresh provenance. The complete gap length must
+be within `live.max_active_candle_tail_gap_minutes`; cache-only candidates retain their narrower
+carry-forward contract. Each refreshed-symbol ranking metric records warning-visible gap count,
+age, source, and consecutive-use diagnostics, followed by an authoritative-recovery diagnostic.
 
 Protective panic and reduce-only actions may proceed when their own account-critical and
 symbol-scoped requirements are fresh, even if unrelated strategy surfaces are unavailable.
@@ -82,14 +97,22 @@ symbol-scoped requirements are fresh, even if unrelated strategy surfaces are un
 
 Flat-symbol forager candidates may remain rankable within
 `live.max_forager_candle_staleness_minutes`. Close EMA readiness may use bounded flat-close
-projection. Quote-volume and log-range ranking inputs carry forward their latest known EMA with
-age/source metadata; they do not receive invented zero tails.
+projection. Quote-volume and log-range ranking inputs may use flat zero-volume continuity for
+later-bounded internal gaps within `live.max_active_candle_tail_gap_minutes` only after an
+authoritative refresh advances during the current planning bundle.
+Cache-only ranking inputs instead carry forward their latest known EMA with age/source metadata;
+they do not receive invented zero tails.
 When the forager setting is unset, its budget-derived acceptable age must not be shorter than
 `live.max_active_candle_tail_gap_minutes`; the refresh budget must not silently reduce the active
 tail grace period. An explicit positive forager cap is an operator override.
 
 Candidates with no prior feature basis, non-finite carried values, or excessive feature age are
 unavailable for new entries. Do not silently rank only the subset that happened to refresh first.
+Ranking-feature absence must remain scoped to forager selection: when the exact remaining eligible
+candidate count fits the remaining slots, Rust may select those candidates without ranking and
+must not let Python turn that unused input absence into symbol-wide non-tradability or a current
+ranking-unavailable alert. Diagnostics may retain the gap as conditional until Rust reports that
+ranking was required for that side.
 
 Approved and ignored coin state is an entry-eligibility input. Stale or unreadable eligibility
 blocks affected initial entries but not protective management. With `auto_gs=true`, removal of a
@@ -116,6 +139,7 @@ violate an explicit ownership or safety policy.
 
 | Input/path | Default | Allowed fallback | Required evidence |
 |---|---|---|---|
+| Rust ideal-order batch | Fatal before reconciliation | None | Producer-boundary regression test |
 | Exchange fetch methods | Propagate | None in fetch method | Caller policy tests |
 | Required EMA | Unavailable/raise | Previous EMA for the same symbol/span only when explicitly implemented | `[ema]` warning, source/age/count, regression tests |
 | Risk-gating input | Fail closed | None unless explicitly approved | `[risk]` visibility and regression tests |

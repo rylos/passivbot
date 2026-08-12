@@ -39,6 +39,7 @@ import pandas as pd
 import json
 import asyncio
 import numbers
+import time
 from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 from cli_utils import (
@@ -86,12 +87,20 @@ from config_utils import (
 from backtest_dataset import dump_backtest_dataset_metadata
 from analysis_visibility import filter_analysis_for_visibility
 from utils import (
+    MarketIdentifierResolutionError,
+    MarketIdentifierExchangeMismatch,
+    UnknownMarketIdentifier,
+    coin_to_symbol,
+    heuristic_symbol_to_coin,
+    looks_like_exact_market_identifier,
     utc_ms,
     make_get_filepath,
     load_markets,
     format_end_date,
     format_approved_ignored_coins,
     date_to_ts,
+    to_standard_exchange_name,
+    to_ccxt_exchange_id,
 )
 from pure_funcs import (
     ts_to_date,
@@ -103,6 +112,7 @@ import pprint
 from copy import deepcopy
 from hlcv_preparation import (
     HLCV_PREPARATION_ALGORITHM_VERSION,
+    _load_and_reconcile_combined_sources,
     prepare_hlcvs,
     prepare_hlcvs_combined,
     try_prepare_hlcvs_v2_local,
@@ -112,6 +122,7 @@ from hlcvs_manifest import (
     build_hlcvs_manifest,
     load_hlcvs_manifest,
     manifest_has_required_schema,
+    save_numpy_artifact_with_hash,
     verify_hlcvs_manifest,
     write_hlcvs_manifest,
 )
@@ -384,16 +395,60 @@ def _apply_market_settings_override(
     market_settings: dict,
     overrides: dict,
 ) -> dict:
+    def find_override(mapping: dict, venue: str, field_name: str):
+        direct_override = mapping.get(coin_key)
+        if venue == "combined" or not (
+            looks_like_exact_market_identifier(coin_key)
+            or any(looks_like_exact_market_identifier(key) for key in mapping)
+        ):
+            return direct_override
+        try:
+            target_symbol = coin_to_symbol(coin_key, venue, verbose=False)
+        except (MarketIdentifierExchangeMismatch, UnknownMarketIdentifier):
+            return direct_override
+        matches = (
+            [(coin_key, direct_override)] if direct_override is not None else []
+        )
+        for identifier, override in mapping.items():
+            if identifier == coin_key:
+                continue
+            try:
+                override_symbol = coin_to_symbol(identifier, venue, verbose=False)
+            except (MarketIdentifierExchangeMismatch, UnknownMarketIdentifier):
+                continue
+            if override_symbol == target_symbol:
+                matches.append((identifier, override))
+        if len(matches) > 1:
+            first_override = matches[0][1]
+            if any(override != first_override for _, override in matches[1:]):
+                raise ValueError(
+                    f"conflicting {field_name} keys resolve to {coin!r} on {venue}: "
+                    f"{sorted(identifier for identifier, _ in matches)}"
+                )
+            return first_override
+        return matches[0][1] if matches else None
+
     result = dict(market_settings)
     coin_key = normalize_backtest_coin(coin)
-    global_override = overrides.get("global", {}).get(coin_key)
+    entry_exchange = str(result.get("exchange") or exchange)
+    global_override = find_override(
+        overrides.get("global", {}),
+        entry_exchange,
+        "backtest.market_settings.overrides",
+    )
     if global_override:
         result.update(deepcopy(global_override))
-    entry_exchange = str(result.get("exchange") or exchange)
-    exchange_override = (
-        overrides.get("by_exchange", {}).get(entry_exchange, {}).get(coin_key)
-        or overrides.get("by_exchange", {}).get(str(exchange), {}).get(coin_key)
+    exchange_override = find_override(
+        overrides.get("by_exchange", {}).get(entry_exchange, {}),
+        entry_exchange,
+        f"backtest.market_settings.overrides_by_exchange.{entry_exchange}",
     )
+    if exchange_override is None and str(exchange) != entry_exchange:
+        exchange_override = find_override(
+            overrides.get("by_exchange", {}).get(str(exchange), {}),
+            str(exchange),
+            f"backtest.market_settings.overrides_by_exchange.{exchange}",
+        )
     if exchange_override:
         result.update(deepcopy(exchange_override))
     return result
@@ -645,6 +700,9 @@ def _build_hlcvs_bundle(
     return pbr.HlcvsBundle(hlcvs_arr, btc_arr, timestamps_arr, bundle_meta)
 
 
+_HLCVS_VALIDATION_TARGET_CHUNK_BYTES = 64 * 1024 * 1024
+
+
 def _validate_hlcvs_valid_windows(
     hlcvs,
     timestamps,
@@ -653,6 +711,7 @@ def _validate_hlcvs_valid_windows(
     last_valid_indices,
     *,
     coin_indices: list[int] | None = None,
+    target_chunk_bytes: int = _HLCVS_VALIDATION_TARGET_CHUNK_BYTES,
 ) -> None:
     hlcvs_arr = np.asarray(hlcvs)
     if hlcvs_arr.ndim != 3 or hlcvs_arr.shape[2] < 4:
@@ -672,6 +731,8 @@ def _validate_hlcvs_valid_windows(
         raise ValueError(
             f"coin_indices length ({len(active_columns)}) does not match coins ({len(coins_order)})"
         )
+
+    valid_windows: list[tuple[int, int, int]] = []
     for payload_idx, coin in enumerate(coins_order):
         if payload_idx >= len(first_valid_indices) or payload_idx >= len(last_valid_indices):
             raise ValueError(
@@ -683,16 +744,105 @@ def _validate_hlcvs_valid_windows(
         start = int(first_valid_indices[payload_idx])
         end = int(last_valid_indices[payload_idx])
         if start > end:
+            valid_windows.append((col, 1, 0))
             continue
         start = max(0, start)
         end = min(n_rows - 1, end)
+        valid_windows.append((col, start, end))
+
+    column_events: dict[int, dict[int, int]] = {}
+    for col, start, end in valid_windows:
         if start > end:
             continue
-        window = hlcvs_arr[start : end + 1, col, :4]
-        if np.isfinite(window).all():
+        for row, delta in ((start, 1), (end + 1, -1)):
+            row_events = column_events.setdefault(row, {})
+            row_events[col] = row_events.get(col, 0) + delta
+
+    scan_segments: list[tuple[int, int, tuple[int, ...]]] = []
+    active_column_counts: dict[int, int] = {}
+    event_rows = sorted(column_events)
+    for event_idx, segment_start in enumerate(event_rows[:-1]):
+        for col, delta in column_events[segment_start].items():
+            next_count = active_column_counts.get(col, 0) + delta
+            if next_count:
+                active_column_counts[col] = next_count
+            else:
+                active_column_counts.pop(col, None)
+        segment_end = event_rows[event_idx + 1]
+        if active_column_counts and segment_start < segment_end:
+            scan_segments.append(
+                (segment_start, segment_end, tuple(sorted(active_column_counts)))
+            )
+
+    itemsize = int(hlcvs_arr.dtype.itemsize)
+    planned_scan_bytes = sum(
+        (segment_end - segment_start) * len(segment_columns) * 4 * itemsize
+        for segment_start, segment_end, segment_columns in scan_segments
+    )
+    chunk_count = 0
+    first_bad_rows: list[int | None] = [None] * len(coins_order)
+    validation_t0 = time.perf_counter()
+    logging.info(
+        "[hlcvs] valid-window validation start rows=%d coins=%d segments=%d "
+        "scan_bytes=%d target_chunk_bytes=%d",
+        n_rows,
+        len(coins_order),
+        len(scan_segments),
+        planned_scan_bytes,
+        int(target_chunk_bytes),
+    )
+    for segment_start, segment_end, segment_columns in scan_segments:
+        row_bytes = max(1, int(len(segment_columns) * 4 * itemsize))
+        chunk_rows = max(1, int(target_chunk_bytes) // row_bytes)
+        first_column = segment_columns[0]
+        last_column = segment_columns[-1]
+        columns_are_contiguous = len(segment_columns) == last_column - first_column + 1
+        column_offsets = (
+            {col: col - first_column for col in segment_columns}
+            if columns_are_contiguous
+            else {col: offset for offset, col in enumerate(segment_columns)}
+        )
+        column_indices = (
+            None
+            if columns_are_contiguous
+            else np.asarray(segment_columns, dtype=np.intp)
+        )
+        for chunk_start in range(segment_start, segment_end, chunk_rows):
+            chunk_end = min(segment_end, chunk_start + chunk_rows)
+            if columns_are_contiguous:
+                chunk_values = hlcvs_arr[
+                    chunk_start:chunk_end, first_column : last_column + 1, :4
+                ]
+            else:
+                chunk_values = hlcvs_arr[chunk_start:chunk_end, :, :4][
+                    :, column_indices, :
+                ]
+            finite_by_row_coin = np.isfinite(chunk_values).all(axis=2)
+            chunk_count += 1
+            for payload_idx, (col, start, end) in enumerate(valid_windows):
+                if first_bad_rows[payload_idx] is not None or start > end:
+                    continue
+                overlap_start = max(start, chunk_start)
+                overlap_end = min(end + 1, chunk_end)
+                if overlap_start >= overlap_end:
+                    continue
+                finite = finite_by_row_coin[
+                    overlap_start - chunk_start : overlap_end - chunk_start,
+                    column_offsets[col],
+                ]
+                if finite.all():
+                    continue
+                first_bad_rows[payload_idx] = overlap_start + int(
+                    np.flatnonzero(~finite)[0]
+                )
+
+    for payload_idx, coin in enumerate(coins_order):
+        bad_row = first_bad_rows[payload_idx]
+        if bad_row is None:
             continue
-        bad_rel_row, bad_field = np.argwhere(~np.isfinite(window))[0]
-        bad_row = start + int(bad_rel_row)
+        col, start, end = valid_windows[payload_idx]
+        bad_fields = np.flatnonzero(~np.isfinite(hlcvs_arr[bad_row, col, :4]))
+        bad_field = int(bad_fields[0])
         bad_value = float(hlcvs_arr[bad_row, col, int(bad_field)])
         if timestamps_arr is not None and bad_row < len(timestamps_arr):
             ts_context = f" timestamp_ms={int(timestamps_arr[bad_row])}"
@@ -704,6 +854,20 @@ def _validate_hlcvs_valid_windows(
             f"k={bad_row}{ts_context} field={hlcv_fields[int(bad_field)]} value={bad_value} "
             f"valid_window={start}..{end}"
         )
+
+    validation_elapsed = time.perf_counter() - validation_t0
+    logging.info(
+        "[hlcvs] valid-window validation done rows=%d coins=%d segments=%d chunks=%d "
+        "scan_bytes=%d elapsed_s=%.1f "
+        "throughput_mib_s=%.1f",
+        n_rows,
+        len(coins_order),
+        len(scan_segments),
+        chunk_count,
+        planned_scan_bytes,
+        validation_elapsed,
+        float(planned_scan_bytes) / (1024.0**2) / max(validation_elapsed, 1e-9),
+    )
 
 
 def _validate_hlcvs_valid_windows_from_mss(hlcvs, timestamps, coins, mss) -> None:
@@ -1502,6 +1666,30 @@ def get_cache_hash(config, exchange):
     market_settings_sources_sorted = sorted(
         (str(k), str(v)) for k, v in market_settings_sources.items()
     )
+    identity_exchanges = (
+        [
+            *exchanges_cfg,
+            *coin_sources.values(),
+            *market_settings_sources.values(),
+        ]
+        if exchange == "combined"
+        else [exchange]
+    )
+    identity_exchanges = sorted(
+        {
+            to_standard_exchange_name(str(venue))
+            for venue in identity_exchanges
+            if str(venue).strip()
+        }
+    )
+    resolved_market_identities = []
+    for venue in identity_exchanges:
+        for coin in data_coins:
+            try:
+                symbol = coin_to_symbol(coin, venue, verbose=False)
+            except MarketIdentifierResolutionError:
+                symbol = None
+            resolved_market_identities.append((venue, str(coin), symbol))
     to_hash = {
         "coins": data_coins,
         "end_date": format_end_date(require_config_value(config, "backtest.end_date")),
@@ -1514,12 +1702,13 @@ def get_cache_hash(config, exchange):
         "ohlcv_source_dir": config.get("backtest", {}).get("ohlcv_source_dir"),
         "coin_sources": coin_sources_sorted,
         "market_settings_sources": market_settings_sources_sorted,
+        "resolved_market_identities": resolved_market_identities,
+        "hlcv_preparation_algorithm_version": HLCV_PREPARATION_ALGORITHM_VERSION,
     }
     if exchange == "combined":
         to_hash["volume_normalization"] = bool(
             config.get("backtest", {}).get("volume_normalization", True)
         )
-        to_hash["hlcv_preparation_algorithm_version"] = HLCV_PREPARATION_ALGORITHM_VERSION
     return calc_hash(to_hash)
 
 
@@ -1786,22 +1975,25 @@ def _save_coins_hlcvs_artifacts_to_cache_dir(
 ) -> None:
     uncompressed_size = hlcvs.nbytes
     sts = utc_ms()
+    array_hashes: dict[str, str] = {}
     if is_compressed:
         fpath = cache_dir / "hlcvs.npy.gz"
         logging.info(f"Attempting to save hlcvs data to cache {fpath}...")
         with gzip.open(fpath, "wb", compresslevel=1) as f:
-            np.save(f, hlcvs)
+            array_hashes["hlcvs"] = save_numpy_artifact_with_hash(f, hlcvs)
         raise_if_backtest_cancel_requested("hlcvs cache artifact")
         if timestamps is not None:
             ts_fpath = cache_dir / "timestamps.npy.gz"
             logging.info(f"Attempting to save timestamps to cache {ts_fpath}...")
             with gzip.open(ts_fpath, "wb", compresslevel=1) as f:
-                np.save(f, timestamps)
+                array_hashes["timestamps"] = save_numpy_artifact_with_hash(f, timestamps)
             raise_if_backtest_cancel_requested("timestamps cache artifact")
         btc_fpath = cache_dir / "btc_usd_prices.npy.gz"
         logging.info(f"Attempting to save BTC/USD prices to cache {btc_fpath}...")
         with gzip.open(btc_fpath, "wb", compresslevel=1) as f:
-            np.save(f, btc_usd_prices)
+            array_hashes["btc_usd_prices"] = save_numpy_artifact_with_hash(
+                f, btc_usd_prices
+            )
         raise_if_backtest_cancel_requested("btc cache artifact")
         compressed_size = (cache_dir / "hlcvs.npy.gz").stat().st_size
         btc_compressed_size = (cache_dir / "btc_usd_prices.npy.gz").stat().st_size
@@ -1813,16 +2005,21 @@ def _save_coins_hlcvs_artifacts_to_cache_dir(
     else:
         fpath = cache_dir / "hlcvs.npy"
         logging.info(f"Attempting to save hlcvs data to cache {fpath}...")
-        np.save(fpath, hlcvs)
+        with fpath.open("wb") as f:
+            array_hashes["hlcvs"] = save_numpy_artifact_with_hash(f, hlcvs)
         raise_if_backtest_cancel_requested("hlcvs cache artifact")
         if timestamps is not None:
             ts_fpath = cache_dir / "timestamps.npy"
             logging.info(f"Attempting to save timestamps to cache {ts_fpath}...")
-            np.save(ts_fpath, timestamps)
+            with ts_fpath.open("wb") as f:
+                array_hashes["timestamps"] = save_numpy_artifact_with_hash(f, timestamps)
             raise_if_backtest_cancel_requested("timestamps cache artifact")
         btc_fpath = cache_dir / "btc_usd_prices.npy"
         logging.info(f"Attempting to save BTC/USD prices to cache {btc_fpath}...")
-        np.save(btc_fpath, btc_usd_prices)
+        with btc_fpath.open("wb") as f:
+            array_hashes["btc_usd_prices"] = save_numpy_artifact_with_hash(
+                f, btc_usd_prices
+            )
         raise_if_backtest_cancel_requested("btc cache artifact")
         line = ""
     logging.info(
@@ -1851,6 +2048,7 @@ def _save_coins_hlcvs_artifacts_to_cache_dir(
         timestamps=timestamps,
         warmup_minutes=warmup_minutes,
         compressed=is_compressed,
+        precomputed_array_hashes=array_hashes,
     )
     raise_if_backtest_cancel_requested("cache manifest write")
     write_hlcvs_manifest(cache_dir, manifest)
@@ -2003,6 +2201,34 @@ async def prepare_hlcvs_mss(config, exchange, *, force_refetch_gaps: bool = Fals
     warmup_map = compute_per_coin_warmup_minutes(config)
     default_warm = int(warmup_map.get("__default__", 0))
     backtest_warmup_minutes = compute_backtest_warmup_minutes(config)
+    if exchange == "combined":
+        backtest_cfg = config.setdefault("backtest", {})
+        configured_exchanges = [
+            to_ccxt_exchange_id(value)
+            for value in require_config_value(config, "backtest.exchanges")
+        ]
+        forced_sources = {
+            str(coin): to_ccxt_exchange_id(source_exchange)
+            for coin, source_exchange in (backtest_cfg.get("coin_sources") or {}).items()
+            if source_exchange
+        }
+        market_settings_sources = {
+            str(coin): to_ccxt_exchange_id(source_exchange)
+            for coin, source_exchange in (
+                backtest_cfg.get("market_settings_sources") or {}
+            ).items()
+            if source_exchange
+        }
+        forced_sources, market_settings_sources = (
+            await _load_and_reconcile_combined_sources(
+                forced_sources,
+                market_settings_sources,
+                effective_backtest_data_coins(config),
+                configured_exchanges,
+            )
+        )
+        backtest_cfg["coin_sources"] = forced_sources
+        backtest_cfg["market_settings_sources"] = market_settings_sources
     override_result = load_hlcvs_data_override(config, exchange)
     if override_result is not None:
         cache_dir, coins, hlcvs, mss, results_path, btc_usd_prices, timestamps = override_result
@@ -2189,6 +2415,45 @@ def log_backtest_execution_settings(
     )
 
 
+def _get_backtest_coin_override(config, mss, exchange, coin):
+    overrides = config.get("coin_overrides", {})
+    direct_override = overrides.get(coin)
+    market_settings = mss.get(coin, {})
+    venue = market_settings.get("exchange") or exchange
+    if venue == "combined":
+        return {}
+    target_symbol = market_settings.get("symbol")
+    if not target_symbol:
+        try:
+            target_symbol = coin_to_symbol(coin, venue, verbose=False)
+        except (MarketIdentifierExchangeMismatch, UnknownMarketIdentifier):
+            return direct_override or {}
+    matches = [(coin, direct_override)] if direct_override is not None else []
+    for identifier, override in overrides.items():
+        if identifier == coin:
+            continue
+        if not (
+            looks_like_exact_market_identifier(identifier)
+            or looks_like_exact_market_identifier(coin)
+        ):
+            continue
+        try:
+            override_symbol = coin_to_symbol(identifier, venue, verbose=False)
+        except (MarketIdentifierExchangeMismatch, UnknownMarketIdentifier):
+            continue
+        if override_symbol == target_symbol:
+            matches.append((identifier, override))
+    if len(matches) > 1:
+        first_override = matches[0][1]
+        if any(override != first_override for _, override in matches[1:]):
+            raise ValueError(
+                f"conflicting coin_overrides resolve to {coin!r} on {venue}: "
+                f"{sorted(identifier for identifier, _ in matches)}"
+            )
+        return first_override
+    return matches[0][1] if matches else {}
+
+
 def prep_backtest_args(
     config,
     mss,
@@ -2220,7 +2485,7 @@ def prep_backtest_args(
     for coin in coins:
         coin_specific_bot_params = {}
         coin_specific_strategy_params = {}
-        coin_override = config.get("coin_overrides", {}).get(coin, {})
+        coin_override = _get_backtest_coin_override(config, mss, exchange, coin)
         coin_override_bot = coin_override.get("bot", {})
         for pside in ["long", "short"]:
             override_side = coin_override_bot.get(pside, {})
@@ -2241,8 +2506,15 @@ def prep_backtest_args(
                 coin_override.get("live", {}).get(f"forced_mode_{pside}", "") == "normal"
             )
         coin_key = normalize_backtest_coin(coin)
+        coin_canonical = heuristic_symbol_to_coin(coin_key)
         for pside in POSITION_SIDES:
-            if coin_key not in approved_by_side[pside]:
+            approved_exact = approved_by_side[pside]
+            approved_by_alias = any(
+                not looks_like_exact_market_identifier(identifier)
+                and heuristic_symbol_to_coin(identifier) == coin_canonical
+                for identifier in approved_exact
+            )
+            if coin_key not in approved_exact and not approved_by_alias:
                 coin_specific_bot_params[pside]["wallet_exposure_limit"] = 0.0
             elif "wallet_exposure_limit" not in coin_override_bot.get(pside, {}):
                 coin_specific_bot_params[pside]["wallet_exposure_limit"] = -1.0
@@ -2922,7 +3194,9 @@ async def main():
 
     for ex in backtest_exchanges:
         await load_markets(ex)
-    await format_approved_ignored_coins(config, backtest_exchanges)
+    await format_approved_ignored_coins(
+        config, backtest_exchanges, prefer_backtest_coin_source_keys=True
+    )
     config["disable_plotting"] = (
         args.disable_plotting if args.disable_plotting is not None else False
     )

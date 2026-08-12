@@ -14,8 +14,13 @@ from copy import deepcopy
 import numpy as np
 import pytest
 
-from backtest import _validate_hlcvs_valid_windows, build_backtest_payload
+from backtest import (
+    _apply_market_settings_override,
+    _validate_hlcvs_valid_windows,
+    build_backtest_payload,
+)
 from config_utils import get_template_config
+import utils
 
 
 def _base_config(candle_interval_minutes: int = 1) -> dict:
@@ -114,6 +119,87 @@ def test_build_backtest_payload_keeps_per_side_approved_coin_universe():
 
     assert payload.bot_params_list[coin4_idx]["long"]["wallet_exposure_limit"] == 0.0
     assert payload.bot_params_list[coin4_idx]["short"]["wallet_exposure_limit"] != 0.0
+
+
+def test_market_settings_overrides_match_exact_and_alias_keys(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    markets = {
+        "BTC/USDT:USDT": {
+            "id": "BTCUSDT",
+            "swap": True,
+            "linear": True,
+            "active": True,
+            "base": "BTC",
+        }
+    }
+    utils.create_coin_symbol_map_cache("bitget", markets, verbose=False)
+    overrides = {
+        "global": {"BTCUSDT": {"c_mult": 2.0}},
+        "by_exchange": {"bitget": {"BTCUSDT": {"maker": 0.001}}},
+    }
+
+    result = _apply_market_settings_override(
+        "BTC",
+        "bitget",
+        {"exchange": "bitget", "c_mult": 1.0, "maker": 0.0002},
+        overrides,
+    )
+
+    assert result["c_mult"] == 2.0
+    assert result["maker"] == 0.001
+
+
+def test_market_settings_override_alias_matches_active_exact_key(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    markets = {
+        "BTC/USDT:USDT": {
+            "id": "BTCUSDT",
+            "swap": True,
+            "linear": True,
+            "active": True,
+            "base": "BTC",
+        }
+    }
+    utils.create_coin_symbol_map_cache("bitget", markets, verbose=False)
+
+    result = _apply_market_settings_override(
+        "BTCUSDT",
+        "bitget",
+        {"exchange": "bitget", "c_mult": 1.0},
+        {"global": {"BTC": {"c_mult": 3.0}}, "by_exchange": {}},
+    )
+
+    assert result["c_mult"] == 3.0
+
+
+def test_market_settings_override_rejects_conflicting_direct_aliases(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    markets = {
+        "BTC/USDT:USDT": {
+            "id": "BTCUSDT",
+            "swap": True,
+            "linear": True,
+            "active": True,
+            "base": "BTC",
+        }
+    }
+    utils.create_coin_symbol_map_cache("bitget", markets, verbose=False)
+
+    with pytest.raises(ValueError, match="conflicting backtest.market_settings.overrides"):
+        _apply_market_settings_override(
+            "BTC",
+            "bitget",
+            {"exchange": "bitget", "c_mult": 1.0},
+            {
+                "global": {
+                    "BTC": {"c_mult": 2.0},
+                    "BTCUSDT": {"c_mult": 3.0},
+                },
+                "by_exchange": {},
+            },
+        )
 
 
 def test_build_backtest_payload_marks_normal_forced_coin_active():
@@ -659,6 +745,105 @@ def test_build_backtest_payload_reports_active_source_column_for_nonfinite_price
             [mss["BTC"]["last_valid_index"]],
             coin_indices=[2],
         )
+
+
+def test_hlcvs_valid_window_chunking_preserves_coin_first_error_order():
+    start_ts = 1609459200000
+    n_minutes = 12
+    coins = ["BTC", "ETH"]
+    hlcvs = np.ones((n_minutes, len(coins), 4), dtype=np.float64)
+    timestamps = np.arange(
+        start_ts, start_ts + n_minutes * 60_000, 60_000, dtype=np.int64
+    )
+    # The legacy validator traverses coins first, so BTC's later bad row must
+    # still win over ETH's earlier bad row after switching to time-major chunks.
+    hlcvs[10, 0, 3] = np.nan
+    hlcvs[1, 1, 0] = np.inf
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"non-finite HLCV value inside valid backtest window: "
+            r"coin=BTC payload_index=0 source_column=0 k=10 .* field=volume"
+        ),
+    ):
+        _validate_hlcvs_valid_windows(
+            hlcvs,
+            timestamps,
+            coins,
+            [0, 0],
+            [n_minutes - 1, n_minutes - 1],
+            target_chunk_bytes=2 * len(coins) * 4 * np.dtype(np.float64).itemsize,
+        )
+
+
+def test_hlcvs_valid_window_chunking_ignores_nonfinite_outside_each_coin_window():
+    n_minutes = 12
+    hlcvs = np.ones((n_minutes, 2, 4), dtype=np.float64)
+    hlcvs[:3, 0, :] = np.nan
+    hlcvs[9:, 0, :] = np.nan
+    hlcvs[:5, 1, :] = np.nan
+    hlcvs[11:, 1, :] = np.nan
+
+    _validate_hlcvs_valid_windows(
+        hlcvs,
+        None,
+        ["BTC", "ETH"],
+        [3, 5],
+        [8, 10],
+        target_chunk_bytes=2 * 2 * 4 * np.dtype(np.float64).itemsize,
+    )
+
+
+def test_hlcvs_valid_window_chunking_scans_only_active_rows_and_columns(monkeypatch):
+    n_minutes = 10
+    hlcvs = np.empty((n_minutes, 4, 4), dtype=np.float64)
+    for col in range(4):
+        hlcvs[:, col, :] = float(col)
+    observed_chunks = []
+    original_isfinite = np.isfinite
+
+    def recording_isfinite(values):
+        arr = np.asarray(values)
+        observed_chunks.append((arr.shape, tuple(np.unique(arr[:, :, 0]))))
+        return original_isfinite(values)
+
+    monkeypatch.setattr(np, "isfinite", recording_isfinite)
+    _validate_hlcvs_valid_windows(
+        hlcvs,
+        None,
+        ["BTC", "EMPTY", "SOL"],
+        [2, n_minutes, 4],
+        [4, n_minutes - 1, 6],
+        coin_indices=[0, 1, 3],
+        target_chunk_bytes=1024,
+    )
+
+    # BTC covers rows 2..4 and SOL covers 4..6. The sweep therefore scans
+    # BTC alone, both columns for their one-row overlap, and SOL alone. The
+    # empty symbol, unused column 2, and rows outside the union are untouched.
+    assert observed_chunks == [
+        ((2, 1, 4), (0.0,)),
+        ((1, 2, 4), (0.0, 3.0)),
+        ((2, 1, 4), (3.0,)),
+    ]
+
+
+def test_hlcvs_valid_window_chunking_skips_scan_when_all_windows_are_empty(monkeypatch):
+    n_minutes = 10
+    hlcvs = np.full((n_minutes, 2, 4), np.nan, dtype=np.float64)
+
+    def fail_if_scanned(_values):
+        raise AssertionError("empty valid windows must not scan the HLCV payload")
+
+    monkeypatch.setattr(np, "isfinite", fail_if_scanned)
+    _validate_hlcvs_valid_windows(
+        hlcvs,
+        None,
+        ["BTC", "ETH"],
+        [n_minutes, n_minutes],
+        [n_minutes - 1, n_minutes - 1],
+    )
 
 
 def test_build_backtest_payload_aggregation_recomputes_effective_start_ts_over_stale_mss():

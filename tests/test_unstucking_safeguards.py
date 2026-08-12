@@ -7,11 +7,111 @@ from unittest.mock import AsyncMock
 
 import pytest
 import numpy as np
+from passivbot_exceptions import FatalBotException
 from utils import utc_ms
 
 
 def _active_market() -> dict:
     return {"active": True, "maker": 0.0002, "taker": 0.00055}
+
+
+def _empty_orchestrator_output(input_json: str) -> str:
+    payload = json.loads(input_json)
+    global_bot_params = payload.get("global", {}).get("global_bot_params", {})
+    symbol_states = []
+    for symbol in payload.get("symbols", []):
+        row = {"symbol_idx": symbol["symbol_idx"]}
+        for pside in ("long", "short"):
+            input_mode = symbol[pside].get("mode")
+            position_size = float(symbol[pside]["position"]["size"])
+            has_position = position_size != 0.0
+            selection_effective_mode = (
+                "normal"
+                if input_mode is None
+                or (input_mode == "graceful_stop" and has_position)
+                else input_mode
+            )
+            side_params = global_bot_params[pside]
+            global_side_enabled = (
+                float(side_params["total_wallet_exposure_limit"]) > 0.0
+                and int(side_params["n_positions"]) > 0
+            )
+            effective_mode = (
+                selection_effective_mode if global_side_enabled else "manual"
+            )
+            symbol_side_eligible = (
+                bool(symbol.get("tradable", False))
+                and float(symbol[pside]["bot_params"]["wallet_exposure_limit"])
+                != 0.0
+            )
+            active = symbol_side_eligible and (
+                (has_position and selection_effective_mode != "manual")
+                or (
+                    not has_position
+                    and global_side_enabled
+                    and selection_effective_mode == "normal"
+                )
+            )
+            row[pside] = {
+                "input_mode": input_mode,
+                "effective_mode": effective_mode,
+                "active": active,
+                "allow_initial": active and effective_mode == "normal",
+            }
+        symbol_states.append(row)
+    return json.dumps(
+        {
+            "orders": [],
+            "diagnostics": {
+                "warnings": [],
+                "symbol_states": symbol_states,
+                "loss_gate_blocks": [],
+                "min_effective_cost_blocks": [],
+                "forager_selections": [],
+            },
+        }
+    )
+
+
+def _single_symbol_orchestrator_output(
+    *, orders=None, include_loss_gate_blocks=True, **diagnostics
+) -> str:
+    diagnostics_payload = {
+        "warnings": [],
+        "symbol_states": [
+            {
+                "symbol_idx": 0,
+                "long": {
+                    "input_mode": None,
+                    "effective_mode": "normal",
+                    "active": True,
+                    "allow_initial": True,
+                },
+                "short": {
+                    "input_mode": "manual",
+                    "effective_mode": "manual",
+                    "active": False,
+                    "allow_initial": False,
+                },
+            }
+        ],
+        **diagnostics,
+    }
+    if include_loss_gate_blocks:
+        diagnostics_payload.setdefault("loss_gate_blocks", [])
+    diagnostics_payload.setdefault("min_effective_cost_blocks", [])
+    diagnostics_payload.setdefault("forager_selections", [])
+    return json.dumps(
+        {
+            "orders": [] if orders is None else orders,
+            "diagnostics": diagnostics_payload,
+        }
+    )
+
+
+def _single_symbol_orchestrator_output_with_duplicate_orders() -> str:
+    valid_output = _single_symbol_orchestrator_output()
+    return '{"orders":[{"malformed":true}],' + valid_output[1:]
 
 
 def _make_mock_pbr():
@@ -473,7 +573,60 @@ def _make_mock_pbr():
         return mapping.get(type_id, "other")
 
     module.get_order_id_type_from_string = _get_order_id_type_from_string
-    module.order_type_id_to_snake = _order_type_id_to_snake
+    _canonical_order_types = [
+        "entry_initial_normal_long",
+        "entry_initial_partial_long",
+        "entry_trailing_normal_long",
+        "entry_trailing_cropped_long",
+        "entry_grid_normal_long",
+        "entry_grid_cropped_long",
+        "entry_grid_inflated_long",
+        "close_grid_long",
+        "close_trailing_long",
+        "close_unstuck_long",
+        "close_auto_reduce_twel_long",
+        "entry_initial_normal_short",
+        "entry_initial_partial_short",
+        "entry_trailing_normal_short",
+        "entry_trailing_cropped_short",
+        "entry_grid_normal_short",
+        "entry_grid_cropped_short",
+        "entry_grid_inflated_short",
+        "close_grid_short",
+        "close_trailing_short",
+        "close_unstuck_short",
+        "close_auto_reduce_twel_short",
+        "close_panic_long",
+        "close_panic_short",
+        "close_auto_reduce_wel_long",
+        "close_auto_reduce_wel_short",
+        "entry_ema_anchor_long",
+        "close_ema_anchor_long",
+        "entry_ema_anchor_short",
+        "close_ema_anchor_short",
+    ]
+    _canonical_order_type_id_base = 0x2000
+    _canonical_order_type_ids = {
+        name: _canonical_order_type_id_base + type_id
+        for type_id, name in enumerate(_canonical_order_types)
+    }
+
+    def _order_type_snake_to_id(name: str) -> int:
+        if name not in _canonical_order_type_ids:
+            raise ValueError("unknown order type name")
+        return _canonical_order_type_ids[name]
+
+    def _canonical_order_type_id_to_snake(type_id: int) -> str:
+        legacy_name = _order_type_id_to_snake(type_id)
+        if legacy_name != "other":
+            return legacy_name
+        canonical_idx = type_id - _canonical_order_type_id_base
+        if not 0 <= canonical_idx < len(_canonical_order_types):
+            raise ValueError("unknown order type id")
+        return _canonical_order_types[canonical_idx]
+
+    module.order_type_snake_to_id = _order_type_snake_to_id
+    module.order_type_id_to_snake = _canonical_order_type_id_to_snake
     return module
 
 
@@ -644,6 +797,7 @@ def _make_dummy_bot(config, *, last_price=100.0):
                 "ema_span_minutes": 60.0,
                 "cooldown_minutes_after_red": 0.0,
                 "no_restart_drawdown_threshold": 1.0,
+                "restart_after_red_policy": "threshold",
                 "tier_ratios": {"yellow": 0.5, "orange": 0.75},
                 "orange_tier_mode": "tp_only_with_active_entry_cancellation",
                 "panic_close_order_type": "market",
@@ -764,6 +918,24 @@ def _make_dummy_bot(config, *, last_price=100.0):
                 get_ema_bounds_many=lambda items, **kwargs: {
                     sym: (last_price - 10, last_price + 10) for sym, _, _ in items
                 },
+            )
+
+            async def _get_candles_with_resolution_ladder(
+                symbol, *, start_ts, end_ts=None, strict=False
+            ):
+                from candlestick_manager import CandleResolutionResult
+
+                candles = await self.cm.get_candles(
+                    symbol, start_ts=start_ts, end_ts=end_ts, strict=strict
+                )
+                return CandleResolutionResult(
+                    candles=candles,
+                    source_counts={"1m": int(candles.size)} if candles.size else {},
+                    failures={},
+                )
+
+            self.cm.get_candles_with_resolution_ladder = (
+                _get_candles_with_resolution_ladder
             )
 
         def bp(self, pside: str, key: str, symbol: str | None = None):
@@ -1029,7 +1201,7 @@ async def test_live_orchestrator_passes_merged_entry_cooldown_delta_anchor(monke
 
     def fake_compute(input_json: str) -> str:
         captured["input"] = json.loads(input_json)
-        return '{"orders": [], "diagnostics": {"warnings": []}}'
+        return _empty_orchestrator_output(input_json)
 
     monkeypatch.setattr(
         bot, "_load_orchestrator_ema_bundle", types.MethodType(fake_load_bundle, bot)
@@ -1037,12 +1209,11 @@ async def test_live_orchestrator_passes_merged_entry_cooldown_delta_anchor(monke
     monkeypatch.setattr(pbr, "compute_ideal_orders_json", fake_compute)
     _stamp_staged_account_and_candles(bot)
 
-    _orders, snapshot = await bot.calc_ideal_orders_orchestrator(return_snapshot=True)
+    await bot.calc_ideal_orders_orchestrator()
 
     rust_symbol = captured["input"]["symbols"][0]
     assert rust_symbol["long"]["last_increase_fill_timestamp_ms"] == 121_000
     assert rust_symbol["allow_missing_strategy_inputs"] is True
-    assert snapshot["last_increase_fill_timestamps"][symbol]["long"] == 121_000
     assert bot._live_event_pipeline.flush(timeout=2.0) is True
     rust_events = [
         event
@@ -1453,7 +1624,7 @@ async def test_trailing_anchor_uses_position_timestamp_when_fill_history_is_out_
 
     await bot.update_trailing_data()
 
-    assert candle_calls == [(symbol, 120_000, None, False)]
+    assert candle_calls == [(symbol, 180_000, None, False)]
     assert bot._orchestrator_trailing_unavailable_symbols == set()
     assert bot.trailing_prices[symbol]["long"]["max_since_open"] == pytest.approx(101.0)
 
@@ -2894,6 +3065,88 @@ async def test_trailing_extrema_reject_incomplete_post_fill_coverage(rows):
 
 
 @pytest.mark.asyncio
+async def test_trailing_extrema_accepts_coarse_old_prefix_with_exact_1m_suffix(caplog):
+    from candlestick_manager import CandleResolutionResult
+
+    cfg = _dummy_config()
+    bot = _make_dummy_bot(cfg)
+    symbol = _set_basic_state(bot)
+    bot._pnls_manager = _DummyPnlsManager(
+        [_DummyFillEvent(symbol, "long", 120_000, "fill-1")]
+    )
+    bot.is_trailing = lambda sym, pside=None: pside == "long"
+    bot.get_exchange_time = lambda: 361_000
+    requested = []
+
+    async def mixed_resolution_candles(sym, *, start_ts, end_ts=None, strict=False):
+        requested.append((sym, start_ts, end_ts, strict))
+        return CandleResolutionResult(
+            candles=_make_candles(
+                [
+                    (180_000, 100.0, 101.0, 99.0, 100.0, 1.0),
+                    (240_000, 100.0, 102.0, 98.0, 101.0, 1.0),
+                    (300_000, 101.0, 103.0, 100.0, 102.0, 1.0),
+                ]
+            ),
+            source_counts={"5m": 2, "1m": 1},
+            failures={},
+        )
+
+    bot.cm.get_candles_with_resolution_ladder = mixed_resolution_candles
+    caplog.set_level(logging.INFO)
+
+    await bot.update_trailing_data()
+
+    assert requested == [(symbol, 180_000, None, False)]
+    assert bot._orchestrator_trailing_unavailable_symbols == set()
+    assert bot.trailing_prices[symbol]["long"]["max_since_open"] == pytest.approx(103.0)
+    assert bot._trailing_historical_resolution_contexts == {
+        symbol: {
+            "source_counts": {"5m": 2},
+            "approximate_until_ts": 240_000,
+            "exact_from_ts": 300_000,
+        }
+    }
+    assert "using approximate old candle prefix" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_trailing_extrema_rejects_coarse_history_without_exact_1m_suffix():
+    from candlestick_manager import CandleResolutionResult
+
+    cfg = _dummy_config()
+    bot = _make_dummy_bot(cfg)
+    symbol = _set_basic_state(bot)
+    bot._pnls_manager = _DummyPnlsManager(
+        [_DummyFillEvent(symbol, "long", 120_000, "fill-1")]
+    )
+    bot.is_trailing = lambda sym, pside=None: pside == "long"
+    bot.get_exchange_time = lambda: 361_000
+
+    async def coarse_only(*_args, **_kwargs):
+        return CandleResolutionResult(
+            candles=_make_candles(
+                [
+                    (180_000, 100.0, 101.0, 99.0, 100.0, 1.0),
+                    (240_000, 100.0, 102.0, 98.0, 101.0, 1.0),
+                    (300_000, 101.0, 103.0, 100.0, 102.0, 1.0),
+                ]
+            ),
+            source_counts={"5m": 3},
+            failures={},
+        )
+
+    bot.cm.get_candles_with_resolution_ladder = coarse_only
+
+    await bot.update_trailing_data()
+
+    assert bot.trailing_prices[symbol]["long"] == _trailing_default()
+    assert bot._orchestrator_trailing_unavailable_reasons == {
+        symbol: ["missing_exact_trailing_candles"]
+    }
+
+
+@pytest.mark.asyncio
 async def test_trailing_extrema_projects_bounded_open_tail_without_persisting():
     cfg = _dummy_config()
     cfg["live"]["max_active_candle_tail_gap_minutes"] = 10
@@ -3012,7 +3265,7 @@ async def test_trailing_extrema_accept_dense_zero_volume_gap_continuity():
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_marks_trailing_unavailable_symbols_non_tradable(monkeypatch):
+async def test_orchestrator_passes_trailing_unavailability_to_rust_per_side(monkeypatch):
     cfg = _dummy_config()
     bot = _make_dummy_bot(cfg)
     symbol = _set_basic_state(bot)
@@ -3037,6 +3290,7 @@ async def test_orchestrator_marks_trailing_unavailable_symbols_non_tradable(monk
         }
     }
     bot._orchestrator_trailing_unavailable_symbols = {symbol}
+    bot._orchestrator_trailing_unavailable_psides = {symbol: ["long"]}
 
     async def fake_load_bundle(self, symbols, modes):
         m1_close = {symbol: {1.0: 100.0, 2.0: 100.0}}
@@ -3050,7 +3304,7 @@ async def test_orchestrator_marks_trailing_unavailable_symbols_non_tradable(monk
 
     def fake_compute(input_json: str) -> str:
         captured["input"] = json.loads(input_json)
-        return '{"orders": [], "diagnostics": {"warnings": []}}'
+        return _empty_orchestrator_output(input_json)
 
     monkeypatch.setattr(
         bot, "_load_orchestrator_ema_bundle", types.MethodType(fake_load_bundle, bot)
@@ -3060,7 +3314,226 @@ async def test_orchestrator_marks_trailing_unavailable_symbols_non_tradable(monk
 
     await bot.calc_ideal_orders_orchestrator()
 
-    assert captured["input"]["symbols"][0]["tradable"] is False
+    rust_symbol = captured["input"]["symbols"][0]
+    assert rust_symbol["tradable"] is True
+    assert rust_symbol["long"]["trailing_available"] is False
+    assert rust_symbol["short"]["trailing_available"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rust_output", "error"),
+    [
+        ('{"diagnostics": {}}', "missing required orders field"),
+        ("{", "malformed JSON"),
+        (
+            _single_symbol_orchestrator_output_with_duplicate_orders(),
+            "malformed JSON",
+        ),
+        (
+            _single_symbol_orchestrator_output(include_loss_gate_blocks=False),
+            "missing required loss_gate_blocks",
+        ),
+        (
+            _single_symbol_orchestrator_output(loss_gate_blocks={}),
+            "loss_gate_blocks must be a list",
+        ),
+        (
+            _single_symbol_orchestrator_output(
+                min_effective_cost_blocks=[{"symbol_idx": "0"}]
+            ),
+            "invalid symbol_idx",
+        ),
+        (
+            _single_symbol_orchestrator_output(
+                forager_selections=[
+                    {
+                        "pside": "long",
+                        "slots_to_fill": 1,
+                        "ranking_required": True,
+                        "score_hysteresis_pct": 0.1,
+                        "selected_symbol_indices": ["0"],
+                        "incumbent_symbol_indices": [],
+                        "top_scores": [],
+                        "hysteresis_events": [],
+                    }
+                ]
+            ),
+            "invalid symbol_idx",
+        ),
+        (
+            _single_symbol_orchestrator_output(
+                orders=[
+                    {
+                        "symbol_idx": 0,
+                        "pside": "long",
+                        "qty": 1.0,
+                        "price": 100.0,
+                        "order_type": "entry_initial_normal_long",
+                        "execution_type": "limit",
+                        "execution_priority": "ordinary",
+                    },
+                    {
+                        "symbol_idx": 0,
+                        "pside": "long",
+                        "qty": 1.0,
+                        "price": 100.0,
+                        "order_type": "entry_initial_normal_long",
+                        "execution_type": "limit",
+                        "execution_priority": "ordinary",
+                    },
+                ]
+            ),
+            "collide under conversion identity",
+        ),
+        (
+            _single_symbol_orchestrator_output(
+                orders=[
+                    {
+                        "symbol_idx": 0,
+                        "pside": "long",
+                        "qty": 1.0,
+                        "price": 100.0,
+                        "order_type": "entry_initial_normal_long",
+                        "execution_type": "market",
+                        "execution_priority": "ordinary",
+                    }
+                ]
+            ),
+            "inconsistent with its submitted input",
+        ),
+        (
+            _single_symbol_orchestrator_output(
+                orders=[
+                    {
+                        "symbol_idx": 0,
+                        "pside": "long",
+                        "qty": 10**400,
+                        "price": 100.0,
+                        "order_type": "entry_initial_normal_long",
+                        "execution_type": "limit",
+                        "execution_priority": "ordinary",
+                    }
+                ]
+            ),
+            "invalid qty",
+        ),
+        (
+            _single_symbol_orchestrator_output(
+                orders=[
+                    {
+                        "symbol_idx": 0,
+                        "pside": "long",
+                        "qty": -1.0,
+                        "price": 100.0,
+                        "order_type": "close_unstuck_long",
+                        "execution_type": "limit",
+                        "execution_priority": "ordinary",
+                    }
+                ]
+            ),
+            "inconsistent with its order_type",
+        ),
+        (
+            _single_symbol_orchestrator_output(
+                orders=[
+                    {
+                        "symbol_idx": 0,
+                        "pside": "long",
+                        "qty": 1.0,
+                        "price": 100.0,
+                        "order_type": "entry_initial_normal_long",
+                        "execution_type": "limit",
+                        "execution_priority": "risk_critical",
+                    }
+                ]
+            ),
+            "inconsistent with its order_type",
+        ),
+    ],
+)
+async def test_orchestrator_invalid_output_emits_correlated_failed_return(
+    monkeypatch, rust_output, error
+):
+    cfg = _dummy_config()
+    # Keep this malformed-envelope test focused on the requested diagnostic
+    # failure rather than auto-GS changing the synthetic symbol-state modes.
+    cfg["live"]["auto_gs"] = False
+    bot = _make_dummy_bot(cfg)
+    bot._bot_value_defaults["n_positions"] = 1
+    bot._bot_value_defaults["total_wallet_exposure_limit"] = 1.0
+    symbol = _set_basic_state(bot)
+    import passivbot_rust as pbr
+
+    def fake_order_type_snake_to_id(order_type):
+        order_type_ids = {
+            "entry_initial_normal_long": 1,
+            "close_unstuck_long": 2,
+        }
+        if order_type not in order_type_ids:
+            raise ValueError(order_type)
+        return order_type_ids[order_type]
+
+    monkeypatch.setattr(
+        pbr,
+        "order_type_snake_to_id",
+        fake_order_type_snake_to_id,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        pbr,
+        "order_type_id_to_snake",
+        lambda order_type_id: {
+            1: "entry_initial_normal_long",
+            2: "close_unstuck_long",
+        }[order_type_id],
+        raising=False,
+    )
+
+    bot.markets_dict = {symbol: _active_market()}
+    bot.effective_min_cost = {symbol: 1.0}
+    bot.trailing_prices = {
+        symbol: {
+            "long": _trailing_default(),
+            "short": _trailing_default(),
+        }
+    }
+
+    async def fake_load_bundle(self, symbols, modes):
+        self._orchestrator_ema_unavailable_symbols = set()
+        self._orchestrator_trailing_unavailable_symbols = set()
+        m1_close = {symbol: {1.0: 100.0, 2.0: 100.0}}
+        m1_volume = {symbol: {10.0: 1_000.0}}
+        m1_log_range = {symbol: {10.0: 0.01}}
+        h1_log_range = {symbol: {10.0: 0.01}}
+        return m1_close, m1_volume, m1_log_range, h1_log_range, {}, {}
+
+    events = []
+    bot._emit_rust_orchestrator_called_event = lambda **kwargs: events.append(
+        ("called", kwargs)
+    )
+    bot._emit_rust_orchestrator_returned_event = lambda **kwargs: events.append(
+        ("returned", kwargs)
+    )
+    monkeypatch.setattr(
+        bot, "_load_orchestrator_ema_bundle", types.MethodType(fake_load_bundle, bot)
+    )
+    monkeypatch.setattr(
+        pbr,
+        "compute_ideal_orders_json",
+        lambda _input_json: rust_output,
+    )
+    _stamp_staged_account_and_candles(bot)
+
+    with pytest.raises(FatalBotException, match=error):
+        await bot.calc_ideal_orders_orchestrator()
+
+    assert [event_type for event_type, _kwargs in events] == ["called", "returned"]
+    called = events[0][1]
+    returned = events[1][1]
+    assert returned["rust_call_id"] == called["rust_call_id"]
+    assert returned["status"] == "failed"
+    assert isinstance(returned["error"], FatalBotException)
 
 
 def _stamp_staged_account_and_candles(bot):
@@ -3342,7 +3815,7 @@ async def test_existing_unstuck_order_does_not_block_rust_emission(monkeypatch):
 
     def fake_compute(input_json: str) -> str:
         captured["input"] = input_json
-        return '{"orders": [], "diagnostics": {"warnings": []}}'
+        return _empty_orchestrator_output(input_json)
 
     monkeypatch.setattr(
         bot, "_load_orchestrator_ema_bundle", types.MethodType(fake_load_bundle, bot)
@@ -3415,7 +3888,7 @@ async def test_active_red_runtime_keeps_panic_mode_in_rust_payload(monkeypatch):
 
     def fake_compute(input_json: str) -> str:
         captured["input"] = json.loads(input_json)
-        return '{"orders": [], "diagnostics": {"warnings": []}}'
+        return _empty_orchestrator_output(input_json)
 
     monkeypatch.setattr(
         bot,
@@ -3450,7 +3923,7 @@ async def test_active_red_runtime_keeps_panic_mode_in_rust_payload(monkeypatch):
     assert symbol in bot.active_symbols
 
     _stamp_staged_account_and_candles(bot)
-    _orders, snapshot = await bot.calc_ideal_orders_orchestrator(return_snapshot=True)
+    await bot.calc_ideal_orders_orchestrator()
 
     rust_symbol = captured["input"]["symbols"][0]
     assert rust_symbol["long"]["mode"] == "panic"
@@ -3458,7 +3931,6 @@ async def test_active_red_runtime_keeps_panic_mode_in_rust_payload(monkeypatch):
     assert captured["input"]["peek_hints"]["expand_close_long"] == [0]
     assert captured["input"]["peek_hints"]["expand_grid_short"] == []
     assert captured["input"]["forager_hysteresis"]["score_hysteresis_pct"] == 0.0
-    assert snapshot["orchestrator_input"]["symbols"][0]["long"]["mode"] == "panic"
 
 
 def test_halted_hsl_runtime_forced_mode_refresh_emits_risk_event():
@@ -3592,7 +4064,7 @@ async def test_staged_orchestrator_uses_market_snapshots_before_cm_fallback(
 
     def fake_compute(input_json: str) -> str:
         captured["input"] = json.loads(input_json)
-        return '{"orders": [], "diagnostics": {"warnings": []}}'
+        return _empty_orchestrator_output(input_json)
 
     bot.cm.get_last_prices = fake_get_last_prices
     bot.market_snapshot_provider = types.SimpleNamespace(
@@ -3697,7 +4169,7 @@ async def test_orchestrator_marks_ema_unavailable_symbols_non_tradable(monkeypat
 
     def fake_compute(input_json: str) -> str:
         captured["input"] = json.loads(input_json)
-        return '{"orders": [], "diagnostics": {"warnings": []}}'
+        return _empty_orchestrator_output(input_json)
 
     bot.market_snapshot_provider = types.SimpleNamespace(
         get_snapshots=fake_get_snapshots
@@ -5462,107 +5934,7 @@ def _minimal_pside_history():
             }
         ],
         "panic_flatten_events": [],
-        "hsl_replay_matrices": {"long": {"XMR/USDT:USDT": [{"ts": 0}]}},
-        "hsl_replay_account_series": [{"ts": 0, "pnl": 0.0}],
-        "hsl_replay_matrix_coverage": {"fill_coverage_proven": False},
     }
-
-
-@pytest.mark.asyncio
-async def test_hard_stop_initialize_from_history_persists_replay_cache(monkeypatch):
-    cfg = _dummy_config()
-    cfg["live"]["hsl_signal_mode"] = "unified"
-    bot = _make_dummy_bot(cfg)
-    _hsl_cfg(bot)["enabled"] = True
-    bot.balance = 100.0
-
-    history = _minimal_pside_history()
-
-    async def fake_history(*, current_balance=None, **kwargs):
-        return history
-
-    persisted = []
-    monkeypatch.setattr(bot, "get_balance_equity_history", fake_history)
-    monkeypatch.setattr(
-        bot,
-        "_equity_hard_stop_persist_replay_matrices",
-        lambda h: persisted.append(h) or 1,
-    )
-
-    await bot._equity_hard_stop_initialize_from_history()
-
-    assert persisted == [history]
-
-
-@pytest.mark.asyncio
-async def test_hard_stop_initialize_from_history_survives_cache_persist_failure(
-    monkeypatch, caplog
-):
-    cfg = _dummy_config()
-    cfg["live"]["hsl_signal_mode"] = "unified"
-    bot = _make_dummy_bot(cfg)
-    _hsl_cfg(bot)["enabled"] = True
-    bot.balance = 100.0
-
-    async def fake_history(*, current_balance=None, **kwargs):
-        return _minimal_pside_history()
-
-    secret = "api_secret=hsl-pside-cache-persist-secret"
-    unsafe_type = type("ApiKeyHslPsideCachePersistSecret", (RuntimeError,), {})
-
-    def failing_persist(history):
-        raise unsafe_type(secret)
-
-    monkeypatch.setattr(bot, "get_balance_equity_history", fake_history)
-    monkeypatch.setattr(
-        bot, "_equity_hard_stop_persist_replay_matrices", failing_persist
-    )
-
-    import logging as logging_module
-
-    with caplog.at_level(logging_module.WARNING):
-        await bot._equity_hard_stop_initialize_from_history()
-
-    assert caplog.records[-1].getMessage() == (
-        "[risk] HSL replay cache persistence failed | error_type=RuntimeError"
-    )
-    assert secret not in caplog.text
-    assert unsafe_type.__name__ not in caplog.text
-    assert _hsl_state(bot)["halted"] is False
-
-
-@pytest.mark.asyncio
-async def test_hard_stop_initialize_from_history_redacts_cache_reuse_failure(monkeypatch, caplog):
-    cfg = _dummy_config()
-    cfg["live"]["hsl_signal_mode"] = "unified"
-    bot = _make_dummy_bot(cfg)
-    _hsl_cfg(bot)["enabled"] = True
-    bot.balance = 100.0
-    secret = "api_secret=hsl-pside-cache-reuse-secret"
-    unsafe_type = type("ApiKeyHslPsideCacheReuseSecret", (RuntimeError,), {})
-    history_calls = []
-
-    async def failing_reuse(_now_ms):
-        raise unsafe_type(secret)
-
-    async def full_history(*, current_balance=None, **kwargs):
-        history_calls.append((current_balance, kwargs))
-        return _minimal_pside_history()
-
-    monkeypatch.setattr(bot, "_equity_hard_stop_try_reuse_pside_replay_cache", failing_reuse)
-    monkeypatch.setattr(bot, "get_balance_equity_history", full_history)
-    monkeypatch.setattr(bot, "_equity_hard_stop_persist_replay_matrices", lambda _h: 0)
-
-    with caplog.at_level(logging.WARNING):
-        await bot._equity_hard_stop_initialize_from_history()
-
-    assert len(history_calls) == 1
-    assert caplog.records[-1].getMessage() == (
-        "[risk] HSL pside replay cache reuse failed; falling back to full replay | error_type=RuntimeError"
-    )
-    assert secret not in caplog.text
-    assert unsafe_type.__name__ not in caplog.text
-    assert _hsl_state(bot)["halted"] is False
 
 
 @pytest.mark.asyncio
@@ -6146,11 +6518,11 @@ async def test_hard_stop_initialize_from_history_preserves_no_restart_peak_acros
 
 
 @pytest.mark.asyncio
-async def test_get_balance_equity_history_hyperliquid_backfills_from_5m(monkeypatch):
+async def test_get_balance_equity_history_backfills_from_5m_on_any_exchange(monkeypatch):
     cfg = _dummy_config()
     cfg["live"]["pnls_max_lookback_days"] = 4.0
     bot = _make_dummy_bot(cfg)
-    bot.exchange = "hyperliquid"
+    bot.exchange = "gateio"
     bot._live_values["pnls_max_lookback_days"] = 4.0
     symbol = "BTC/USDT:USDT"
     bot.c_mults = {symbol: 1.0}
@@ -6183,7 +6555,7 @@ async def test_get_balance_equity_history_hyperliquid_backfills_from_5m(monkeypa
                         ),
                     ]
                 )
-            if timeframe == "15m":
+            if timeframe in {"15m", "1h"}:
                 return _make_candles([])
             raise AssertionError(f"unexpected timeframe {timeframe}")
 

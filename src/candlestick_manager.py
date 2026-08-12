@@ -49,7 +49,19 @@ import atexit
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple, TypedDict, TYPE_CHECKING
+from typing import (
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+    TypedDict,
+    TYPE_CHECKING,
+)
 import threading
 from collections import OrderedDict
 
@@ -77,7 +89,11 @@ from legacy_data_migrator import (
     normalize_ccxt_volume_to_base,
 )
 from live.diagnostic_safety import bounded_exception_type
-from utils import symbol_to_coin
+from utils import (
+    FIRST_OHLCV_TIMESTAMPS_CACHE_VERSION,
+    exchange_name_aliases,
+    symbol_to_coin,
+)
 
 # Suppress portalocker's "timeout has no effect in blocking mode" warning
 warnings.filterwarnings(
@@ -283,6 +299,23 @@ CANDLE_DTYPE = np.dtype(
     ]
 )
 
+CANDLE_RESOLUTION_LADDER: tuple[tuple[str, int], ...] = (
+    ("1m", 1),
+    ("5m", 5),
+    ("15m", 15),
+    ("1h", 60),
+)
+
+
+@dataclass(frozen=True)
+class CandleResolutionResult:
+    """Candles assembled from the finest available historical resolutions."""
+
+    candles: np.ndarray
+    source_counts: Dict[str, int]
+    failures: Dict[str, Exception]
+
+
 _LIVE_WS_OBSERVATION_RETENTION_MS = 2 * 60 * ONE_MIN_MS
 
 EMA_SERIES_DTYPE = np.dtype(
@@ -390,15 +423,118 @@ def synthesize_1m_from_higher_tf(candles: np.ndarray, tf_minutes: int) -> np.nda
     arr = _ensure_dtype(candles)
     if arr.size == 0:
         return np.empty((0,), dtype=CANDLE_DTYPE)
-    if tf_minutes == 5:
-        expanded = [ohlcv_5m_to_1m(row) for row in arr]
-    elif tf_minutes == 15:
-        expanded = [ohlcv_15m_to_1m(row) for row in arr]
-    else:
-        raise ValueError(f"unsupported tf_minutes={tf_minutes}")
+    if tf_minutes <= 1:
+        raise ValueError(f"tf_minutes must be > 1, got {tf_minutes}")
+    expanded = [ohlcv_xm_to_1m(row, tf_minutes) for row in arr]
     if not expanded:
         return np.empty((0,), dtype=CANDLE_DTYPE)
     return np.sort(np.concatenate(expanded), order="ts")
+
+
+async def fetch_candles_with_resolution_ladder(
+    fetch_candles: Callable[..., Awaitable[np.ndarray]],
+    *,
+    start_ts: int,
+    end_ts: int,
+    supported_timeframes: Optional[Iterable[str]] = None,
+) -> CandleResolutionResult:
+    """Fetch exact 1m candles, then cover only older leading history coarsely.
+
+    The first available 1m candle is the precision boundary. Higher-timeframe
+    candles may supply minutes before that boundary only when their full bucket
+    ends there or earlier; they never patch gaps at or after it. Within the
+    older prefix, the finest successful source wins.
+    """
+    start_minute = _floor_minute(start_ts)
+    end_minute = _floor_minute(end_ts)
+    if end_minute < start_minute:
+        return CandleResolutionResult(
+            candles=np.empty((0,), dtype=CANDLE_DTYPE),
+            source_counts={},
+            failures={},
+        )
+
+    supported = (
+        {str(timeframe).lower() for timeframe in supported_timeframes}
+        if supported_timeframes is not None
+        else None
+    )
+    rows_by_ts: Dict[int, np.void] = {}
+    sources_by_ts: Dict[int, str] = {}
+    failures: Dict[str, Exception] = {}
+    precision_boundary = end_minute + ONE_MIN_MS
+
+    for index, (timeframe, tf_minutes) in enumerate(CANDLE_RESOLUTION_LADDER):
+        timeframe = str(timeframe).lower()
+        if supported is not None and timeframe not in supported:
+            continue
+        fetch_end = end_minute if index == 0 else precision_boundary - ONE_MIN_MS
+        if fetch_end < start_minute:
+            break
+        try:
+            fetched = _ensure_dtype(
+                await fetch_candles(
+                    timeframe=timeframe,
+                    start_ts=start_minute,
+                    end_ts=fetch_end,
+                )
+            )
+        except Exception as exc:
+            failures[timeframe] = exc
+            continue
+
+        if fetched.size == 0:
+            continue
+        if tf_minutes == 1:
+            candidates = fetched
+        else:
+            period_ms = tf_minutes * ONE_MIN_MS
+            complete_before_boundary = (
+                fetched["ts"].astype(np.int64) + period_ms <= precision_boundary
+            )
+            candidates = synthesize_1m_from_higher_tf(
+                fetched[complete_before_boundary], tf_minutes
+            )
+        if index == 0:
+            exact_timestamps = [
+                int(row["ts"])
+                for row in candidates
+                if start_minute <= int(row["ts"]) <= end_minute
+            ]
+            if exact_timestamps:
+                precision_boundary = min(exact_timestamps)
+
+        for row in candidates:
+            ts = int(row["ts"])
+            if ts < start_minute or ts > end_minute:
+                continue
+            if index > 0 and ts >= precision_boundary:
+                continue
+            if ts in rows_by_ts:
+                continue
+            rows_by_ts[ts] = row
+            sources_by_ts[ts] = timeframe
+
+        if precision_boundary <= start_minute:
+            break
+        expected_prefix = range(start_minute, precision_boundary, ONE_MIN_MS)
+        if all(ts in rows_by_ts for ts in expected_prefix):
+            break
+
+    if not rows_by_ts:
+        candles = np.empty((0,), dtype=CANDLE_DTYPE)
+    else:
+        candles = np.empty((len(rows_by_ts),), dtype=CANDLE_DTYPE)
+        for index, ts in enumerate(sorted(rows_by_ts)):
+            candles[index] = rows_by_ts[ts]
+    source_counts: Dict[str, int] = {}
+    for source in sources_by_ts.values():
+        source_counts[source] = source_counts.get(source, 0) + 1
+    return CandleResolutionResult(
+        candles=candles,
+        source_counts=source_counts,
+        failures=failures,
+    )
 
 
 def get_caller_name(depth: int = 2, logger: Optional[logging.Logger] = None) -> str:
@@ -835,6 +971,11 @@ class CandlestickManager:
         ] = {}
         # Cache for EMA computations: per symbol -> {(metric, span, tf): (value, end_ts, computed_at_ms)}
         self._ema_cache: Dict[str, Dict[Tuple[str, int, str], Tuple[float, int, int]]] = {}
+        # Non-persistent provenance for EMA values computed with later-bounded
+        # internal zero-volume continuity rows. Keys mirror the EMA cache.
+        self._ema_provisional_internal_gap_context: Dict[
+            str, Dict[Tuple[str, float, str], Dict[str, int]]
+        ] = {}
         # Compatibility attribute retained for older monitor/tool code.  The
         # candlestick manager no longer owns current in-progress prices.
         self._current_close_cache: Dict[str, Tuple[float, int]] = {}
@@ -2211,22 +2352,6 @@ class CandlestickManager:
         except Exception:
             return ""
 
-    def _legacy_shard_candidates(self, symbol: str, date_key: str, tf: str) -> List[str]:
-        if tf != "1m":
-            return []
-        ex = str(self.exchange_name or "").lower()
-        coin = self._legacy_coin_from_symbol(symbol)
-        sym_code = self._legacy_symbol_code_from_symbol(symbol)
-        out: List[str] = []
-
-        if coin:
-            out.append(os.path.join("historical_data", f"ohlcvs_{ex}", coin, f"{date_key}.npy"))
-        if ex == "binanceusdm" and sym_code:
-            out.append(os.path.join("historical_data", "ohlcvs_futures", sym_code, f"{date_key}.npy"))
-        if ex == "bybit" and sym_code:
-            out.append(os.path.join("historical_data", "ohlcvs_bybit", sym_code, f"{date_key}.npy"))
-        return out
-
     def _legacy_shard_dirs(self, symbol: str, tf: str) -> List[str]:
         if tf != "1m":
             return []
@@ -2580,43 +2705,6 @@ class CandlestickManager:
             )
             return None
 
-    def _save_range(
-        self,
-        symbol: str,
-        arr: np.ndarray,
-        *,
-        timeframe: Optional[str] = None,
-        tf: Optional[str] = None,
-    ) -> None:
-        """Persist fetched candles to daily shards by date_key."""
-        if arr.size == 0:
-            return
-        arr = np.sort(_ensure_dtype(arr), order="ts")
-        tf_norm = self._normalize_timeframe_arg(timeframe, tf)
-        current_key: Optional[str] = None
-        bucket = []
-        total = 0
-        for row in arr:
-            key = self._date_key(int(row["ts"]))
-            if current_key is None:
-                current_key = key
-            if key != current_key:
-                if bucket:
-                    self._save_shard(
-                        symbol,
-                        current_key,
-                        np.array(bucket, dtype=CANDLE_DTYPE),
-                        tf=tf_norm,
-                    )
-                    total += len(bucket)
-                bucket = []
-                current_key = key
-            bucket.append(tuple(row.tolist()))
-        if bucket and current_key is not None:
-            self._save_shard(symbol, current_key, np.array(bucket, dtype=CANDLE_DTYPE), tf=tf_norm)
-            total += len(bucket)
-            self._log("debug", "saved_range", symbol=symbol, rows=total)
-
     def _save_range_incremental(
         self,
         symbol: str,
@@ -2891,6 +2979,24 @@ class CandlestickManager:
         self, symbol: str, *, timeframe: Optional[str] = None
     ) -> None:
         """Invalidate cached EMA values for a symbol, optionally for one timeframe."""
+        if symbol in self._ema_provisional_internal_gap_context:
+            if timeframe is None:
+                self._ema_provisional_internal_gap_context.pop(symbol, None)
+            else:
+                tf_key = str(_tf_to_ms(timeframe))
+                retained_context = {
+                    key: value
+                    for key, value in self._ema_provisional_internal_gap_context[
+                        symbol
+                    ].items()
+                    if len(key) < 3 or str(key[2]) != tf_key
+                }
+                if retained_context:
+                    self._ema_provisional_internal_gap_context[symbol] = (
+                        retained_context
+                    )
+                else:
+                    self._ema_provisional_internal_gap_context.pop(symbol, None)
         if symbol not in self._ema_cache:
             return
         if timeframe is None:
@@ -3274,22 +3380,6 @@ class CandlestickManager:
             )
         return changed
 
-    def _save_known_gaps(self, symbol: str, gaps: List[Tuple[int, int]]) -> None:
-        """Save gaps from simple tuples (backward compatibility wrapper)."""
-        now_ms = self._now_ms()
-        enhanced = [
-            {
-                "start_ts": int(s),
-                "end_ts": int(e),
-                "retry_count": _GAP_MAX_RETRIES,  # Assume caller-provided gaps are persistent
-                "reason": GAP_REASON_AUTO,
-                "added_at": now_ms,
-                "last_retry_at": now_ms,
-            }
-            for s, e in gaps
-        ]
-        self._save_known_gaps_enhanced(symbol, enhanced)
-
     def _add_known_gap(
         self,
         symbol: str,
@@ -3464,47 +3554,6 @@ class CandlestickManager:
             increment_retry=False,
             retry_count=_GAP_MAX_RETRIES,
         )
-
-    def _defer_persistent_gap_retry(
-        self,
-        symbol: str,
-        start_ts: int,
-        end_ts: int,
-        *,
-        now_ms: Optional[int] = None,
-    ) -> bool:
-        """Restart the cooldown for persistent unresolved gaps after a failed proof.
-
-        Contextual KuCoin verification is a re-check of an already-persistent
-        gap, not the first attempt in a new ordinary retry sequence. Preserve
-        the persistent retry count and reason so an empty or one-sided response
-        cannot make every subsequent candle read issue another REST request.
-        """
-        now = self._now_ms() if now_ms is None else int(now_ms)
-        changed = False
-        gaps = self._get_known_gaps_enhanced(symbol)
-        for gap in gaps:
-            if (
-                int(gap["start_ts"]) <= int(end_ts)
-                and int(gap["end_ts"]) >= int(start_ts)
-                and int(gap.get("retry_count", 0)) >= _GAP_MAX_RETRIES
-                and str(gap.get("reason", GAP_REASON_AUTO))
-                in {GAP_REASON_AUTO, GAP_REASON_FETCH_FAILED}
-            ):
-                gap["retry_count"] = _GAP_MAX_RETRIES
-                gap["last_retry_at"] = now
-                changed = True
-        if changed:
-            self._save_known_gaps_enhanced(symbol, gaps)
-            self._log(
-                "debug",
-                "persistent_gap_verification_deferred",
-                symbol=symbol,
-                start_ts=int(start_ts),
-                end_ts=int(end_ts),
-                retry_after_ms=now + _GAP_PERSISTENT_RETRY_MS,
-            )
-        return changed
 
     def _kucoin_contextual_retry_due(
         self,
@@ -4725,23 +4774,76 @@ class CandlestickManager:
     def _first_ohlcv_cache_path(self) -> Path:
         return Path(self.cache_dir) / "first_ohlcv_timestamps_unified_exchange_specific.json"
 
+    def _first_ohlcv_cache_version_path(self) -> Path:
+        return Path(self.cache_dir) / "first_ohlcv_timestamps_unified.version"
+
+    def _first_ohlcv_cache_symbols_path(self) -> Path:
+        return (
+            Path(self.cache_dir)
+            / "first_ohlcv_timestamps_unified_exchange_specific_symbols.json"
+        )
+
     def _first_ohlcv_cache_exchange_name(self) -> str:
         exchange_name = str(self.exchange_name or self._ex_id or "").lower()
         return _FIRST_OHLCV_EXCHANGE_CACHE_ALIASES.get(exchange_name, exchange_name)
 
     def _lookup_cached_authoritative_start_ts(self, symbol: str) -> Optional[int]:
         cache_path = self._first_ohlcv_cache_path()
-        if not cache_path.exists():
+        symbols_path = self._first_ohlcv_cache_symbols_path()
+        if not cache_path.exists() or not symbols_path.exists():
             return None
         try:
+            with open(self._first_ohlcv_cache_version_path(), "r", encoding="utf-8") as f:
+                if int(f.read().strip()) != FIRST_OHLCV_TIMESTAMPS_CACHE_VERSION:
+                    return None
             with open(cache_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if not isinstance(data, dict):
+            with open(symbols_path, "r", encoding="utf-8") as f:
+                cached_symbols = json.load(f)
+            if not isinstance(data, dict) or not isinstance(cached_symbols, dict):
                 return None
-            coin = symbol.split("/")[0].strip()
             exchange_name = self._first_ohlcv_cache_exchange_name()
-            value = data.get(coin, {}).get(exchange_name)
-            return int(value) if value is not None and float(value) > 0.0 else None
+            cache_keys = [symbol]
+            markets = getattr(self.exchange, "markets", {}) if self.exchange is not None else {}
+            if isinstance(markets, dict):
+                for market_symbol, market in markets.items():
+                    if not isinstance(market, dict):
+                        continue
+                    resolved_symbol = str(market.get("symbol") or market_symbol)
+                    if resolved_symbol != symbol:
+                        continue
+                    native_id = str(market.get("id") or "").strip()
+                    if native_id and native_id not in cache_keys:
+                        cache_keys.append(native_id)
+                    if native_id:
+                        qualifiers = set(exchange_name_aliases(exchange_name))
+                        qualifiers.update(exchange_name_aliases(self.exchange_name))
+                        qualifiers.update(exchange_name_aliases(self._ex_id))
+                        for qualifier in sorted(qualifiers):
+                            qualified_id = f"{qualifier}::{native_id}"
+                            if qualified_id not in cache_keys:
+                                cache_keys.append(qualified_id)
+            base_coin = symbol.split("/")[0].strip()
+            if base_coin != symbol:
+                cache_keys.append(base_coin)
+            for cache_key in cache_keys:
+                exchange_values = data.get(cache_key, {})
+                if not isinstance(exchange_values, dict):
+                    continue
+                value = exchange_values.get(exchange_name)
+                provenance_values = cached_symbols.get(cache_key, {})
+                cached_symbol = (
+                    provenance_values.get(exchange_name)
+                    if isinstance(provenance_values, dict)
+                    else None
+                )
+                if (
+                    value is not None
+                    and float(value) > 0.0
+                    and cached_symbol == symbol
+                ):
+                    return int(value)
+            return None
         except Exception:
             return None
 
@@ -4837,63 +4939,6 @@ class CandlestickManager:
 
         if changed and save:
             self._save_known_gaps_enhanced(symbol, new_gaps)
-
-    def _get_min_shard_ts(self, symbol: str) -> Optional[int]:
-        """Return earliest shard timestamp (ms) from index or disk, if available."""
-        try:
-            idx = self._ensure_symbol_index(symbol, tf="1m")
-            shards = idx.get("shards") or {}
-            if isinstance(shards, dict):
-                min_ts: Optional[int] = None
-                for shard_meta in shards.values():
-                    if not isinstance(shard_meta, dict):
-                        continue
-                    mi = shard_meta.get("min_ts")
-                    if mi is None:
-                        continue
-                    ts = int(mi)
-                    min_ts = ts if min_ts is None else min(min_ts, ts)
-                if min_ts is not None:
-                    return min_ts
-        except Exception:
-            pass
-
-        # Fallback: infer earliest shard from filenames on disk.
-        try:
-            shard_dir = self._symbol_dir(symbol, tf="1m")
-            if not os.path.isdir(shard_dir):
-                return None
-            day_keys = [f[:-4] for f in os.listdir(shard_dir) if f.endswith(".npy")]
-            if not day_keys:
-                return None
-            day_keys.sort()
-            start_ts, _ = self._date_range_of_key(day_keys[0])
-            return int(start_ts)
-        except Exception:
-            return None
-
-    def _get_inception_probe_meta(self, symbol: str) -> Tuple[int, int]:
-        """Return (last_probe_ms, last_probe_end_ts) for inception probing."""
-        idx = self._ensure_symbol_index(symbol)
-        meta = idx.get("meta", {})
-        try:
-            last_probe_ms = int(meta.get("inception_ts_probe_ms", 0) or 0)
-            last_probe_end_ts = int(meta.get("inception_ts_probe_end_ts", 0) or 0)
-            return last_probe_ms, last_probe_end_ts
-        except Exception:
-            return 0, 0
-
-    def _set_inception_probe_meta(
-        self, symbol: str, probe_ms: int, probe_end_ts: int, *, save: bool = True
-    ) -> None:
-        """Persist inception probe metadata to avoid repeated probes."""
-        idx = self._ensure_symbol_index(symbol)
-        meta = idx.setdefault("meta", {})
-        meta["inception_ts_probe_ms"] = int(probe_ms)
-        meta["inception_ts_probe_end_ts"] = int(probe_end_ts)
-        self._index[f"{symbol}::1m"] = idx
-        if save:
-            self._save_index(symbol)
 
     def _maybe_update_inception_ts(self, symbol: str, arr: np.ndarray, *, save: bool = True) -> None:
         """Update inception_ts if arr contains an earlier timestamp than known."""
@@ -4994,6 +5039,14 @@ class CandlestickManager:
             try:
                 params: Dict[str, Any] = {}
                 request_limit = int(limit)
+                # Bitget account-mode detection enables UTA routing on the shared
+                # authenticated CCXT client. Public candle history is account-
+                # independent, and the UTA candle endpoint may expose a shorter
+                # history than the classic futures history endpoint. Override only
+                # this public request so live UTA accounts retain private v3 routing
+                # without losing older strategy candles.
+                if "bitget" in exid:
+                    params["uta"] = False
                 # Provide an end bound for exchanges that support it.
                 # Note: Avoid passing 'until' to Bitget due to API validation errors on non-1m tfs.
                 if is_weex and end_exclusive_ms is not None:
@@ -7324,6 +7377,60 @@ class CandlestickManager:
             }
         )
 
+    async def get_candles_with_resolution_ladder(
+        self,
+        symbol: str,
+        *,
+        start_ts: int,
+        end_ts: Optional[int] = None,
+        strict: bool = False,
+    ) -> CandleResolutionResult:
+        """Return exact recent 1m candles with a coarser historical prefix.
+
+        Higher-timeframe candles are read through the same manager and may only
+        fill complete buckets ending inside the requested old-history prefix.
+        Callers remain responsible for requiring an exact recent 1m suffix when
+        their decision contract needs one.
+        """
+        self._raise_if_shutdown_requested("get_candles_with_resolution_ladder")
+        now = self._now_ms()
+        latest_finalized = _floor_minute(now) - ONE_MIN_MS
+        effective_end = (
+            latest_finalized
+            if end_ts is None
+            else min(_floor_minute(int(end_ts)), latest_finalized)
+        )
+        effective_start = _floor_minute(int(start_ts))
+        if effective_end < effective_start:
+            return CandleResolutionResult(
+                candles=np.empty((0,), dtype=CANDLE_DTYPE),
+                source_counts={},
+                failures={},
+            )
+
+        exchange_timeframes = getattr(self.exchange, "timeframes", None)
+        supported_timeframes = (
+            set(exchange_timeframes)
+            if isinstance(exchange_timeframes, dict) and exchange_timeframes
+            else None
+        )
+
+        async def fetch_resolution(*, timeframe: str, start_ts: int, end_ts: int):
+            return await self.get_candles(
+                symbol,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                strict=strict,
+                timeframe=None if timeframe == "1m" else timeframe,
+            )
+
+        return await fetch_candles_with_resolution_ladder(
+            fetch_resolution,
+            start_ts=effective_start,
+            end_ts=effective_end,
+            supported_timeframes=supported_timeframes,
+        )
+
     async def get_candles(
         self,
         symbol: str,
@@ -9355,6 +9462,83 @@ class CandlestickManager:
             tf=tf,
         )
 
+    def _record_ema_provisional_internal_gap_context(
+        self,
+        symbol: str,
+        metric_key: str,
+        span: float,
+        period_ms: int,
+        start_ts: int,
+        end_ts: int,
+    ) -> None:
+        key = (str(metric_key), float(span), str(period_ms))
+        contexts = self._ema_provisional_internal_gap_context.setdefault(symbol, {})
+        if period_ms != ONE_MIN_MS:
+            contexts.pop(key, None)
+            return
+        tolerance_ms = int(
+            self.provisional_internal_gap_tolerance_minutes * ONE_MIN_MS
+        )
+        if tolerance_ms <= 0:
+            contexts.pop(key, None)
+            return
+        last_final_ts = int(self.get_last_final_ts(symbol) or 0)
+        cached = self._cache.get(symbol)
+        if isinstance(cached, np.ndarray) and cached.size > 0:
+            last_final_ts = max(
+                last_final_ts, int(np.max(np.asarray(cached["ts"], dtype=np.int64)))
+            )
+        used_ranges: List[Tuple[int, int]] = []
+        for full_gap_start, full_gap_end in self._unverified_uncovered_gap_ranges(
+            symbol, int(start_ts), int(end_ts)
+        ):
+            gap_width_ms = int(full_gap_end) - int(full_gap_start) + ONE_MIN_MS
+            overlap_start = max(int(start_ts), int(full_gap_start))
+            overlap_end = min(int(end_ts), int(full_gap_end))
+            if (
+                overlap_start <= overlap_end
+                and gap_width_ms <= tolerance_ms
+                and int(full_gap_end) < last_final_ts
+            ):
+                used_ranges.append((overlap_start, overlap_end))
+        if not used_ranges:
+            contexts.pop(key, None)
+            if not contexts:
+                self._ema_provisional_internal_gap_context.pop(symbol, None)
+            return
+        gap_candles = sum(
+            (gap_end - gap_start) // ONE_MIN_MS + 1
+            for gap_start, gap_end in used_ranges
+        )
+        max_gap_candles = max(
+            (gap_end - gap_start) // ONE_MIN_MS + 1
+            for gap_start, gap_end in used_ranges
+        )
+        oldest_gap_start = min(gap_start for gap_start, _gap_end in used_ranges)
+        contexts[key] = {
+            "gap_count": int(len(used_ranges)),
+            "gap_candles": int(gap_candles),
+            "max_gap_candles": int(max_gap_candles),
+            "oldest_gap_age_ms": max(0, int(self._now_ms()) - oldest_gap_start),
+            "window_start_ts": int(start_ts),
+            "window_end_ts": int(end_ts),
+        }
+
+    def get_ema_provisional_internal_gap_context(
+        self,
+        symbol: str,
+        metric_key: str,
+        span: float,
+        *,
+        timeframe: Optional[str] = None,
+        tf: Optional[str] = None,
+    ) -> Optional[Dict[str, int]]:
+        period_ms = _tf_to_ms(timeframe if timeframe is not None else tf)
+        context = self._ema_provisional_internal_gap_context.get(symbol, {}).get(
+            (str(metric_key), float(span), str(period_ms))
+        )
+        return None if context is None else dict(context)
+
     async def get_latest_ema_close(
         self,
         symbol: str,
@@ -9403,6 +9587,15 @@ class CandlestickManager:
             return float("nan")
         closes = np.asarray(arr["c"], dtype=np.float64)
         res = float(self._ema(closes, span))
+        if allow_provisional_internal_gaps:
+            self._record_ema_provisional_internal_gap_context(
+                symbol,
+                "close",
+                span,
+                period_ms,
+                start_ts,
+                end_ts,
+            )
         # Store in cache
         cache[key] = (res, int(end_ts), int(now))
         return res
@@ -9658,6 +9851,20 @@ class CandlestickManager:
             return float("nan")
         series = series_fn(arr)
         res = float(self._ema(series, span))
+        if allow_provisional_internal_gaps:
+            if math.isfinite(res):
+                self._record_ema_provisional_internal_gap_context(
+                    symbol,
+                    metric_key,
+                    span,
+                    period_ms,
+                    start_ts,
+                    end_ts,
+                )
+            else:
+                self._ema_provisional_internal_gap_context.get(symbol, {}).pop(
+                    (str(metric_key), float(span), str(period_ms)), None
+                )
         cache[key] = (res, int(end_ts), int(now))
         return res
 
@@ -9913,7 +10120,20 @@ class CandlestickManager:
                 value = float(self._ema(self._ema_metric_series(metric_key, tail), span))
                 out[metric_key][span] = value
                 if not math.isfinite(value):
+                    if allow_provisional_internal_gaps:
+                        self._ema_provisional_internal_gap_context.get(symbol, {}).pop(
+                            (str(metric_key), float(span), str(period_ms)), None
+                        )
                     continue
+                if allow_provisional_internal_gaps:
+                    self._record_ema_provisional_internal_gap_context(
+                        symbol,
+                        metric_key,
+                        span,
+                        period_ms,
+                        metric_start_ts,
+                        end_ts,
+                    )
                 cache[(cache_metric_key, float(span), tf_key)] = (
                     value,
                     int(end_ts),

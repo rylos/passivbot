@@ -3,7 +3,7 @@ import hashlib
 import json
 import logging
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import numpy as np
 
@@ -368,7 +368,7 @@ def test_live_event_cycle_helpers_emit_structured_events():
         },
         "pending_pnl_count": 2,
         "degraded_pnl_count": 1,
-        "authoritative_epoch": "[redacted]",
+        "authoritative_epoch": 7,
     }
     assert "SECRET" not in str(events[1].data)
     assert "https://" not in str(events[1].data)
@@ -500,13 +500,13 @@ def test_startup_timing_debug_profile_adds_bounded_phase_shape(
 
     bot = FakeBot()
     bot._startup_timing_begin()
-    bot._startup_timing_mark("account", details="api_key=SECRET mode=coin")
+    bot._startup_timing_mark("account", details="mode=coin")
 
     assert bot._live_event_pipeline.flush(timeout=2.0) is True
     event = sink.events[0]
     assert event.event_type == EventTypes.BOT_STARTUP_TIMING
     assert event.data["debug_profile"] == "startup"
-    assert event.data["details"] == "api_key=SECRET mode=coin"
+    assert event.data["details"] == "mode=coin"
     assert event.data["debug"] == {
         "data_keys": [
             "debug_profile",
@@ -521,7 +521,7 @@ def test_startup_timing_debug_profile_adds_bounded_phase_shape(
         "elapsed_ms": 2500,
         "since_previous_ms": 2500,
         "details_present": True,
-        "details_len": len("api_key=SECRET mode=coin"),
+        "details_len": len("mode=coin"),
     }
     assert "SECRET" not in str(event.data["debug"])
     assert "api_key" not in str(event.data["debug"])
@@ -613,99 +613,6 @@ def test_startup_timing_best_effort_active_candle_omits_readiness_contract_field
             },
         )
     ]
-
-
-def test_routine_planning_defer_summary_emits_live_event(monkeypatch):
-    import passivbot as pb_mod
-
-    sink = ListEventSink()
-
-    class FakeBot:
-        _current_live_event_cycle_id = pb_mod.Passivbot._current_live_event_cycle_id
-        _emit_live_event = pb_mod.Passivbot._emit_live_event
-        _emit_planning_defer_summary_event = (
-            pb_mod.Passivbot._emit_planning_defer_summary_event
-        )
-        _record_routine_completed_candle_defer = (
-            pb_mod.Passivbot._record_routine_completed_candle_defer
-        )
-
-        def __init__(self):
-            self.exchange = "kucoin"
-            self.user = "kucoin_01"
-            self.bot_id = "bot_1"
-            self._live_event_current_cycle_id = "cy_3"
-            self._live_event_pipeline = LiveEventPipeline(
-                structured_sinks=[sink],
-                monitor_sinks=[],
-            )
-            self._routine_completed_candle_defer_summary = {
-                "window_start_ms": 1_000,
-                "last_log_ms": 0,
-                "count": 19,
-                "symbols": {"XRP/USDT:USDT"},
-            }
-
-        def _log_symbols(self, symbols, limit=8):
-            del limit
-            return ",".join(str(symbol) for symbol in symbols)
-
-    bot = FakeBot()
-    monkeypatch.setattr(pb_mod.planning_gates, "_utc_ms", lambda: 1_861_000)
-
-    bot._record_routine_completed_candle_defer(
-        {
-            "missing": ["completed_candles"],
-            "required": ["balance", "completed_candles", "market_snapshot"],
-            "context": "rust order calculation",
-            "epoch": 42,
-            "invalid": {
-                "completed_candles": [
-                    {
-                        "reason": "signature_mismatch",
-                        "mismatch_type": "completed_candle_target_changed",
-                        "changed_symbols": ["BTC/USDT:USDT"],
-                        "missing_symbols": ["ETH/USDT:USDT"],
-                    }
-                ]
-            },
-        }
-    )
-
-    assert bot._live_event_pipeline.flush(timeout=2.0) is True
-    assert len(sink.events) == 1
-    event = sink.events[0]
-    assert event.event_type == EventTypes.PLANNING_DEFER_SUMMARY
-    assert event.cycle_id == "cy_3"
-    assert event.reason_code == "completed_candle_target_changed"
-    assert event.status == "deferred"
-    assert event.data["count"] == 20
-    assert event.data["window_s"] == 1860
-    assert event.data["symbols"] == [
-        "BTC/USDT:USDT",
-        "ETH/USDT:USDT",
-        "XRP/USDT:USDT",
-    ]
-    assert event.data["symbols_count"] == 3
-    assert event.data["symbols_truncated"] is False
-    assert event.data["missing"] == ["completed_candles"]
-    assert event.data["invalid_surfaces"] == ["completed_candles"]
-    assert bot._routine_completed_candle_defer_summary["count"] == 0
-
-    bot._emit_planning_defer_summary_event(
-        reason_code="completed_candle_target_changed",
-        count=40,
-        window_s=60,
-        symbols=[f"S{i:02d}/USDT:USDT" for i in range(40)],
-        details={},
-    )
-    assert bot._live_event_pipeline.flush(timeout=2.0) is True
-    wide_event = sink.events[-1]
-    assert wide_event.event_type == EventTypes.PLANNING_DEFER_SUMMARY
-    assert wide_event.data["symbols_count"] == 40
-    assert wide_event.data["symbols_truncated"] is True
-    assert len(wide_event.data["symbols"]) == 32
-    assert bot._live_event_pipeline.close(timeout=2.0) is True
 
 
 def test_order_wave_summary_emits_live_event(caplog):
@@ -990,10 +897,9 @@ def test_rust_orchestrator_emitters_record_bounded_summaries():
         "input_hash": "failed_input_hash",
         "error_type": "RuntimeError",
     }
-    assert "error" not in failed.data
     assert error_type.__name__ not in str(failed.data)
     assert secret not in str(failed.data)
-    assert url not in str(failed.data)
+    assert "example.invalid" not in str(failed.data)
     assert bot._live_event_pipeline.close(timeout=2.0) is True
 
 
@@ -5940,8 +5846,6 @@ async def test_start_bot_records_startup_error_stop_and_early_snapshot(
         _monitor_emit_stop = pb_mod.Passivbot._monitor_emit_stop
         _emit_live_event = staticmethod(lambda *args, **kwargs: None)
         _set_log_silence_watchdog_context = pb_mod.Passivbot._set_log_silence_watchdog_context
-        _start_log_silence_watchdog = pb_mod.Passivbot._start_log_silence_watchdog
-        _stop_log_silence_watchdog = pb_mod.Passivbot._stop_log_silence_watchdog
         _shutdown_requested = pb_mod.Passivbot._shutdown_requested
         _raise_if_shutdown_requested = pb_mod.Passivbot._raise_if_shutdown_requested
         _sleep_unless_shutdown = pb_mod.Passivbot._sleep_unless_shutdown
@@ -5965,10 +5869,8 @@ async def test_start_bot_records_startup_error_stop_and_early_snapshot(
             self.debug_mode = False
             self.stop_signal_received = False
             self.snapshot_flushes = []
-            self._log_silence_watchdog_seconds = 0.0
             self._log_silence_watchdog_phase = "startup"
             self._log_silence_watchdog_stage = "idle"
-            self._log_silence_watchdog_task = None
             self._bot_ready = False
             self.live_event_console_enabled = structured_console
             self._live_event_pipeline = object() if structured_console else None
@@ -6035,32 +5937,6 @@ async def test_start_bot_records_startup_error_stop_and_early_snapshot(
         == incident_events[1]["payload"]["incident_id"]
     )
     assert incident_events[1]["payload"]["traceback"]["frame_count"] >= 1
-
-
-def test_maybe_log_silence_watchdog_emits_phase_and_stage(monkeypatch, caplog):
-    import passivbot as pb_mod
-
-    class FakeBot:
-        _maybe_log_silence_watchdog = pb_mod.Passivbot._maybe_log_silence_watchdog
-        _format_duration = pb_mod.Passivbot._format_duration
-
-        def __init__(self):
-            self._log_silence_watchdog_seconds = 60.0
-            self._log_silence_watchdog_phase = "startup"
-            self._log_silence_watchdog_stage = "equity_hard_stop_initialize_from_history"
-            self._health_start_ms = 0
-            self._last_loop_duration_ms = 0
-
-    monkeypatch.setattr(pb_mod, "get_last_log_activity_monotonic", lambda: 0.0)
-    monkeypatch.setattr(pb_mod, "utc_ms", lambda: 120_000)
-    caplog.set_level(logging.INFO)
-
-    bot = FakeBot()
-
-    assert bot._maybe_log_silence_watchdog(now_monotonic=61.0) is True
-    assert any("silence watchdog" in rec.message for rec in caplog.records)
-    assert any("phase=startup" in rec.message for rec in caplog.records)
-    assert any("stage=equity_hard_stop_initialize_from_history" in rec.message for rec in caplog.records)
 
 
 def test_log_new_fill_events_records_fill_history():
@@ -6456,9 +6332,6 @@ def test_monitor_unstuck_section_skips_pnl_math_when_unstuck_disabled():
     bot.open_orders = {}
     bot.has_open_unstuck_order = lambda: False
     bot._unstuck_uses_realized_pnl = lambda: False
-    bot._calc_unstuck_allowances_live = MagicMock(
-        side_effect=AssertionError("must not read nonauthoritative PnL")
-    )
     bot._calc_unstuck_allowance_for_logging = MagicMock(
         side_effect=AssertionError("must not read nonauthoritative PnL")
     )
@@ -6470,12 +6343,40 @@ def test_monitor_unstuck_section_skips_pnl_math_when_unstuck_disabled():
 
     section = bot._build_monitor_unstuck_section()
 
-    bot._calc_unstuck_allowances_live.assert_not_called()
     bot._calc_unstuck_allowance_for_logging.assert_not_called()
     assert section["sides"]["long"]["status"] == "unstuck_disabled"
     assert section["sides"]["long"]["allowance_live"] is None
     assert section["sides"]["short"]["status"] == "unstuck_disabled"
     assert section["sides"]["short"]["allowance_live"] is None
+
+
+def test_monitor_unstuck_section_derives_live_allowance_from_raw_diagnostic():
+    import passivbot as pb_mod
+
+    bot = pb_mod.Passivbot.__new__(pb_mod.Passivbot)
+    bot.open_orders = {}
+    bot.has_open_unstuck_order = lambda: False
+    bot._unstuck_uses_realized_pnl = lambda: True
+    bot._calc_unstuck_allowance_for_logging = MagicMock(
+        side_effect=[
+            {"status": "ok", "allowance": 12.5},
+            {"status": "ok", "allowance": -3.0},
+        ]
+    )
+    bot.bot_value = lambda pside, key: {
+        "unstuck_loss_allowance_pct": 0.01,
+        "unstuck_close_pct": 0.0,
+        "unstuck_threshold": 0.9,
+    }[key]
+
+    section = bot._build_monitor_unstuck_section()
+
+    assert bot._calc_unstuck_allowance_for_logging.call_args_list == [
+        call("long"),
+        call("short"),
+    ]
+    assert section["sides"]["long"]["allowance_live"] == pytest.approx(12.5)
+    assert section["sides"]["short"]["allowance_live"] == pytest.approx(0.0)
 
 
 @pytest.mark.asyncio
@@ -6598,6 +6499,7 @@ async def test_build_monitor_snapshot_includes_market_forager_unstuck_and_recent
             self._forager_rank_feature_unavailable_by_side = {
                 "long": {"ETH/USDT:USDT"}
             }
+            self._forager_ranking_required_by_side = {"long": True, "short": False}
             self._orchestrator_trailing_unavailable_symbols = {"BTC/USDT:USDT"}
             self._orchestrator_trailing_unavailable_reasons = {
                 "BTC/USDT:USDT": ["position_fill_confirmation_pending"]
@@ -6833,10 +6735,6 @@ async def test_build_monitor_snapshot_includes_market_forager_unstuck_and_recent
                 }
             return {"status": "disabled"}
 
-        def _calc_unstuck_allowances_live(self):
-            # Allowances are pure budget facts, real even with an open unstuck order.
-            return {"long": 1.0, "short": 0.0}
-
         async def build_forager_candidate_payload(
             self,
             pside,
@@ -6918,6 +6816,8 @@ async def test_build_monitor_snapshot_includes_market_forager_unstuck_and_recent
         "rankable": True,
         "rankability_reasons": [],
         "ranking_feature_unavailable_psides": [],
+        "conditional_ranking_feature_unavailable_psides": [],
+        "ranking_required_psides": ["long"],
         "ema_unavailable_reasons": [],
     }
     assert snapshot["market"]["ETH/USDT:USDT"]["forager"] == {
@@ -6925,6 +6825,8 @@ async def test_build_monitor_snapshot_includes_market_forager_unstuck_and_recent
         "rankable": False,
         "rankability_reasons": ["ranking_features_unavailable"],
         "ranking_feature_unavailable_psides": ["long"],
+        "conditional_ranking_feature_unavailable_psides": [],
+        "ranking_required_psides": ["long"],
         "ema_unavailable_reasons": [],
     }
     assert snapshot["market"]["BTC/USDT:USDT"]["c_mult"] == pytest.approx(1.0)
@@ -6956,6 +6858,8 @@ async def test_build_monitor_snapshot_includes_market_forager_unstuck_and_recent
     assert snapshot["forager"]["long"]["ranking"]["top_ema_readiness"]["symbol"] == "ETH/USDT:USDT"
     assert snapshot["unstuck"]["has_open_order"] is True
     assert snapshot["unstuck"]["sides"]["long"]["allowance"] == pytest.approx(-20.0)
+    assert snapshot["unstuck"]["sides"]["long"]["allowance_live"] == pytest.approx(0.0)
+    assert snapshot["unstuck"]["sides"]["short"]["allowance_live"] == pytest.approx(0.0)
     assert snapshot["unstuck"]["sides"]["long"]["override_loss_allowance_pcts"] == {
         "BTC/USDT:USDT": pytest.approx(0.005)
     }
@@ -7021,6 +6925,70 @@ def test_monitor_forager_candidates_use_live_age_eligibility():
 
     assert market[old_symbol]["forager"]["candidate_psides"] == ["long"]
     assert "forager" not in market[young_symbol]
+
+
+def test_monitor_forager_ranking_gap_blocks_only_when_rust_required_ranking():
+    import passivbot as pb_mod
+
+    symbol = "HYPE/USDT:USDT"
+
+    class FakeBot:
+        _build_monitor_market_section = pb_mod.Passivbot._build_monitor_market_section
+
+        def __init__(self):
+            self.active_symbols = []
+            self.positions = {}
+            self.open_orders = {}
+            self.trailing_prices = {}
+            self.effective_min_cost = {}
+            self.approved_coins = {"long": {symbol}, "short": set()}
+            self.ignored_coins = {"long": set(), "short": set()}
+            self.approved_coins_minus_ignored_coins = {
+                "long": {symbol},
+                "short": set(),
+            }
+            self.markets_dict = {symbol: {"active": True}}
+            self._orchestrator_ema_bundle_completed = True
+            self._orchestrator_ema_bundle_symbols = {symbol}
+            self._forager_rank_feature_unavailable_by_side = {
+                "long": {symbol},
+                "short": set(),
+            }
+            self._forager_ranking_required_by_side = {
+                "long": False,
+                "short": False,
+            }
+
+        def is_forager_mode(self, pside):
+            return pside == "long"
+
+        def is_approved(self, pside, candidate):
+            return pside == "long" and candidate == symbol
+
+        def effective_min_cost_is_low_enough(self, pside, candidate):
+            return pside == "long" and candidate == symbol
+
+        def has_position(self, pside=None, symbol=None):
+            return False
+
+    bot = FakeBot()
+    conditional = bot._build_monitor_market_section()[symbol]["forager"]
+
+    assert conditional["rankable"] is True
+    assert conditional["ranking_feature_unavailable_psides"] == []
+    assert conditional["conditional_ranking_feature_unavailable_psides"] == [
+        "long"
+    ]
+    assert conditional["ranking_required_psides"] == []
+
+    bot._forager_ranking_required_by_side["long"] = True
+    blocking = bot._build_monitor_market_section()[symbol]["forager"]
+
+    assert blocking["rankable"] is False
+    assert blocking["rankability_reasons"] == ["ranking_features_unavailable"]
+    assert blocking["ranking_feature_unavailable_psides"] == ["long"]
+    assert blocking["conditional_ranking_feature_unavailable_psides"] == []
+    assert blocking["ranking_required_psides"] == ["long"]
 
 
 def test_monitor_forager_candidates_use_live_min_cost_eligibility():

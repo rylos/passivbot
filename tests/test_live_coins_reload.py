@@ -61,6 +61,707 @@ async def test_external_ignored_coins_reload(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_unqualified_native_id_collision_across_exchanges_requires_scope(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    markets_by_exchange = {
+        "bitget": {
+            "ABC/USDT:USDT": {
+                "id": "12345",
+                "swap": True,
+                "linear": True,
+                "active": True,
+                "base": "ABC",
+            }
+        },
+        "bybit": {
+            "OTHER/USDT:USDT": {
+                "id": "12345",
+                "swap": True,
+                "linear": True,
+                "active": True,
+                "base": "OTHER",
+            }
+        },
+    }
+
+    async def fake_load_markets(exchange, verbose=False, quote=None):
+        markets = markets_by_exchange[exchange]
+        assert utils.create_coin_symbol_map_cache(
+            exchange, markets, quote=quote, verbose=False
+        )
+        return markets
+
+    monkeypatch.setattr(utils, "load_markets", fake_load_markets)
+    config = {
+        "live": {
+            "approved_coins": {"long": ["12345"], "short": ["12345"]},
+            "ignored_coins": {"long": [], "short": []},
+        }
+    }
+
+    with pytest.raises(
+        utils.AmbiguousMarketIdentifier,
+        match="different contracts across configured exchanges",
+    ):
+        await format_approved_ignored_coins(config, ["bitget", "bybit"])
+
+
+@pytest.mark.asyncio
+async def test_cross_exchange_native_id_collision_preserves_multiplier_identity(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    markets_by_exchange = {
+        "bitget": {
+            "ABC/USDT:USDT": {
+                "id": "SAME-ID",
+                "swap": True,
+                "linear": True,
+                "active": True,
+                "base": "ABC",
+            }
+        },
+        "bybit": {
+            "1000ABC/USDT:USDT": {
+                "id": "SAME-ID",
+                "swap": True,
+                "linear": True,
+                "active": True,
+                "base": "1000ABC",
+            }
+        },
+    }
+
+    async def fake_load_markets(exchange, verbose=False, quote=None):
+        markets = markets_by_exchange[exchange]
+        assert utils.create_coin_symbol_map_cache(
+            exchange, markets, quote=quote, verbose=False
+        )
+        return markets
+
+    monkeypatch.setattr(utils, "load_markets", fake_load_markets)
+
+    with pytest.raises(
+        utils.AmbiguousMarketIdentifier,
+        match="different contracts across configured exchanges",
+    ):
+        await utils.reject_cross_exchange_market_identifier_collisions(
+            ["SAME-ID"], ["bitget", "bybit"]
+        )
+
+
+@pytest.mark.asyncio
+async def test_cross_exchange_lowercase_native_id_preserves_multiplier_identity(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    markets_by_exchange = {
+        "bitget": {
+            "ABC/USDT:USDT": {
+                "id": "same-id",
+                "swap": True,
+                "linear": True,
+                "active": True,
+                "base": "ABC",
+            }
+        },
+        "bybit": {
+            "1000ABC/USDT:USDT": {
+                "id": "same-id",
+                "swap": True,
+                "linear": True,
+                "active": True,
+                "base": "1000ABC",
+            }
+        },
+    }
+
+    async def fake_load_markets(exchange, verbose=False, quote=None):
+        markets = markets_by_exchange[exchange]
+        assert utils.create_coin_symbol_map_cache(
+            exchange, markets, quote=quote, verbose=False
+        )
+        return markets
+
+    monkeypatch.setattr(utils, "load_markets", fake_load_markets)
+
+    with pytest.raises(
+        utils.AmbiguousMarketIdentifier,
+        match="different contracts across configured exchanges",
+    ):
+        await utils.reject_cross_exchange_market_identifier_collisions(
+            ["same-id"], ["bitget", "bybit"]
+        )
+
+
+@pytest.mark.asyncio
+async def test_cross_exchange_plain_alias_resolves_each_venue_denomination(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    markets_by_exchange = {
+        "bitget": {
+            "ABC/USDT:USDT": {
+                "id": "ABCUSDT",
+                "swap": True,
+                "linear": True,
+                "active": True,
+                "base": "ABC",
+            }
+        },
+        "bybit": {
+            "1000ABC/USDT:USDT": {
+                "id": "1000ABCUSDT",
+                "swap": True,
+                "linear": True,
+                "active": True,
+                "base": "1000ABC",
+            }
+        },
+    }
+
+    async def fake_load_markets(exchange, verbose=False, quote=None):
+        markets = markets_by_exchange[exchange]
+        assert utils.create_coin_symbol_map_cache(
+            exchange, markets, quote=quote, verbose=False
+        )
+        return markets
+
+    monkeypatch.setattr(utils, "load_markets", fake_load_markets)
+
+    await utils.reject_cross_exchange_market_identifier_collisions(
+        ["ABC"], ["bitget", "bybit"]
+    )
+
+    assert utils.coin_to_symbol("ABC", "bitget") == "ABC/USDT:USDT"
+    assert utils.coin_to_symbol("ABC", "bybit") == "1000ABC/USDT:USDT"
+
+
+@pytest.mark.asyncio
+async def test_user_plain_alias_remains_plain_when_matching_native_ids(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    markets_by_exchange = {
+        "bitget": {
+            "ABC/USDT:USDT": {
+                "id": "ABC",
+                "swap": True,
+                "linear": True,
+                "active": True,
+                "base": "ABC",
+            }
+        },
+        "bybit": {
+            "1000ABC/USDT:USDT": {
+                "id": "ABC",
+                "swap": True,
+                "linear": True,
+                "active": True,
+                "base": "1000ABC",
+            }
+        },
+    }
+
+    async def fake_load_markets(exchange, verbose=False, quote=None):
+        markets = markets_by_exchange[exchange]
+        assert utils.create_coin_symbol_map_cache(
+            exchange, markets, quote=quote, verbose=False
+        )
+        return markets
+
+    monkeypatch.setattr(utils, "load_markets", fake_load_markets)
+    config = {
+        "live": {
+            "approved_coins": {"long": ["ABC"], "short": ["ABC"]},
+            "ignored_coins": {"long": [], "short": []},
+        }
+    }
+
+    await format_approved_ignored_coins(config, ["bitget", "bybit"])
+
+    assert utils.coin_to_symbol("ABC", "bitget") == "ABC/USDT:USDT"
+    assert utils.coin_to_symbol("ABC", "bybit") == "1000ABC/USDT:USDT"
+
+
+@pytest.mark.asyncio
+async def test_cross_exchange_plain_alias_unifies_prefix_and_suffix_denominations(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    markets_by_exchange = {
+        "binance": {
+            "1000SHIB/USDT:USDT": {
+                "id": "1000SHIBUSDT",
+                "swap": True,
+                "linear": True,
+                "active": True,
+                "base": "1000SHIB",
+            }
+        },
+        "bybit": {
+            "SHIB1000/USDT:USDT": {
+                "id": "SHIB1000USDT",
+                "swap": True,
+                "linear": True,
+                "active": True,
+                "base": "SHIB1000",
+            }
+        },
+    }
+
+    async def fake_load_markets(exchange, verbose=False, quote=None):
+        markets = markets_by_exchange[exchange]
+        assert utils.create_coin_symbol_map_cache(
+            exchange, markets, quote=quote, verbose=False
+        )
+        return markets
+
+    monkeypatch.setattr(utils, "load_markets", fake_load_markets)
+
+    await utils.reject_cross_exchange_market_identifier_collisions(
+        ["SHIB"], ["binance", "bybit"]
+    )
+
+    assert utils.coin_to_symbol("SHIB", "binance") == "1000SHIB/USDT:USDT"
+    assert utils.coin_to_symbol("SHIB", "bybit") == "SHIB1000/USDT:USDT"
+
+
+@pytest.mark.asyncio
+async def test_approved_all_plain_alias_is_not_upgraded_by_coincident_native_id(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    markets_by_exchange = {
+        "binance": {
+            "1000ABC/USDT:USDT": {
+                "id": "1000ABCUSDT",
+                "swap": True,
+                "linear": True,
+                "active": True,
+                "base": "1000ABC",
+            }
+        },
+        "hyperliquid": {
+            "ABC/USDC:USDC": {
+                "id": "ABC",
+                "swap": True,
+                "linear": True,
+                "active": True,
+                "base": "ABC",
+            }
+        },
+    }
+
+    async def fake_load_markets(exchange, verbose=False, quote=None):
+        markets = markets_by_exchange[exchange]
+        assert utils.create_coin_symbol_map_cache(
+            exchange, markets, quote=quote, verbose=False
+        )
+        return markets
+
+    monkeypatch.setattr(utils, "load_markets", fake_load_markets)
+    monkeypatch.setattr(
+        utils, "filter_markets", lambda markets, exchange, quote=None: (markets, None)
+    )
+    config = {
+        "live": {
+            "approved_coins": "all",
+            "ignored_coins": {"long": [], "short": []},
+        }
+    }
+
+    await format_approved_ignored_coins(config, ["binance", "hyperliquid"])
+
+    assert config["live"]["approved_coins"] == {
+        "long": ["ABC"],
+        "short": ["ABC"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_cross_exchange_native_id_allows_quote_variants_of_same_underlying(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    markets_by_exchange = {
+        "bybit": {
+            "BTC/USDT:USDT": {
+                "id": "SAME-ID",
+                "swap": True,
+                "linear": True,
+                "active": True,
+                "base": "BTC",
+            }
+        },
+        "hyperliquid": {
+            "BTC/USDC:USDC": {
+                "id": "SAME-ID",
+                "swap": True,
+                "linear": True,
+                "active": True,
+                "base": "BTC",
+            }
+        },
+    }
+
+    async def fake_load_markets(exchange, verbose=False, quote=None):
+        markets = markets_by_exchange[exchange]
+        assert utils.create_coin_symbol_map_cache(
+            exchange, markets, quote=quote, verbose=False
+        )
+        return markets
+
+    monkeypatch.setattr(utils, "load_markets", fake_load_markets)
+
+    await utils.reject_cross_exchange_market_identifier_collisions(
+        ["SAME-ID"], ["bybit", "hyperliquid"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_approved_aliases_for_one_market_are_coalesced(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    markets = {
+        "BTC/USDT:USDT": {
+            "id": "BTCUSDT",
+            "swap": True,
+            "linear": True,
+            "active": True,
+            "base": "BTC",
+        }
+    }
+
+    assert utils.create_coin_symbol_map_cache("bitget", markets, verbose=False)
+    config = {
+        "live": {
+            "approved_coins": {
+                "long": ["BTC", "BTCUSDT"],
+                "short": ["BTCUSDT", "BTC"],
+            },
+            "ignored_coins": {"long": [], "short": []},
+        }
+    }
+
+    await format_approved_ignored_coins(config, ["bitget"])
+
+    assert config["live"]["approved_coins"] == {
+        "long": ["BTC"],
+        "short": ["BTC"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_backtest_approved_aliases_use_source_key_from_override_only_venue(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    markets_by_exchange = {
+        "bybit": {
+            "EDGE/USDT:USDT": {
+                "id": "EDGEUSDT",
+                "swap": True,
+                "linear": True,
+                "active": True,
+                "base": "EDGE",
+            }
+        },
+        "kucoin": {
+            "EDGE/USDT:USDT": {
+                "id": "EDGEUSDTM",
+                "swap": True,
+                "linear": True,
+                "active": True,
+                "base": "EDGE",
+            }
+        },
+    }
+
+    async def fake_load_markets(exchange, verbose=False, quote=None):
+        markets = markets_by_exchange[exchange]
+        assert utils.create_coin_symbol_map_cache(
+            exchange, markets, quote=quote, verbose=False
+        )
+        return markets
+
+    monkeypatch.setattr(utils, "load_markets", fake_load_markets)
+    config = {
+        "backtest": {"coin_sources": {"EDGEUSDTM": "kucoin"}},
+        "live": {
+            "approved_coins": {
+                "long": ["EDGE"],
+                "short": ["EDGEUSDTM"],
+            },
+            "ignored_coins": {"long": [], "short": []},
+        },
+    }
+
+    await format_approved_ignored_coins(
+        config, ["bybit"], prefer_backtest_coin_source_keys=True
+    )
+
+    assert config["live"]["approved_coins"] == {
+        "long": ["EDGEUSDTM"],
+        "short": ["EDGEUSDTM"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_live_approved_alias_ignores_backtest_coin_source(monkeypatch):
+    async def unexpected_load_markets(exchange, verbose=False, quote=None):
+        pytest.fail(f"live formatting must not load backtest-only source venue {exchange}")
+
+    monkeypatch.setattr(utils, "load_markets", unexpected_load_markets)
+    config = {
+        "backtest": {"coin_sources": {"EDGEUSDTM": "kucoin"}},
+        "live": {
+            "approved_coins": {"long": ["EDGE"], "short": ["EDGE"]},
+            "ignored_coins": {"long": [], "short": []},
+        },
+    }
+
+    await format_approved_ignored_coins(config, ["bybit"])
+
+    assert config["live"]["approved_coins"] == {
+        "long": ["EDGE"],
+        "short": ["EDGE"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_backtest_ignored_alias_resolves_on_source_only_venue(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    markets_by_exchange = {
+        "bybit": {},
+        "kucoin": {
+            "EDGE/USDT:USDT": {
+                "id": "EDGEUSDTM",
+                "swap": True,
+                "linear": True,
+                "active": True,
+                "base": "EDGE",
+            }
+        },
+    }
+
+    async def fake_load_markets(exchange, verbose=False, quote=None):
+        markets = markets_by_exchange[exchange]
+        assert utils.create_coin_symbol_map_cache(
+            exchange, markets, quote=quote, verbose=False
+        )
+        return markets
+
+    monkeypatch.setattr(utils, "load_markets", fake_load_markets)
+    config = {
+        "backtest": {"coin_sources": {"EDGEUSDTM": "kucoin"}},
+        "live": {
+            "approved_coins": {
+                "long": ["EDGEUSDTM"],
+                "short": ["EDGEUSDTM"],
+            },
+            "ignored_coins": {"long": ["EDGE"], "short": ["EDGE"]},
+        },
+    }
+
+    await format_approved_ignored_coins(
+        config, ["bybit"], prefer_backtest_coin_source_keys=True
+    )
+
+    assert config["live"]["approved_coins"] == {"long": [], "short": []}
+
+
+@pytest.mark.asyncio
+async def test_exact_ignored_identifier_removes_matching_approved_alias(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    markets = {
+        "BTC/USDT:USDT": {
+            "id": "BTCUSDT",
+            "swap": True,
+            "linear": True,
+            "active": True,
+            "base": "BTC",
+        }
+    }
+    utils.create_coin_symbol_map_cache("bitget", markets, verbose=False)
+
+    async def fake_load_markets(_exchange, verbose=False, quote=None):
+        return markets
+
+    monkeypatch.setattr(utils, "load_markets", fake_load_markets)
+    config = {
+        "live": {
+            "approved_coins": {"long": ["BTC"], "short": ["BTC"]},
+            "ignored_coins": {"long": ["BTCUSDT"], "short": []},
+        }
+    }
+
+    await format_approved_ignored_coins(config, ["bitget"])
+
+    assert config["live"]["approved_coins"] == {"long": [], "short": ["BTC"]}
+    assert config["live"]["ignored_coins"] == {"long": ["BTCUSDT"], "short": []}
+
+
+@pytest.mark.asyncio
+async def test_ignored_alias_removes_matching_exact_approval(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    markets = {
+        "BTC/USDT:USDT": {
+            "id": "BTCUSDT",
+            "swap": True,
+            "linear": True,
+            "active": True,
+            "base": "BTC",
+        }
+    }
+    utils.create_coin_symbol_map_cache("bitget", markets, verbose=False)
+
+    async def fake_load_markets(_exchange, verbose=False, quote=None):
+        return markets
+
+    monkeypatch.setattr(utils, "load_markets", fake_load_markets)
+    config = {
+        "live": {
+            "approved_coins": {"long": ["BTCUSDT"], "short": []},
+            "ignored_coins": {"long": ["BTC"], "short": []},
+        }
+    }
+
+    await format_approved_ignored_coins(config, ["bitget"])
+
+    assert config["live"]["approved_coins"]["long"] == []
+
+
+@pytest.mark.asyncio
+async def test_ignored_multiplier_alias_removes_matching_canonical_approval(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    markets = {
+        "1000SHIB/USDT:USDT": {
+            "id": "1000SHIBUSDT",
+            "swap": True,
+            "linear": True,
+            "active": True,
+            "base": "1000SHIB",
+        }
+    }
+    utils.create_coin_symbol_map_cache("bitget", markets, verbose=False)
+
+    async def fake_load_markets(_exchange, verbose=False, quote=None):
+        return markets
+
+    monkeypatch.setattr(utils, "load_markets", fake_load_markets)
+    config = {
+        "live": {
+            "approved_coins": {"long": ["SHIB"], "short": []},
+            "ignored_coins": {"long": ["1000SHIB"], "short": []},
+        }
+    }
+
+    await format_approved_ignored_coins(config, ["bitget"])
+
+    assert config["live"]["approved_coins"]["long"] == []
+
+
+@pytest.mark.asyncio
+async def test_exact_ignored_identifier_does_not_remove_distinct_multiplier_market(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    markets = {
+        "ABC/USDT:USDT": {
+            "id": "ABCUSDT",
+            "swap": True,
+            "linear": True,
+            "active": True,
+            "base": "ABC",
+        },
+        "1000ABC/USDT:USDT": {
+            "id": "1000ABCUSDT",
+            "swap": True,
+            "linear": True,
+            "active": True,
+            "base": "1000ABC",
+        },
+    }
+    utils.create_coin_symbol_map_cache("bitget", markets, verbose=False)
+
+    async def fake_load_markets(_exchange, verbose=False, quote=None):
+        return markets
+
+    monkeypatch.setattr(utils, "load_markets", fake_load_markets)
+    config = {
+        "live": {
+            "approved_coins": {"long": ["ABC/USDT:USDT"], "short": []},
+            "ignored_coins": {"long": ["1000ABCUSDT"], "short": []},
+        }
+    }
+
+    await format_approved_ignored_coins(config, ["bitget"])
+
+    assert config["live"]["approved_coins"]["long"] == ["ABC/USDT:USDT"]
+
+
+@pytest.mark.asyncio
+async def test_scoped_ignore_preserves_other_venues_from_approved_all(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    markets_by_exchange = {
+        "binance": {
+            "1000SHIB/USDT:USDT": {
+                "id": "1000SHIBUSDT",
+                "swap": True,
+                "linear": True,
+                "active": True,
+                "base": "1000SHIB",
+            }
+        },
+        "bybit": {
+            "SHIB1000/USDT:USDT": {
+                "id": "SHIB1000USDT",
+                "swap": True,
+                "linear": True,
+                "active": True,
+                "base": "SHIB1000",
+            }
+        },
+    }
+
+    async def fake_load_markets(exchange, verbose=False, quote=None):
+        markets = markets_by_exchange[exchange]
+        assert utils.create_coin_symbol_map_cache(
+            exchange, markets, quote=quote, verbose=False
+        )
+        return markets
+
+    monkeypatch.setattr(utils, "load_markets", fake_load_markets)
+    monkeypatch.setattr(
+        utils, "filter_markets", lambda markets, exchange, quote=None: (markets, None)
+    )
+    config = {
+        "live": {
+            "approved_coins": "all",
+            "ignored_coins": {
+                "long": ["binance::1000SHIBUSDT"],
+                "short": [],
+            },
+        }
+    }
+
+    await format_approved_ignored_coins(config, ["binance", "bybit"])
+
+    assert config["live"]["approved_coins"] == {
+        "long": ["bybit::SHIB1000USDT"],
+        "short": ["SHIB"],
+    }
+
+
+@pytest.mark.asyncio
 async def test_format_approved_ignored_coins_records_transform():
     config = {
         "live": {
@@ -162,6 +863,371 @@ async def test_format_approved_ignored_coins_supports_migrated_all(monkeypatch):
     assert config["live"]["approved_coins"] == {
         "long": ["BTC", "ETH"],
         "short": ["BTC", "ETH"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_format_approved_all_uses_plain_id_for_denomination_variants(monkeypatch):
+    markets = {
+        "ABC/USDT:USDT": {
+            "swap": True,
+            "linear": True,
+            "base": "ABC",
+            "id": "ABCUSDT",
+        },
+        "1000ABC/USDT:USDT": {
+            "swap": True,
+            "linear": True,
+            "base": "1000ABC",
+            "id": "1000ABCUSDT",
+        },
+        "BTC/USDT:USDT": {
+            "swap": True,
+            "linear": True,
+            "base": "BTC",
+            "id": "BTCUSDT",
+        },
+    }
+
+    async def fake_load_markets(exchange, verbose=False, quote=None):
+        return markets
+
+    def fake_filter_markets(loaded_markets, exchange, quote=None):
+        return loaded_markets, None
+
+    monkeypatch.setattr(utils, "load_markets", fake_load_markets)
+    monkeypatch.setattr(utils, "filter_markets", fake_filter_markets)
+
+    config = {
+        "live": {
+            "approved_coins": "all",
+            "ignored_coins": {"long": [], "short": []},
+        }
+    }
+
+    await format_approved_ignored_coins(config, ["bitget"])
+
+    expected = ["ABC", "BTC"]
+    assert config["live"]["approved_coins"] == {
+        "long": expected,
+        "short": expected,
+    }
+
+
+@pytest.mark.asyncio
+async def test_format_approved_all_preserves_distinct_numeric_suffix_ticker(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    markets = {
+        "1000ABC/USDT:USDT": {
+            "swap": True,
+            "linear": True,
+            "base": "1000ABC",
+            "id": "1000ABCUSDT",
+        },
+        "ABC1000/USDT:USDT": {
+            "swap": True,
+            "linear": True,
+            "base": "ABC1000",
+            "id": "ABC1000USDT",
+        },
+    }
+
+    async def fake_load_markets(exchange, verbose=False, quote=None):
+        assert utils.create_coin_symbol_map_cache(
+            exchange, markets, quote=quote, verbose=False
+        )
+        return markets
+
+    monkeypatch.setattr(utils, "load_markets", fake_load_markets)
+    monkeypatch.setattr(
+        utils, "filter_markets", lambda loaded, exchange, quote=None: (loaded, None)
+    )
+    config = {
+        "live": {
+            "approved_coins": "all",
+            "ignored_coins": {"long": [], "short": []},
+        }
+    }
+
+    await format_approved_ignored_coins(config, ["bitget"])
+
+    expected = ["ABC", "ABC1000"]
+    assert config["live"]["approved_coins"] == {
+        "long": expected,
+        "short": expected,
+    }
+
+
+@pytest.mark.asyncio
+async def test_format_coin_lists_preserves_distinct_exact_identifiers_and_coalesces_aliases(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    markets = {
+        "ABC/USDT:USDT": {
+            "id": "ABCUSDT",
+            "swap": True,
+            "linear": True,
+            "active": True,
+            "base": "ABC",
+        },
+        "1000ABC/USDT:USDT": {
+            "id": "1000ABCUSDT",
+            "swap": True,
+            "linear": True,
+            "active": True,
+            "base": "1000ABC",
+        },
+    }
+
+    async def fake_load_markets(exchange, verbose=False, quote=None):
+        assert exchange == "bitget"
+        assert utils.create_coin_symbol_map_cache(
+            exchange, markets, quote=quote, verbose=False
+        )
+        return markets
+
+    monkeypatch.setattr(utils, "load_markets", fake_load_markets)
+    identifiers = ["bitget::ABCUSDT", "1000ABC/USDT:USDT", "ABCUSDT"]
+    config = {
+        "live": {
+            "approved_coins": {"long": identifiers, "short": []},
+            "ignored_coins": {"long": [], "short": identifiers},
+        }
+    }
+
+    await format_approved_ignored_coins(config, ["bitget"])
+
+    assert config["live"]["approved_coins"]["long"] == identifiers[:2]
+    assert config["live"]["ignored_coins"]["short"] == identifiers
+
+
+@pytest.mark.asyncio
+async def test_format_approved_all_selects_one_denomination_per_underlying(monkeypatch):
+    markets_by_exchange = {
+        "bitget": {
+            "ABC/USDT:USDT": {
+                "swap": True,
+                "linear": True,
+                "base": "ABC",
+                "id": "ABCUSDT",
+            },
+            "1000ABC/USDT:USDT": {
+                "swap": True,
+                "linear": True,
+                "base": "1000ABC",
+                "id": "1000ABCUSDT",
+            },
+            "BTC/USDT:USDT": {
+                "swap": True,
+                "linear": True,
+                "base": "BTC",
+                "id": "BTCUSDT",
+            },
+        },
+        "bybit": {
+            "ABC/USDT:USDT": {
+                "swap": True,
+                "linear": True,
+                "base": "ABC",
+                "id": "ABCUSDT",
+            },
+            "BTC/USDT:USDT": {
+                "swap": True,
+                "linear": True,
+                "base": "BTC",
+                "id": "BTCUSDT",
+            },
+        },
+    }
+
+    async def fake_load_markets(exchange, verbose=False, quote=None):
+        return markets_by_exchange[exchange]
+
+    monkeypatch.setattr(utils, "load_markets", fake_load_markets)
+    monkeypatch.setattr(
+        utils, "filter_markets", lambda markets, exchange, quote=None: (markets, None)
+    )
+    config = {
+        "live": {
+            "approved_coins": "all",
+            "ignored_coins": {"long": [], "short": []},
+        }
+    }
+
+    await format_approved_ignored_coins(config, ["bitget", "bybit"])
+
+    expected = ["ABC", "BTC"]
+    assert config["live"]["approved_coins"] == {
+        "long": expected,
+        "short": expected,
+    }
+
+
+@pytest.mark.asyncio
+async def test_format_approved_all_unifies_cross_exchange_scaled_contracts(monkeypatch):
+    markets_by_exchange = {
+        "bybit": {
+            "ABC/USDT:USDT": {
+                "swap": True,
+                "linear": True,
+                "base": "ABC",
+                "id": "ABCUSDT",
+            }
+        },
+        "bitget": {
+            "1000ABC/USDT:USDT": {
+                "swap": True,
+                "linear": True,
+                "base": "1000ABC",
+                "id": "1000ABCUSDT",
+            }
+        },
+    }
+
+    async def fake_load_markets(exchange, verbose=False, quote=None):
+        return markets_by_exchange[exchange]
+
+    monkeypatch.setattr(utils, "load_markets", fake_load_markets)
+    monkeypatch.setattr(
+        utils, "filter_markets", lambda markets, exchange, quote=None: (markets, None)
+    )
+    config = {
+        "live": {
+            "approved_coins": "all",
+            "ignored_coins": {"long": [], "short": []},
+        }
+    }
+
+    await format_approved_ignored_coins(config, ["bybit", "bitget"])
+
+    expected = ["ABC"]
+    assert config["live"]["approved_coins"] == {
+        "long": expected,
+        "short": expected,
+    }
+
+
+@pytest.mark.asyncio
+async def test_format_approved_all_unifies_cross_exchange_quote_variants(monkeypatch):
+    markets_by_exchange = {
+        "bybit": {
+            "BTC/USDT:USDT": {
+                "swap": True,
+                "linear": True,
+                "base": "BTC",
+                "id": "BTCUSDT",
+            }
+        },
+        "hyperliquid": {
+            "BTC/USDC:USDC": {
+                "swap": True,
+                "linear": True,
+                "base": "BTC",
+                "id": "BTC",
+            }
+        },
+    }
+
+    async def fake_load_markets(exchange, verbose=False, quote=None):
+        return markets_by_exchange[exchange]
+
+    monkeypatch.setattr(utils, "load_markets", fake_load_markets)
+    monkeypatch.setattr(
+        utils, "filter_markets", lambda markets, exchange, quote=None: (markets, None)
+    )
+    config = {
+        "live": {
+            "approved_coins": "all",
+            "ignored_coins": {"long": [], "short": []},
+        }
+    }
+
+    await format_approved_ignored_coins(config, ["bybit", "hyperliquid"])
+
+    assert config["live"]["approved_coins"] == {
+        "long": ["BTC"],
+        "short": ["BTC"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_format_approved_all_unifies_exchange_denomination_conventions(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    markets_by_exchange = {
+        "bybit": {
+            "SHIB1000/USDT:USDT": {
+                "swap": True,
+                "linear": True,
+                "base": "SHIB1000",
+                "id": "SHIB1000USDT",
+            }
+        },
+        "binance": {
+            "1000SHIB/USDT:USDT": {
+                "swap": True,
+                "linear": True,
+                "base": "1000SHIB",
+                "id": "1000SHIBUSDT",
+            }
+        },
+        "bitget": {
+            "SHIB/USDT:USDT": {
+                "swap": True,
+                "linear": True,
+                "base": "SHIB",
+                "id": "SHIBUSDT",
+            }
+        },
+        "hyperliquid": {
+            "KSHIB/USDC:USDC": {
+                "swap": True,
+                "linear": True,
+                "base": "KSHIB",
+                "baseName": "kSHIB",
+                "id": "38",
+            }
+        },
+        "mexc": {
+            "SHIB100000/USDT:USDT": {
+                "swap": True,
+                "linear": True,
+                "base": "SHIB100000",
+                "baseName": "SHIB",
+                "id": "SHIB100000USDT",
+            }
+        },
+    }
+
+    async def fake_load_markets(exchange, verbose=False, quote=None):
+        markets = markets_by_exchange[exchange]
+        assert utils.create_coin_symbol_map_cache(
+            exchange, markets, quote=quote, verbose=False
+        )
+        return markets
+
+    monkeypatch.setattr(utils, "load_markets", fake_load_markets)
+    monkeypatch.setattr(
+        utils, "filter_markets", lambda markets, exchange, quote=None: (markets, None)
+    )
+    config = {
+        "live": {
+            "approved_coins": "all",
+            "ignored_coins": {"long": [], "short": []},
+        }
+    }
+
+    await format_approved_ignored_coins(
+        config, ["binance", "bybit", "bitget", "hyperliquid", "mexc"]
+    )
+
+    assert config["live"]["approved_coins"] == {
+        "long": ["SHIB"],
+        "short": ["SHIB"],
     }
 
 

@@ -62,7 +62,7 @@ For the recommended user workflow, examples, and best practices, see [Config Wor
 - **market_order_slippage_pct**: Backtest-only slippage applied whenever the backtester simulates market-order execution. This applies both to HSL panic closes when `bot.{long,short}.hsl.panic_close_order_type` is `"market"` and to normal orchestrator orders promoted to market execution by `live.market_orders_allowed`. A sell fills at `close * (1 - slippage_pct)` rounded down to `price_step`; a buy fills at `close * (1 + slippage_pct)` rounded up. The fill is guaranteed once the market-execution path is chosen, and the resulting fill also uses taker fees. Default `0.0005` (5 bps). This field is not a live slippage cap; live market orders use the exchange adapter's order semantics and any exchange/CCXT slippage controls.
 - **visible_metrics**: Controls which metrics are printed to the terminal after a standalone backtest. `null` shows the metrics implied by `optimize.scoring` and `optimize.limits`, `[]` shows all metrics, and an explicit list adds extra named metrics to the default view. This affects CLI visibility only; the full metric set is still computed and persisted.
   Fill-activity metrics use the `fills_*` prefix, including fill counts, per-day entry/close and long/short rates, no-fill gap durations, per-position-slot activity, active fill day counts/ratio, analysis duration, active symbol count, and top-symbol fill share.
-- **config_version**: Top-level schema version string for the config file. Canonical V8 configs must use `v8.0.0`. V8 is a breaking config schema and does not automatically convert v7 or pre-v8 configs; start from a V8 example config and port settings manually.
+- **config_version**: Top-level schema version string for the config file. Canonical V8 configs must use `v8.2.0`. V8 is a breaking config schema and does not automatically convert v7 or pre-v8 configs; start from a V8 example config and port settings manually.
 - **balance_sample_divider**: Minutes per bucket when sampling balances/equity for
   `balance_and_equity.csv.gz` and related plots. `1` keeps full per-minute resolution; higher values
   thin out the series (e.g., `15` stores one point every 15 minutes) to reduce file sizes. The CSV
@@ -81,7 +81,13 @@ Suite configuration uses a flattened structure directly under `backtest`:
   - `exchanges`: Exchanges that can contribute data to this scenario. Scenario-only exchanges are added to the suite preparation set before the run starts.
   - `coin_sources`: Scenario-specific overrides for `coin_sources`.
   - `overrides`: Arbitrary config path overrides (e.g., `{"bot.long.risk.total_wallet_exposure_limit": 2}`).
-- **backtest.aggregate**: Dict of metric-specific aggregation modes (default `mean`). Keys fall back to the `default` entry if unspecified.
+- **backtest.reducer**: Dict of metric-specific reduction modes (default `mean`). Keys fall back to the `default` entry if unspecified.
+
+`reducer` is the canonical field name for suite reduction in `backtest`, `optimize.scoring`, and
+`optimize.limits`. The legacy input aliases `aggregate`, `stat`, and `scenario_stat` remain accepted
+at those schema positions; `field` also remains accepted for legacy limit entries. Loaded or dumped
+configs always emit `reducer`. Supplying multiple aliases with the same value is allowed and
+collapses to `reducer`; conflicting values are rejected.
 
 See [Suite Examples](suite_examples.md) for practical examples and suggested usage.
 
@@ -89,7 +95,7 @@ Example per-metric aggregation:
 
 ```json
 "backtest": {
-  "aggregate": {
+  "reducer": {
     "default": "mean",
     "mdg_usd": "median",
     "sharpe_ratio": "std",
@@ -395,18 +401,40 @@ See [docs/forager.md](forager.md) for a full description of motivation, ranking 
         close.retracement_volatility_1h_weight, close.retracement_volatility_1m_weight
       ]
       ```
-    - `config.bot.long/short` shared groups:
+    - `config.bot.long/short` shared fields:
       ```
       [
-        risk.*, forager.*, hsl.*, unstuck.*, wallet_exposure_limit
+        risk.position_exposure_enforcer_enabled,
+        risk.position_exposure_enforcer_threshold,
+        risk.entry_cooldown_minutes,
+        risk.we_excess_allowance_pct,
+        hsl.cooldown_minutes_after_red,
+        hsl.ema_span_minutes,
+        hsl.enabled,
+        hsl.no_restart_drawdown_threshold,
+        hsl.orange_tier_mode,
+        hsl.panic_close_order_type,
+        hsl.red_threshold,
+        hsl.restart_after_red_policy,
+        hsl.tier_ratios.orange,
+        hsl.tier_ratios.yellow,
+        unstuck.close_pct,
+        unstuck.ema_dist,
+        unstuck.ema_gating_enabled,
+        unstuck.enabled,
+        unstuck.loss_allowance_pct,
+        unstuck.threshold,
+        wallet_exposure_limit
       ]
       ```
+      The `hsl.*` entries are eligible only when the main config's global
+      `live.hsl_signal_mode` is `"coin"`. The signal mode is not itself overridable.
     - `config.live`:
     ```
     [forced_mode_long, forced_mode_short, leverage]
     ```
   - Examples:
-    - `{"COIN1": {"override_config_path": "path/to/override_config.json"}}` -- Will attempt to load "path/to/override_config.json" and apply all eligible parameters from there for COIN1
+    - `{"COIN1": {"override_config_path": "path/to/override_config.json"}}` -- Loads the required file and applies all explicitly present eligible parameters from it for COIN1
     - `{"COIN2": {"override_config_path": "path/to/other_override_config.json", "bot": {"long": {"strategy": {"trailing_martingale": {"close": {"threshold_base_pct": 0.005}}}}}}}` -- Will attempt to load `"path/to/other_override_config.json"` first, and apply the given close threshold override after.
     - `{"COIN3": {"bot": {"short": {"strategy": {"trailing_martingale": {"entry": {"initial_qty_pct": 0.01}}}}}, "live": {"forced_mode_long": "panic"}}}` -- Will apply given overrides for COIN3.
 - **forced_modes**:
@@ -520,6 +548,8 @@ See [docs/forager.md](forager.md) for a full description of motivation, ranking 
   - Live and backtest use the same contract for realized-PnL risk windows: filter realized fill events to the active lookback window, then recompute cumulative PnL, current value, and peak from only that filtered sequence.
 - **position_exposure_enforcer_threshold**: Per-position multiplier that triggers the position exposure enforcer. When a bot-managed position’s exposure exceeds `wallet_exposure_limit * (1 + effective_we_excess_allowance_pct) * position_exposure_enforcer_threshold`, the bot emits a reduce-only order to bring it back under control. Set <1.0 for continual trimming or `1.0` for a hard cap; use `position_exposure_enforcer_enabled = false` to disable.
 - **entry_cooldown_minutes**: Time-based cooldown after the last position-increasing fill for that coin+pside. Full simultaneous entry ladders are emitted only when `entry_cooldown_minutes = 0.0` and entry retracement is disabled. The deprecated `trailing_grid_v7` compatibility strategy is the exception: at zero cooldown it preserves v7's internally bounded simultaneous grid leg, whose generator stops before stacking retracement-dependent trailing orders. Any positive value enforces a cooldown of that many minutes and limits staged position-adding entries to one order, including fractional values such as `0.05` for roughly three seconds. Backtests evaluate entries on one-minute steps, so any positive sub-minute cooldown prevents a same-minute replacement/add and effectively waits until the next backtest decision minute; live trading enforces the actual millisecond duration between intra-minute checks.
+  This field may be overridden per coin+side as
+  `coin_overrides.<coin>.bot.<side>.risk.entry_cooldown_minutes`.
 - **total_exposure_entry_gate_enabled**: Enables the TWEL entry cap for bot-generated entries. When enabled, entries are blocked or cropped before projected snapped-balance TWE, including existing same-side exchange positions, can exceed `min(total_wallet_exposure_limit, total_wallet_exposure_limit * total_exposure_enforcer_threshold)`. When disabled, excess allowance may let entries push same-side TWE above raw TWEL.
 - **total_exposure_enforcer_enabled**: Enables TWEL auto-reduce repair for already-over-target same-side exchange exposure. Manual and panic exposure counts toward the trigger, but only managed positions can receive TWEL auto-reduce orders. Disable this independently from the TWEL entry gate when you want entry capping without repair closes, or repair closes without entry capping.
 - **total_exposure_enforcer_policy**: TWEL auto-reduce candidate policy. `reduce_overweight` trims managed positions whose WE is above `total_wallet_exposure_limit * total_exposure_enforcer_threshold / effective_n_positions`, where live `effective_n_positions` follows the current dynamic tradable-slot count and falls back to the current held-position count when no symbols are entry-eligible. `reduce_portfolio` can trim any managed open position on that side. Both policies prefer profitable/breakeven reductions before shallow adverse-loss reductions and stop once projected TWE reaches the repair target. Default: `reduce_overweight`.
@@ -635,8 +665,8 @@ Risk should be constrained through canonical `*_strategy_eq` metrics instead. De
 - **scoring**:
   - The optimizer minimizes the configured objective list and keeps the Pareto front.
   - Each object-form scoring entry accepts `metric`, `goal`, and optional suite-only `scenario`
-    and `aggregate` selectors. An omitted `scenario` inherits `optimize.objective_scenario`; a
-    named value selects that scenario; explicit `null` selects suite aggregation. `aggregate`
+    and `reducer` selectors. An omitted `scenario` inherits `optimize.objective_scenario`; a
+    named value selects that scenario; explicit `null` selects suite aggregation. `reducer`
     overrides the reducer for that objective and supports `mean`, `min`, `max`, `std`, and
     `median`. It is invalid when the objective resolves to a named scenario.
   - The current default profile uses:
@@ -664,14 +694,17 @@ Risk should be constrained through canonical `*_strategy_eq` metrics instead. De
 The optimizer reuses the backtest suite configuration when `--suite [y/n]` is enabled.
 
 - **backtest.suite_enabled**: Can be toggled for optimizer runs via `--suite [y/n]` on `passivbot optimize`.
-- **backtest.aggregate**: Per-metric aggregation rules applied to scenario results before feeding into `optimize.scoring` and `optimize.limits`.
+- **backtest.reducer**: Per-metric aggregation rules applied to scenario results before feeding into `optimize.scoring` and `optimize.limits`.
 - **backtest.scenarios**: Scenario dictionaries. Each one may override `coins`, `ignored_coins`, `start_date`, `end_date`, `exchanges`, `coin_sources`, and `overrides` (arbitrary config path overrides).
+  `overrides` accepts either dotted config paths or nested config fragments; nested fragments are
+  flattened to leaf paths, while a top-level `coin_overrides` mapping remains an atomic scenario
+  replacement so scenarios may introduce coin-specific entries absent from the base config.
 - **optimize.objective_scenario**: Default scoring scenario. Set it to a unique scenario label to
   score objectives from that scenario by default, or to `null` to use suite aggregation by
   default. Individual `optimize.scoring` entries may override the default with a named `scenario`
-  or explicit `scenario: null`, and aggregate-based entries may set their own `aggregate` reducer.
+  or explicit `scenario: null`, and suite-reduced entries may set their own `reducer`.
   Individual `optimize.limits` entries independently select either a named scenario or a suite
-  aggregate statistic.
+  reduced statistic.
 
 Use `--suite-config path/to/file.json` to layer additional scenario definitions at runtime.
 
@@ -688,10 +721,10 @@ Any metric listed above can be used when defining limits. Currency-specific metr
 - Optional `enabled`: set to `false` to disable a default limit without deleting it. This prevents config normalization from re-adding that metric's default limit later.
 - Optional `scenario`: a named suite scenario to evaluate for this limit. Omitted or explicit
   `null` uses suite aggregation. A named scenario uses that scenario's metric value and cannot be
-  combined with `stat`; unknown labels and scenario limits outside suite optimization are rejected.
-- Optional `stat`: for suite-aggregate limits, the statistic to compare against (`min`, `max`,
-  `mean`, `std`, or `median`). If omitted, Passivbot uses the metric's `backtest.aggregate` rule,
-  then `backtest.aggregate.default`, then `mean`.
+  combined with `reducer`; unknown labels and scenario limits outside suite optimization are rejected.
+- Optional `reducer`: for suite-aggregate limits, the statistic to compare against (`min`, `max`,
+  `mean`, `std`, or `median`). If omitted, Passivbot uses the metric's `backtest.reducer` rule,
+  then `backtest.reducer.default`, then `mean`.
 
 #### Format
 
@@ -708,11 +741,11 @@ Define limits in `optimize.limits` as a list:
   {
     "metric": "drawdown_worst_strategy_eq",
     "penalize_if": "greater_than",
-    "stat": "max",
+    "reducer": "max",
     "value": 0.7
   },
   {"metric": "loss_profit_ratio", "penalize_if": "outside_range", "range": [0.05, 0.7]},
-  {"metric": "adg_btc", "penalize_if": "<", "value": 0.0005, "stat": "mean"},
+  {"metric": "adg_btc", "penalize_if": "<", "value": 0.0005, "reducer": "mean"},
   {"metric": "hard_stop_time_in_red_pct", "penalize_if": ">", "value": 0.02},
   {"metric": "backtest_completion_ratio", "penalize_if": "<", "value": 1.0}
 ]
@@ -740,7 +773,7 @@ passivbot optimize \
   --limit 'drawdown_worst_strategy_eq <= 0.5 scenario=base' \
   --limit 'backtest_completion_ratio>=1.0' \
   --limit 'loss_profit_ratio outside_range [0.05,0.7]' \
-  --limit 'adg > 0.0008 stat=mean'
+  --limit 'adg > 0.0008 reducer=mean'
 ```
 
 CLI replacement rules:

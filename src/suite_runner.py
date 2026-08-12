@@ -25,14 +25,21 @@ from config.overrides import parse_overrides
 from config.param_paths import require_existing_config_path
 from config.parse import load_raw_config
 from config.shared_bot import canonicalize_shared_bot_side
+from config.reducers import canonicalize_reducer_mapping, reducer_mapping_from_aliases
 from config_transform import ConfigTransformTracker, record_transform
 from logging_setup import configure_logging
 from materialized_cache import release_materialized_payload
+from backtest_universe import normalize_backtest_coin
 from utils import (
+    MarketIdentifierExchangeMismatch,
+    UnknownMarketIdentifier,
+    coin_to_symbol,
     format_approved_ignored_coins,
     format_end_date,
     load_markets,
-    symbol_to_coin,
+    reject_cross_exchange_market_identifier_collisions,
+    split_exchange_qualified_market_identifier,
+    to_standard_exchange_name,
     ts_to_date,
     utc_ms,
     date_to_ts,
@@ -54,6 +61,7 @@ _SCENARIO_KEYS = frozenset(
         "overrides",
     }
 )
+_ATOMIC_SCENARIO_OVERRIDE_ROOTS = frozenset({"coin_overrides"})
 
 # --------------------------------------------------------------------------- #
 # Data containers
@@ -109,34 +117,40 @@ def extract_suite_config(
 
     New structure reads from:
     - backtest.scenarios (list of scenario dicts)
-    - backtest.aggregate (aggregation settings)
+    - backtest.reducer (scenario reduction settings)
     - backtest.exchanges (default exchanges for scenarios)
     - backtest.volume_normalization (bool, default True)
     - backtest.suite_enabled (bool, default False) - master switch for suite mode
 
     Args:
         base_config: Full config dict
-        suite_override: Optional override dict with scenarios/aggregate keys
+        suite_override: Optional override dict with scenarios/reducer keys
 
     Returns:
-        Dict with 'scenarios', 'aggregate', 'exchanges', 'volume_normalization', and 'enabled' keys
+        Dict with 'scenarios', 'reducer', 'exchanges', 'volume_normalization', and 'enabled' keys
     """
     backtest = base_config.get("backtest", {})
 
     # Build config from new flattened structure
+    reducer_cfg, reducer_present = reducer_mapping_from_aliases(
+        backtest,
+        path="config.backtest",
+    )
     cfg = {
         "scenarios": deepcopy(backtest.get("scenarios", [])),
-        "aggregate": deepcopy(backtest.get("aggregate", {"default": "mean"})),
+        "reducer": reducer_cfg if reducer_present else {"default": "mean"},
         "exchanges": deepcopy(backtest.get("exchanges", [])),
         "volume_normalization": backtest.get("volume_normalization", True),
     }
 
     # Apply overrides if provided
     if suite_override:
+        suite_override = deepcopy(suite_override)
+        canonicalize_reducer_mapping(suite_override, path="suite override")
         if "scenarios" in suite_override:
             cfg["scenarios"] = deepcopy(suite_override["scenarios"])
-        if "aggregate" in suite_override:
-            cfg["aggregate"] = deepcopy(suite_override["aggregate"])
+        if "reducer" in suite_override:
+            cfg["reducer"] = deepcopy(suite_override["reducer"])
         if "exchanges" in suite_override:
             cfg["exchanges"] = deepcopy(suite_override["exchanges"])
         if "volume_normalization" in suite_override:
@@ -159,7 +173,12 @@ def _suite_override_from_section(section: Dict[str, Any], *, source_label: str) 
         suite = section["suite"]
         if not isinstance(suite, dict):
             raise ValueError(f"Suite config {source_label} field 'suite' must be a mapping.")
-        return deepcopy(suite)
+        suite_override = deepcopy(suite)
+        canonicalize_reducer_mapping(
+            suite_override,
+            path=f"suite config {source_label}.suite",
+        )
+        return suite_override
     if "scenarios" not in section:
         raise ValueError(f"Suite config {source_label} must define scenarios.")
     scenarios = section["scenarios"]
@@ -168,8 +187,12 @@ def _suite_override_from_section(section: Dict[str, Any], *, source_label: str) 
     suite_override: Dict[str, Any] = {
         "scenarios": deepcopy(scenarios),
     }
-    if "aggregate" in section:
-        suite_override["aggregate"] = deepcopy(section["aggregate"])
+    reducer_cfg, reducer_present = reducer_mapping_from_aliases(
+        section,
+        path=f"suite config {source_label}",
+    )
+    if reducer_present:
+        suite_override["reducer"] = reducer_cfg
     for key in ("exchanges", "volume_normalization"):
         if key in section:
             suite_override[key] = deepcopy(section[key])
@@ -181,7 +204,7 @@ def load_suite_override_config(suite_config_path: str | Path) -> Dict[str, Any]:
     Load a suite override file without normalizing it as a full bot config.
 
     External suite files are intentionally partial: they may contain only
-    backtest.scenarios/backtest.aggregate or a legacy backtest.suite wrapper.
+    backtest.scenarios/backtest.reducer or a legacy backtest.suite wrapper.
     Full config flavor detection is therefore the wrong boundary here.
     """
 
@@ -259,18 +282,144 @@ def _flatten_coin_list(value: Any) -> List[str]:
     return []
 
 
-def _normalized_coin_set(value: Any) -> set[str]:
+def _normalized_coin_set(value: Any, exchanges: Sequence[str] = ()) -> set[str]:
     out: set[str] = set()
     if isinstance(value, str):
         value = [value]
     for entry in value or []:
-        coin = symbol_to_coin(str(entry), verbose=False)
-        if coin:
-            out.add(coin)
+        coin = normalize_backtest_coin(entry)
+        if not coin:
+            continue
+        qualified_exchange, _ = split_exchange_qualified_market_identifier(coin)
+        resolved_symbols = set()
+        for exchange in exchanges:
+            try:
+                symbol = coin_to_symbol(coin, exchange, verbose=False)
+                resolved_symbols.add(
+                    f"{qualified_exchange}::{symbol}"
+                    if qualified_exchange is not None
+                    else symbol
+                )
+            except (MarketIdentifierExchangeMismatch, UnknownMarketIdentifier):
+                continue
+        out.update(resolved_symbols or {coin})
     return out
 
 
-def validate_suite_side_coin_lists(config: Dict[str, Any]) -> None:
+def _reconcile_suite_identifiers_to_available(
+    identifiers: Sequence[str],
+    available_coins: set[str],
+    exchanges: Sequence[str],
+) -> list[str]:
+    """Match exact/alias scenario identifiers to prepared dataset coin keys."""
+    reconciled = []
+    for identifier in identifiers:
+        raw = str(identifier)
+        if raw in available_coins:
+            reconciled.append(raw)
+            continue
+        matches = set()
+        for exchange in exchanges:
+            try:
+                target_symbol = coin_to_symbol(raw, exchange, verbose=False)
+            except (MarketIdentifierExchangeMismatch, UnknownMarketIdentifier):
+                continue
+            for available_coin in available_coins:
+                try:
+                    if (
+                        coin_to_symbol(available_coin, exchange, verbose=False)
+                        == target_symbol
+                    ):
+                        matches.add(available_coin)
+                except (MarketIdentifierExchangeMismatch, UnknownMarketIdentifier):
+                    continue
+        if len(matches) > 1:
+            raise ValueError(
+                f"suite identifier {raw!r} matches multiple prepared coins: "
+                f"{sorted(matches)}"
+            )
+        reconciled.append(next(iter(matches)) if matches else raw)
+    return list(dict.fromkeys(reconciled))
+
+
+def _reconcile_suite_coin_sources(
+    sources: Dict[str, str], coins: Sequence[str]
+) -> Dict[str, str]:
+    available_coins = set(coins)
+    reconciled = {}
+    for source_coin, exchange in sorted(sources.items()):
+        mapped = _reconcile_suite_identifiers_to_available(
+            [source_coin], available_coins, [exchange]
+        )[0]
+        target_coin = mapped if mapped in available_coins else source_coin
+        existing = reconciled.get(target_coin)
+        if existing is not None and existing != exchange:
+            raise ValueError(
+                f"suite coin_sources maps conflicting exchanges for {target_coin}: "
+                f"{existing} and {exchange}"
+            )
+        reconciled[target_coin] = exchange
+    return reconciled
+
+
+def _coalesce_master_coins(
+    coins: Sequence[str], sources: Dict[str, str], exchanges: Sequence[str]
+) -> list[str]:
+    """Use one dataset identity per resolved market, preferring forced-source keys."""
+    source_assignments = {}
+    for source_coin, exchange in sorted(sources.items()):
+        exchange = to_standard_exchange_name(str(exchange))
+        try:
+            source_symbol = coin_to_symbol(source_coin, exchange, verbose=False)
+        except UnknownMarketIdentifier:
+            continue
+        qualified_exchange, _ = split_exchange_qualified_market_identifier(source_coin)
+        if qualified_exchange is not None:
+            continue
+        existing = source_assignments.get(source_symbol)
+        if existing is not None and existing[1] != exchange:
+            raise ValueError(
+                "suite coin_sources maps equivalent identifiers "
+                f"{existing[0]!r} and {source_coin!r} to conflicting exchanges: "
+                f"{existing[1]} and {exchange}"
+            )
+        source_assignments[source_symbol] = (source_coin, exchange)
+
+    coalesced = set(str(coin) for coin in coins)
+    for source_coin, exchange in sorted(sources.items()):
+        try:
+            source_symbol = coin_to_symbol(source_coin, exchange, verbose=False)
+        except UnknownMarketIdentifier:
+            coalesced.add(source_coin)
+            continue
+        equivalent = set()
+        for coin in coalesced:
+            try:
+                if coin_to_symbol(coin, exchange, verbose=False) == source_symbol:
+                    equivalent.add(coin)
+            except (MarketIdentifierExchangeMismatch, UnknownMarketIdentifier):
+                continue
+        coalesced.difference_update(equivalent)
+        coalesced.add(source_coin)
+
+    representatives = {}
+    for coin in sorted(coalesced):
+        resolved = []
+        for exchange in exchanges:
+            try:
+                resolved.append(
+                    (exchange, coin_to_symbol(coin, exchange, verbose=False))
+                )
+            except (MarketIdentifierExchangeMismatch, UnknownMarketIdentifier):
+                continue
+        identity = ("resolved", tuple(resolved)) if resolved else ("raw", coin)
+        representatives.setdefault(identity, coin)
+    return sorted(representatives.values())
+
+
+def validate_suite_side_coin_lists(
+    config: Dict[str, Any], exchanges: Sequence[str] = ()
+) -> None:
     live = config.get("live", {}) if isinstance(config, dict) else {}
     if not isinstance(live, dict):
         return
@@ -278,8 +427,8 @@ def validate_suite_side_coin_lists(config: Dict[str, Any]) -> None:
         value = live.get(field)
         if not isinstance(value, dict):
             continue
-        long_coins = _normalized_coin_set(value.get("long", []))
-        short_coins = _normalized_coin_set(value.get("short", []))
+        long_coins = _normalized_coin_set(value.get("long", []), exchanges)
+        short_coins = _normalized_coin_set(value.get("short", []), exchanges)
         if long_coins == short_coins:
             continue
         long_only = sorted(long_coins - short_coins)
@@ -311,7 +460,7 @@ def _coerce_coin_source_dict(value: Any) -> Optional[Dict[str, str]]:
     for coin, exchange in value.items():
         if exchange is None:
             continue
-        coin_key = symbol_to_coin(str(coin), verbose=False)
+        coin_key = normalize_backtest_coin(coin)
         if not coin_key:
             continue
         exchange_value = str(exchange)
@@ -333,7 +482,7 @@ def _normalize_coin_list(value: Any) -> Optional[List[str]]:
     normalized: List[str] = []
     seen: set[str] = set()
     for entry in coins_raw:
-        coin = symbol_to_coin(str(entry), verbose=False)
+        coin = normalize_backtest_coin(entry)
         if not coin or coin in seen:
             continue
         seen.add(coin)
@@ -519,11 +668,11 @@ def build_scenarios(
     - Multiple exchanges in scenario = best-per-coin combination
 
     Args:
-        suite_cfg: Suite configuration dict with 'scenarios' and 'aggregate'
+        suite_cfg: Suite configuration dict with 'scenarios' and 'reducer'
         base_exchanges: Default exchanges to inherit when scenario doesn't specify
 
     Returns:
-        Tuple of (scenarios list, aggregate config dict)
+        Tuple of (scenarios list, reducer config dict)
     """
     scenarios_cfg = suite_cfg.get("scenarios") or []
     if not scenarios_cfg:
@@ -558,6 +707,7 @@ def build_scenarios(
         overrides = raw.get("overrides")
         if overrides is not None and not isinstance(overrides, dict):
             raise ValueError(f"Scenario overrides for '{raw.get('label')}' must be a mapping")
+        overrides = _normalize_scenario_overrides(overrides)
         scenario_coins = (
             _normalize_coin_list(raw.get("coins")) if raw.get("coins") is not None else None
         )
@@ -575,7 +725,7 @@ def build_scenarios(
                 ignored_coins=scenario_ignored,
                 exchanges=exchanges_list,
                 coin_sources=coin_source_map,
-                overrides=deepcopy(overrides) if overrides else None,
+                overrides=overrides or None,
             )
         )
 
@@ -589,8 +739,38 @@ def build_scenarios(
             + ", ".join(duplicate_labels)
         )
 
-    aggregate_cfg = deepcopy(suite_cfg.get("aggregate", {"default": "mean"}))
-    return scenarios, aggregate_cfg
+    reducer_cfg = deepcopy(suite_cfg.get("reducer", {"default": "mean"}))
+    return scenarios, reducer_cfg
+
+
+def _normalize_scenario_overrides(overrides: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Flatten nested override documents while preserving atomic dynamic mappings."""
+    normalized: Dict[str, Any] = {}
+
+    def visit(mapping: Dict[str, Any], prefix: tuple[str, ...] = ()) -> None:
+        for raw_key, value in mapping.items():
+            if not isinstance(raw_key, str):
+                raise ValueError("Scenario override keys must be strings")
+            key = raw_key.strip()
+            if not key:
+                raise ValueError("Scenario override keys must not be empty")
+            path = (*prefix, key)
+            root = path[0].split(".", 1)[0]
+            if (
+                isinstance(value, dict)
+                and "." not in key
+                and root not in _ATOMIC_SCENARIO_OVERRIDE_ROOTS
+            ):
+                visit(value, path)
+                continue
+            dotted_path = ".".join(path)
+            if dotted_path in normalized:
+                raise ValueError(f"Scenario override path {dotted_path!r} is defined more than once")
+            normalized[dotted_path] = deepcopy(value)
+
+    if overrides:
+        visit(overrides)
+    return normalized
 
 
 def collect_suite_coin_sources(
@@ -744,12 +924,17 @@ async def prepare_master_datasets(
         cache_dir: str,
         btc_usd_prices: np.ndarray,
         timestamps: Optional[np.ndarray],
+        source_exchanges: Optional[Iterable[str]] = None,
     ) -> ExchangeDataset:
         coin_index = {coin: idx for idx, coin in enumerate(coins)}
         coin_exchange = {
             coin: str(mss.get(coin, {}).get("exchange", exchange_name)) for coin in coins
         }
-        available_exchanges = sorted(set(coin_exchange.values())) or [exchange_name]
+        available_exchanges = sorted(
+            {str(exchange) for exchange in source_exchanges}
+            if source_exchanges is not None
+            else set(coin_exchange.values())
+        ) or [exchange_name]
         timestamps_array = (
             None
             if timestamps is None
@@ -841,6 +1026,7 @@ async def prepare_master_datasets(
             cache_dir,
             btc_usd_prices,
             timestamps,
+            source_exchanges=require_config_value(combined_config, "backtest.exchanges"),
         )
         # Free original arrays after copying to SharedMemory (can save ~5GB+ RAM)
         del hlcvs, btc_usd_prices
@@ -976,7 +1162,7 @@ def apply_scenario(
         )
     backtest_section = cfg.setdefault("backtest", {})
     live_section = cfg.setdefault("live", {})
-    validate_suite_side_coin_lists(cfg)
+    validate_suite_side_coin_lists(cfg, backtest_section.get("exchanges", []))
 
     new_start = scenario.start_date or backtest_section.get("start_date")
     if new_start != backtest_section.get("start_date"):
@@ -993,6 +1179,16 @@ def apply_scenario(
     scenario_coins = list(scenario.coins) if scenario.coins is not None else list(default_coins)
     scenario_ignored = (
         list(scenario.ignored_coins) if scenario.ignored_coins is not None else list(default_ignored)
+    )
+    available_exchange_list = list(available_exchanges)
+    scenario_exchanges = (
+        list(scenario.exchanges) if scenario.exchanges else available_exchange_list
+    )
+    scenario_coins = _reconcile_suite_identifiers_to_available(
+        scenario_coins, available_coins, scenario_exchanges
+    )
+    scenario_ignored = _reconcile_suite_identifiers_to_available(
+        scenario_ignored, available_coins, scenario_exchanges
     )
 
     filtered_coins = [coin for coin in scenario_coins if coin in available_coins]
@@ -1011,7 +1207,6 @@ def apply_scenario(
     filtered_ignored = [coin for coin in scenario_ignored if coin in available_coins]
     filtered_ignored = sorted(dict.fromkeys(filtered_ignored))
 
-    scenario_exchanges = list(scenario.exchanges) if scenario.exchanges else list(available_exchanges)
     if scenario_exchanges != backtest_section.get("exchanges"):
         tracker.update(
             ["backtest", "exchanges"], backtest_section.get("exchanges"), scenario_exchanges
@@ -1068,6 +1263,7 @@ def apply_scenario(
         base_coin_sources or {},
         scenario.coin_sources,
     )
+    resolved_sources = _reconcile_suite_coin_sources(resolved_sources, filtered_coins)
     if resolved_sources != backtest_section.get("coin_sources"):
         tracker.update(
             ["backtest", "coin_sources"],
@@ -1651,12 +1847,12 @@ def _recompute_index_metadata(
 
 
 # --------------------------------------------------------------------------- #
-# Aggregation
+# Scenario reduction
 # --------------------------------------------------------------------------- #
 
 
-def aggregate_metrics(
-    results: Sequence[ScenarioResult], aggregate_cfg: Dict[str, Any]
+def reduce_metrics(
+    results: Sequence[ScenarioResult], reducer_cfg: Dict[str, Any]
 ) -> Dict[str, Any]:
     if not results:
         return {"aggregated": {}, "stats": {}}
@@ -1670,9 +1866,9 @@ def aggregate_metrics(
             metrics_values.setdefault(metric, []).append(float(value))
 
     stats: Dict[str, Dict[str, float]] = {}
-    aggregates: Dict[str, float] = {}
-    aggregate_cfg = {canonicalize_metric_name(str(k)): v for k, v in aggregate_cfg.items()}
-    default_mode = str(aggregate_cfg.get("default", "mean")).lower()
+    reduced: Dict[str, float] = {}
+    reducer_cfg = {canonicalize_metric_name(str(k)): v for k, v in reducer_cfg.items()}
+    default_mode = str(reducer_cfg.get("default", "mean")).lower()
 
     for metric, values in metrics_values.items():
         if not values:
@@ -1685,24 +1881,24 @@ def aggregate_metrics(
             "std": float(np.std(arr)),
             "median": float(np.median(arr)),
         }
-        mode = aggregate_cfg.get(metric)
+        mode = reducer_cfg.get(metric)
         if mode is None and "_" in metric:
             base = metric.rsplit("_", 1)[0]
-            mode = aggregate_cfg.get(base)
+            mode = reducer_cfg.get(base)
         mode = str(mode or default_mode).lower()
         if mode == "mean":
-            aggregates[metric] = stats[metric]["mean"]
+            reduced[metric] = stats[metric]["mean"]
         elif mode == "max":
-            aggregates[metric] = stats[metric]["max"]
+            reduced[metric] = stats[metric]["max"]
         elif mode == "min":
-            aggregates[metric] = stats[metric]["min"]
+            reduced[metric] = stats[metric]["min"]
         elif mode == "std":
-            aggregates[metric] = stats[metric]["std"]
+            reduced[metric] = stats[metric]["std"]
         elif mode == "median":
-            aggregates[metric] = float(np.median(arr))
+            reduced[metric] = float(np.median(arr))
         else:
-            raise ValueError(f"Unsupported aggregation mode '{mode}' for metric '{metric}'.")
-    return {"aggregated": aggregates, "stats": stats}
+            raise ValueError(f"Unsupported reducer '{mode}' for metric '{metric}'.")
+    return {"aggregated": reduced, "stats": stats}
 
 
 def build_suite_metrics_payload(
@@ -1760,12 +1956,11 @@ async def run_backtest_suite_async(
     suite_output_root: Optional[Path] = None,
 ) -> SuiteSummary:
     base_exchanges = require_config_value(config, "backtest.exchanges")
-    validate_suite_side_coin_lists(config)
 
     base_coins = _flatten_coin_list(require_live_value(config, "approved_coins"))
     base_ignored = _flatten_coin_list(require_live_value(config, "ignored_coins"))
 
-    scenarios, aggregate_cfg = build_scenarios(suite_cfg, base_exchanges=base_exchanges)
+    scenarios, reducer_cfg = build_scenarios(suite_cfg, base_exchanges=base_exchanges)
 
     # Determine which individual exchange datasets are needed for single-exchange scenarios
     needed_individual = _determine_needed_individual_exchanges(scenarios, base_exchanges)
@@ -1781,16 +1976,30 @@ async def run_backtest_suite_async(
             sorted(added_exchanges),
         )
 
-    for exchange in exchanges_list:
-        await load_markets(exchange, verbose=False)
-    await format_approved_ignored_coins(config, exchanges_list, verbose=False)
-
     suite_coin_sources = collect_suite_coin_sources(config, scenarios)
+    identity_exchanges = sorted(
+        set(exchanges_list) | set(suite_coin_sources.values())
+    )
+    for exchange in identity_exchanges:
+        await load_markets(exchange, verbose=False)
+    await format_approved_ignored_coins(
+        config,
+        exchanges_list,
+        verbose=False,
+        prefer_backtest_coin_source_keys=True,
+    )
+    validate_suite_side_coin_lists(config, exchanges_list)
 
     master_coins = _collect_union((s.coins for s in scenarios), base_coins)
-    if suite_coin_sources:
-        master_coins = sorted(dict.fromkeys([*master_coins, *suite_coin_sources.keys()]))
+    master_coins = _coalesce_master_coins(
+        master_coins, suite_coin_sources, identity_exchanges
+    )
     master_ignored = _collect_union((s.ignored_coins for s in scenarios), base_ignored)
+    await reject_cross_exchange_market_identifier_collisions(
+        [*master_coins, *master_ignored, *suite_coin_sources.keys()],
+        identity_exchanges,
+        verbose=False,
+    )
 
     base_config = deepcopy(config)
     base_config.setdefault("backtest", {})
@@ -1892,8 +2101,8 @@ async def run_backtest_suite_async(
             len(result.metrics.get("stats", {})),
         )
 
-    aggregate_summary = aggregate_metrics(results, aggregate_cfg)
-    suite_metrics = build_suite_metrics_payload(results, aggregate_summary)
+    reduced_summary = reduce_metrics(results, reducer_cfg)
+    suite_metrics = build_suite_metrics_payload(results, reduced_summary)
     # Persist a lean, canonical payload: shared schema + elapsed per scenario.
     summary_payload = {
         "suite_id": suite_timestamp,
@@ -1915,7 +2124,7 @@ async def run_backtest_suite_async(
     return SuiteSummary(
         suite_id=suite_timestamp,
         scenarios=results,
-        aggregate=aggregate_summary,
+        aggregate=reduced_summary,
         output_dir=suite_dir,
         suite_metrics=suite_metrics,
     )

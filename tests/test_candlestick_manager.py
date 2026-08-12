@@ -28,9 +28,188 @@ from candlestick_manager import (
     _GAP_PERSISTENT_RETRY_MS,
     _GATEIO_RECENT_1M_LIMIT_CANDLES,
     _floor_minute,
+    fetch_candles_with_resolution_ladder,
     sanitize_remote_fetch_diagnostic,
+    synthesize_1m_from_higher_tf,
 )
 from logging_setup import DEFAULT_DATEFMT, DEFAULT_FORMAT_WITH_PREFIX
+
+
+def _resolution_candles(*minutes, close_offset=0.0):
+    return np.array(
+        [
+            (
+                minute * ONE_MIN_MS,
+                100.0 + close_offset + minute,
+                101.0 + close_offset + minute,
+                99.0 + close_offset + minute,
+                100.0 + close_offset + minute,
+                1.0,
+            )
+            for minute in minutes
+        ],
+        dtype=CANDLE_DTYPE,
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolution_ladder_stops_when_exact_1m_reaches_start():
+    calls = []
+
+    async def fetch(*, timeframe, start_ts, end_ts):
+        calls.append((timeframe, start_ts, end_ts))
+        assert timeframe == "1m"
+        return _resolution_candles(0, 1, 2)
+
+    result = await fetch_candles_with_resolution_ladder(
+        fetch,
+        start_ts=0,
+        end_ts=2 * ONE_MIN_MS,
+    )
+
+    assert [call[0] for call in calls] == ["1m"]
+    assert result.source_counts == {"1m": 3}
+    assert result.failures == {}
+    assert result.candles["ts"].tolist() == [0, ONE_MIN_MS, 2 * ONE_MIN_MS]
+
+
+@pytest.mark.asyncio
+async def test_resolution_ladder_fills_only_prefix_before_exact_1m():
+    calls = []
+
+    async def fetch(*, timeframe, start_ts, end_ts):
+        calls.append((timeframe, start_ts, end_ts))
+        if timeframe == "1m":
+            return _resolution_candles(10, 11, 13)
+        if timeframe == "5m":
+            return _resolution_candles(0, 5, close_offset=1_000.0)
+        raise AssertionError(f"unexpected timeframe {timeframe}")
+
+    result = await fetch_candles_with_resolution_ladder(
+        fetch,
+        start_ts=0,
+        end_ts=13 * ONE_MIN_MS,
+    )
+
+    assert [call[0] for call in calls] == ["1m", "5m"]
+    assert calls[1][2] == 9 * ONE_MIN_MS
+    assert result.source_counts == {"5m": 10, "1m": 3}
+    assert 12 * ONE_MIN_MS not in set(result.candles["ts"])
+    exact_row = result.candles[result.candles["ts"] == 10 * ONE_MIN_MS][0]
+    assert float(exact_row["c"]) == pytest.approx(110.0)
+
+
+@pytest.mark.asyncio
+async def test_resolution_ladder_rejects_coarse_bucket_crossing_1m_boundary():
+    async def fetch(*, timeframe, start_ts, end_ts):
+        if timeframe == "1m":
+            return _resolution_candles(12, 13)
+        if timeframe == "5m":
+            return _resolution_candles(5, 10, close_offset=500.0)
+        return _resolution_candles()
+
+    result = await fetch_candles_with_resolution_ladder(
+        fetch,
+        start_ts=5 * ONE_MIN_MS,
+        end_ts=13 * ONE_MIN_MS,
+    )
+
+    timestamps = set(result.candles["ts"])
+    expected_timestamps = {minute * ONE_MIN_MS for minute in range(5, 10)} | {
+        12 * ONE_MIN_MS,
+        13 * ONE_MIN_MS,
+    }
+    assert timestamps == expected_timestamps
+    assert result.source_counts == {"5m": 5, "1m": 2}
+
+
+@pytest.mark.asyncio
+async def test_manager_resolution_ladder_reuses_canonical_candle_reads(tmp_path):
+    manager = CandlestickManager(exchange=None, cache_dir=str(tmp_path))
+    manager._now_ms_callback = lambda: 13 * ONE_MIN_MS
+    calls = []
+
+    async def fake_get_candles(
+        symbol, *, start_ts, end_ts, strict, timeframe=None, **_kwargs
+    ):
+        calls.append((symbol, timeframe or "1m", start_ts, end_ts, strict))
+        if timeframe is None:
+            return _resolution_candles(10, 11)
+        if timeframe == "5m":
+            return _resolution_candles(0, 5, close_offset=500.0)
+        return _resolution_candles()
+
+    manager.get_candles = fake_get_candles
+
+    result = await manager.get_candles_with_resolution_ladder(
+        "TEST/USDT", start_ts=0, end_ts=11 * ONE_MIN_MS, strict=False
+    )
+
+    assert [call[1] for call in calls] == ["1m", "5m"]
+    assert result.source_counts == {"5m": 10, "1m": 2}
+    assert result.candles.size == 12
+
+
+@pytest.mark.asyncio
+async def test_resolution_ladder_uses_finer_sources_before_one_hour():
+    calls = []
+
+    async def fetch(*, timeframe, start_ts, end_ts):
+        calls.append(timeframe)
+        if timeframe == "1m":
+            return _resolution_candles(*range(60, 75))
+        if timeframe == "5m":
+            return _resolution_candles(50, close_offset=500.0)
+        if timeframe == "15m":
+            return _resolution_candles(30, close_offset=1_500.0)
+        if timeframe == "1h":
+            return _resolution_candles(0, close_offset=6_000.0)
+        raise AssertionError(timeframe)
+
+    result = await fetch_candles_with_resolution_ladder(
+        fetch,
+        start_ts=0,
+        end_ts=74 * ONE_MIN_MS,
+    )
+
+    assert calls == ["1m", "5m", "15m", "1h"]
+    assert result.source_counts == {"1h": 40, "15m": 15, "5m": 5, "1m": 15}
+    assert result.candles.size == 75
+
+
+@pytest.mark.asyncio
+async def test_resolution_ladder_skips_unsupported_tier_and_records_failures():
+    calls = []
+
+    async def fetch(*, timeframe, start_ts, end_ts):
+        calls.append(timeframe)
+        if timeframe in {"1m", "15m"}:
+            raise RuntimeError(f"{timeframe} unavailable")
+        if timeframe == "1h":
+            return _resolution_candles(0)
+        raise AssertionError(timeframe)
+
+    result = await fetch_candles_with_resolution_ladder(
+        fetch,
+        start_ts=0,
+        end_ts=59 * ONE_MIN_MS,
+        supported_timeframes={"1m", "15m", "1h"},
+    )
+
+    assert calls == ["1m", "15m", "1h"]
+    assert set(result.failures) == {"1m", "15m"}
+    assert result.source_counts == {"1h": 60}
+    assert result.candles.size == 60
+
+
+def test_synthesize_1m_from_one_hour_candle():
+    result = synthesize_1m_from_higher_tf(_resolution_candles(0), 60)
+
+    assert result.size == 60
+    assert int(result[0]["ts"]) == 0
+    assert int(result[-1]["ts"]) == 59 * ONE_MIN_MS
+    with pytest.raises(ValueError, match="must be > 1"):
+        synthesize_1m_from_higher_tf(_resolution_candles(0), 1)
 
 
 def test_normalize_ccxt_ohlcv_filters_nonfinite_and_nonpositive_rows(tmp_path):
@@ -4116,6 +4295,77 @@ async def test_live_ema_provisionally_fills_bounded_unknown_gap_and_recomputes(
     )
     assert authoritative_ema == pytest.approx(expected_authoritative)
     assert authoritative_ema != pytest.approx(provisional)
+
+
+@pytest.mark.asyncio
+async def test_refreshed_forager_metrics_bridge_bounded_internal_gap(
+    monkeypatch, tmp_path
+):
+    now = 11 * ONE_MIN_MS
+    monkeypatch.setattr("time.time", lambda: now / 1000.0)
+    cm = CandlestickManager(
+        exchange=None,
+        exchange_name="kucoinfutures",
+        cache_dir=str(tmp_path / "caches"),
+        provisional_internal_gap_tolerance_minutes=10,
+    )
+    cm._now_ms_callback = lambda: now
+    symbol = "SPARSE/USDT:USDT"
+    start = 8 * ONE_MIN_MS
+    missing = 9 * ONE_MIN_MS
+    end = 10 * ONE_MIN_MS
+    cm._cache[symbol] = np.array(
+        [
+            (start, 100.0, 101.0, 99.0, 100.0, 1.0),
+            (end, 120.0, 121.0, 119.0, 120.0, 1.0),
+        ],
+        dtype=CANDLE_DTYPE,
+    )
+    cm._add_known_gap(
+        symbol,
+        missing,
+        missing,
+        reason=GAP_REASON_FETCH_FAILED,
+    )
+    spans = {"qv": [3.0], "log_range": [3.0]}
+
+    strict = await cm.get_latest_ema_metric_spans(
+        symbol,
+        spans,
+        allow_remote_fetch=False,
+        allow_provisional_internal_gaps=False,
+    )
+    assert math.isnan(strict["qv"][3.0])
+    assert math.isnan(strict["log_range"][3.0])
+
+    refreshed = await cm.get_latest_ema_metric_spans(
+        symbol,
+        spans,
+        allow_remote_fetch=False,
+        allow_provisional_internal_gaps=True,
+    )
+    expected_qv = cm._ema(np.asarray([100.0, 0.0, 120.0]), 3.0)
+    expected_log_range = cm._ema(
+        np.log(np.asarray([101.0 / 99.0, 1.0, 121.0 / 119.0])),
+        3.0,
+    )
+    assert refreshed["qv"][3.0] == pytest.approx(expected_qv)
+    assert refreshed["log_range"][3.0] == pytest.approx(expected_log_range)
+    qv_context = cm.get_ema_provisional_internal_gap_context(
+        symbol, "qv", 3.0, timeframe="1m"
+    )
+    log_range_context = cm.get_ema_provisional_internal_gap_context(
+        symbol, "log_range", 3.0, timeframe="1m"
+    )
+    assert qv_context == log_range_context
+    assert qv_context["gap_count"] == 1
+    assert qv_context["gap_candles"] == 1
+    assert qv_context["max_gap_candles"] == 1
+    assert qv_context["oldest_gap_age_ms"] == 2 * ONE_MIN_MS
+    assert np.array_equal(
+        cm._cache[symbol]["ts"],
+        np.asarray([start, end], dtype=np.int64),
+    )
 
 
 def test_synthetic_timestamp_retention_uses_replay_clock(monkeypatch, tmp_path):

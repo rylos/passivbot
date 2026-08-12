@@ -99,14 +99,16 @@
    candles: they may use non-persistent zero-volume continuity rows so sparse no-trade intervals
    do not permanently block strategy inputs. The timestamps remain unresolved and retryable;
    delayed authoritative rows replace the provisional values and invalidate affected EMA caches.
-   This exception is selected explicitly by the consumer: cache-only candidate close EMAs and
-   completed-candle forager ranking metrics remain strict, use policy-separated cache entries, and
-   cannot reuse a provisional active-strategy result. Synthetic replacement tracking follows the
+   This exception is selected explicitly by the consumer: completed-candle forager ranking metrics
+   may bridge bounded internal gaps only after the current planning bundle observes that the symbol's
+   authoritative refresh timestamp advanced. Merely allowing a remote fetch is insufficient;
+   cache-only candidate reads remain strict. Synthetic replacement tracking follows the
    manager's live/replay clock so delayed authoritative rows invalidate provisional replay EMAs
-   deterministically.
-   The live orchestrator likewise requests forager quote-volume and log-range through the strict
-   policy even for active symbols. A coincident strategy log-range span may use provisional
-   continuity without leaking that value into the separate `forager_m1` ranking bundle.
+   deterministically. Runtime provenance is retained per symbol, metric, span, and EMA window so
+   live orchestration can report gap count, age, synthetic source, consecutive uses, and recovery.
+   The live orchestrator requests forager quote-volume and log-range with bounded internal-gap
+   continuity only for symbols actually refreshed during that planner bundle; cache-only stale
+   candidates cannot invent zero-volume or zero-range observations.
    Open-ended tails use the separate bounded projection policy below.
    Refresh budgets count
    symbol/timeframe fetches, health scans are bounded and rotated across cycles, interleave each
@@ -185,7 +187,9 @@
    nevertheless symbol-scoped: once every normal side is proven dynamically managed, any missing
    required strategy EMA degrades the whole flat symbol rather than fabricating a partial bundle.
    Missing forager ranking features remain side-scoped because their affected side is authoritative
-   and carried separately from strategy EMA maps. Dynamic-management eligibility is retained in
+   and carried separately from strategy EMA maps. They remain conditional diagnostics, rather than
+   symbol-wide EMA-unavailable state, until Rust reports that ranking was required for that side.
+   Dynamic-management eligibility is retained in
    memory independently of side-scoped cancellation permission when Rust's symbol-level
    nontradable result changes both sides to the configured manual stop mode. This lets the next
    identical missing-ranking cycle remain degraded without authorizing cancellation of an
@@ -210,9 +214,20 @@
    bulk backtest-data download.
 10. Native higher-timeframe EMA windows require full requested coverage on every exchange. WEEX
     additionally requires exact aligned coverage for 1m EMA windows because its recent endpoint
-    silently tail-anchors responses. Exchange-independent trailing-extrema and HSL replay-cache
-    extension consumers also require exact aligned coverage; incomplete windows become unavailable
-    or fall back to authoritative replay.
+    silently tail-anchors responses. HSL restart and live trailing restart reconstruction may fetch
+    1m candles first, then cover only the older leading prefix with 5m, 15m, and 1h candles. The
+    finest available source wins, source counts remain visible, and only coarse buckets ending at
+    or before the first available 1m candle are eligible, so later price action cannot leak backward
+    across the precision boundary.
+
+    Trailing still requires a nonempty exact 1m suffix and its existing dense post-fill coverage
+    and bounded open-tail checks. The first post-fill minute remains the exact reset boundary;
+    deterministic expansion may clip the beginning of a coarse bucket there but never emits an
+    earlier timestamp. Coarse OHLC preserves the old prefix's highs and lows, while the dependent
+    `min_since_max` and `max_since_min` values are explicitly approximate because a higher-timeframe
+    candle cannot prove whether its high or low occurred first. Failure to obtain the exact suffix
+    keeps the affected position side unavailable rather than treating an entirely coarse window as
+    current trailing state.
 11. Quote-volume EMA is derived from normalized CCXT base volume and typical price
     (`base_volume * (high + low + close) / 3`). It is an approximation when an exchange, including
     WEEX, does not expose raw quote turnover through unified OHLCV.
@@ -231,8 +246,10 @@
     Missing rows remain unavailable to ordinary candle consumers until an authoritative row
     arrives. Live strategy EMA reads may provisionally bridge a later-bracketed internal gap with
     non-persistent flat zero-volume rows only when the gap is no wider than
-    `live.max_active_candle_tail_gap_minutes`; cache-only forager ranking carry-forward remains
-    unavailable across an unresolved internal gap. Complete rows in the supplied EMA window remain
+    `live.max_active_candle_tail_gap_minutes`; forager ranking reads use the same bounded internal-gap
+    rule only after an authoritative refresh advances during the current planning bundle, while
+    cache-only forager ranking carry-forward remains unavailable across an unresolved internal gap.
+    Complete rows in the supplied EMA window remain
     authoritative even if stale known-gap metadata still names their timestamps. Recording or
     extending a 1m gap invalidates cached 1m EMA and open-tail projection values. An overlap refresh
     which retries a due gap
@@ -293,6 +310,12 @@
     gate the whole planner cycle. Canonical EMA consumers determine symbol/order-class readiness;
     unavailable values remain absent, never neutralized. Account surfaces and fresh market
     snapshots retain their separate execution barriers.
+16. A `NaN` returned by a completed-candle EMA API represents an empty or incomplete EMA window.
+    The live consumer may recover it only through the explicitly bounded open-tail projection or
+    carry-forward policies above; without such a recovery, it becomes symbol- or action-scoped
+    unavailability. It is never passed to Rust or replaced by an unbounded or fabricated value.
+    Positive or negative infinity is not an availability sentinel and remains a fatal invalid
+    calculation result before any fallback.
 
 Cache paths use `to_standard_exchange_name()` rather than raw CCXT identifiers such as
 `binanceusdm` or `kucoinfutures`.

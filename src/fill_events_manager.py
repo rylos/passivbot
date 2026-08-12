@@ -13,16 +13,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import errno
-import fcntl
 import inspect
 import json
 import logging
 import math
 import os
-import random
 import re
 import shutil
-import tempfile
 import time
 from collections import defaultdict, deque
 from copy import deepcopy
@@ -44,9 +41,21 @@ from config import load_input_config, prepare_config
 from live.diagnostic_safety import bounded_exception_type, exception_text_contains
 
 try:
-    from utils import ts_to_date  # type: ignore
+    from utils import (  # type: ignore
+        AmbiguousMarketIdentifier,
+        MarketIdentifierResolutionError,
+        MarketIdentifierExchangeMismatch,
+        UnknownMarketIdentifier,
+        ts_to_date,
+    )
 except ImportError:  # pragma: no cover - fallback for package-relative execution
-    from .utils import ts_to_date
+    from .utils import (
+        AmbiguousMarketIdentifier,
+        MarketIdentifierResolutionError,
+        MarketIdentifierExchangeMismatch,
+        UnknownMarketIdentifier,
+        ts_to_date,
+    )
 
 from logging_setup import configure_logging
 from procedures import load_user_info
@@ -113,178 +122,6 @@ def _is_disk_full_error(exc: BaseException) -> bool:
     return exception_text_contains(
         exc, ("No space left on device",), case_sensitive=True
     )
-
-
-# ---------------------------------------------------------------------------
-# Rate Limit Coordination
-# ---------------------------------------------------------------------------
-
-# Default rate limits per exchange (calls per minute)
-_DEFAULT_RATE_LIMITS: Dict[str, Dict[str, int]] = {
-    "binance": {"fetch_my_trades": 1200, "fetch_income_history": 120, "default": 1200},
-    "bybit": {"fetch_my_trades": 120, "fetch_positions_history": 120, "default": 120},
-    "bitget": {"fill_history": 120, "fetch_order": 60, "default": 120},
-    "hyperliquid": {"fetch_my_trades": 120, "default": 120},
-    "weex": {"fetch_my_trades": 120, "fetch_order": 60, "default": 120},
-    "gateio": {"fetch_closed_orders": 120, "default": 120},
-    "kucoin": {
-        "fetch_my_trades": 120,
-        "fetch_positions_history": 120,
-        "fetch_order": 60,
-        "default": 120,
-    },
-    # OKX: /fills = 60 req/2s, /fills-history = 10 req/2s (conservative estimates)
-    "okx": {"fetch_my_trades": 1800, "fills_history": 300, "default": 300},
-}
-
-# Window for rate limit tracking (ms)
-_RATE_LIMIT_WINDOW_MS = 60_000
-
-# Default jitter range for staggered startup (seconds)
-_STARTUP_JITTER_MIN = 0.0
-_STARTUP_JITTER_MAX = 30.0
-
-
-class RateLimitCoordinator:
-    """Coordinates rate limiting across multiple bot instances via shared temp file.
-
-    Each exchange has a temp file that logs recent API calls. Instances check this
-    file before making API calls and add jitter if approaching rate limits.
-    """
-
-    def __init__(
-        self,
-        exchange: str,
-        user: str,
-        *,
-        temp_dir: Optional[Path] = None,
-        window_ms: int = _RATE_LIMIT_WINDOW_MS,
-        limits: Optional[Dict[str, int]] = None,
-    ) -> None:
-        self.exchange = exchange.lower()
-        self.user = user
-        self.window_ms = window_ms
-        self.limits = limits or _DEFAULT_RATE_LIMITS.get(self.exchange, {"default": 120})
-
-        if temp_dir is None:
-            temp_dir = Path(tempfile.gettempdir()) / "passivbot_rate_limits"
-        self.temp_dir = temp_dir
-        self.temp_dir.mkdir(parents=True, exist_ok=True)
-        self.temp_file = self.temp_dir / f"{self.exchange}.json"
-
-    def _load_calls(self) -> List[Dict[str, object]]:
-        """Load recent API calls from temp file."""
-        if not self.temp_file.exists():
-            return []
-        try:
-            with self.temp_file.open("r") as f:
-                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
-                try:
-                    data = json.load(f)
-                finally:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-                return data.get("calls", [])
-        except Exception as exc:
-            logger.debug("RateLimitCoordinator: failed to load %s: %s", self.temp_file, exc)
-            return []
-
-    def _save_calls(self, calls: List[Dict[str, object]]) -> None:
-        """Save API calls to temp file atomically."""
-        now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
-
-        # Prune old entries
-        cutoff = now_ms - self.window_ms
-        calls = [c for c in calls if c.get("timestamp_ms", 0) > cutoff]
-
-        data = {
-            "calls": calls,
-            "window_ms": self.window_ms,
-            "limits": self.limits,
-            "last_update": now_ms,
-        }
-
-        tmp_file = self.temp_file.with_suffix(".tmp")
-        try:
-            with tmp_file.open("w") as f:
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                try:
-                    json.dump(data, f)
-                finally:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-            os.replace(tmp_file, self.temp_file)
-        except Exception as exc:
-            logger.debug("RateLimitCoordinator: failed to save %s: %s", self.temp_file, exc)
-
-    def get_current_usage(self, endpoint: str) -> int:
-        """Get current call count for an endpoint in the current window."""
-        calls = self._load_calls()
-        now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
-        cutoff = now_ms - self.window_ms
-        return sum(
-            1 for c in calls if c.get("endpoint") == endpoint and c.get("timestamp_ms", 0) > cutoff
-        )
-
-    def get_limit(self, endpoint: str) -> int:
-        """Get rate limit for an endpoint."""
-        return self.limits.get(endpoint, self.limits.get("default", 120))
-
-    def record_call(self, endpoint: str) -> None:
-        """Record an API call."""
-        calls = self._load_calls()
-        calls.append(
-            {
-                "endpoint": endpoint,
-                "timestamp_ms": int(datetime.now(tz=timezone.utc).timestamp() * 1000),
-                "user": self.user,
-            }
-        )
-        self._save_calls(calls)
-
-    async def wait_if_needed(self, endpoint: str) -> float:
-        """Check rate limit and wait if needed. Returns time waited (seconds)."""
-        current = self.get_current_usage(endpoint)
-        limit = self.get_limit(endpoint)
-
-        if current >= limit:
-            # At or over limit - wait for full window
-            wait_time = self.window_ms / 1000.0
-            logger.info(
-                "RateLimitCoordinator: %s:%s at limit (%d/%d), waiting %.1fs",
-                self.exchange,
-                endpoint,
-                current,
-                limit,
-                wait_time,
-            )
-            await asyncio.sleep(wait_time)
-            return wait_time
-        elif current >= limit * 0.8:
-            # Approaching limit - add jitter
-            jitter = random.uniform(0.1, 2.0)
-            logger.debug(
-                "RateLimitCoordinator: %s:%s approaching limit (%d/%d), jitter %.2fs",
-                self.exchange,
-                endpoint,
-                current,
-                limit,
-                jitter,
-            )
-            await asyncio.sleep(jitter)
-            return jitter
-
-        return 0.0
-
-    @staticmethod
-    async def startup_jitter(
-        min_seconds: float = _STARTUP_JITTER_MIN,
-        max_seconds: float = _STARTUP_JITTER_MAX,
-    ) -> float:
-        """Apply random jitter at startup to stagger multiple bot launches."""
-        jitter = random.uniform(min_seconds, max_seconds)
-        if jitter > 0:
-            logger.info("RateLimitCoordinator: startup jitter %.2fs", jitter)
-            await asyncio.sleep(jitter)
-        return jitter
 
 
 def _format_ms(ts: Optional[int]) -> str:
@@ -1891,20 +1728,11 @@ def _is_close_payload(payload: Dict[str, object]) -> bool:
 # Cache
 # ---------------------------------------------------------------------------
 
-# Maximum retry attempts before marking gap as persistent
-_GAP_MAX_RETRIES = 3
-
-# Gap confidence levels
-GAP_CONFIDENCE_UNKNOWN = 0.0
-GAP_CONFIDENCE_SUSPICIOUS = 0.3
-GAP_CONFIDENCE_LIKELY_LEGITIMATE = 0.7
+# Legacy cache metadata may explicitly mark a range as proven legitimate.
 GAP_CONFIDENCE_CONFIRMED = 1.0
 
-# Gap reasons
-GAP_REASON_AUTO = "auto_detected"
 GAP_REASON_FETCH_FAILED = "fetch_failed"
 GAP_REASON_CONFIRMED = "confirmed_legitimate"
-GAP_REASON_MANUAL = "manual"
 PENDING_PNL_REFRESH_MARGIN_MS = 5 * 60 * 1000
 KUCOIN_POSITION_HISTORY_LOOKAHEAD_MS = 10 * 60 * 1000
 DEGRADED_PNL_REPAIR_MAX_INTERVALS_PER_CYCLE = 4
@@ -1912,14 +1740,14 @@ DEGRADED_PNL_REPAIR_MAX_INTERVAL_SPAN_MS = 24 * 60 * 60 * 1000
 
 
 class KnownGap(TypedDict, total=False):
-    """Gap metadata stored in metadata.json known_gaps."""
+    """Unproven bounded fetch range stored in metadata.json."""
 
     start_ts: int  # Gap start timestamp (ms)
     end_ts: int  # Gap end timestamp (ms)
-    retry_count: int  # Number of fetch attempts (max 3)
-    reason: str  # auto_detected, fetch_failed, confirmed_legitimate, manual
+    retry_count: int  # Diagnostic count; orchestration owns retry timing
+    reason: str  # fetch_failed or legacy confirmed_legitimate
     added_at: int  # Timestamp when gap was first detected
-    confidence: float  # 0.0=unknown, 0.3=suspicious, 0.7=likely_ok, 1.0=confirmed
+    confidence: float  # Legacy compatibility; 1.0 means confirmed legitimate
 
 
 class CacheMetadata(TypedDict, total=False):
@@ -2298,10 +2126,9 @@ class FillEventCache:
         start_ts: int,
         end_ts: int,
         *,
-        reason: str = GAP_REASON_AUTO,
-        confidence: float = GAP_CONFIDENCE_UNKNOWN,
+        reason: str = GAP_REASON_FETCH_FAILED,
     ) -> None:
-        """Add or update a known gap."""
+        """Record a bounded range whose exchange fetch failed."""
         metadata = self.load_metadata()
         gaps = metadata.get("known_gaps", [])
         now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
@@ -2313,10 +2140,12 @@ class FillEventCache:
                 gap["start_ts"] = min(gap["start_ts"], start_ts)
                 gap["end_ts"] = max(gap["end_ts"], end_ts)
                 gap["retry_count"] = gap.get("retry_count", 0) + 1
-                if gap["retry_count"] >= _GAP_MAX_RETRIES:
-                    gap["confidence"] = max(
-                        gap.get("confidence", 0), GAP_CONFIDENCE_LIKELY_LEGITIMATE
-                    )
+                # A current failed traversal is stronger evidence than a
+                # legacy operator classification. Conservatively retry the
+                # merged range instead of letting confirmed metadata hide a
+                # newly unproven extension.
+                gap["reason"] = reason
+                gap.pop("confidence", None)
                 logger.info(
                     "FillEventCache.add_known_gap: updated gap %s → %s (retry_count=%d)",
                     _format_ms(gap["start_ts"]),
@@ -2333,7 +2162,6 @@ class FillEventCache:
             "retry_count": 0,
             "reason": reason,
             "added_at": now_ms,
-            "confidence": confidence,
         }
         gaps.append(new_gap)
         metadata["known_gaps"] = gaps
@@ -2391,17 +2219,26 @@ class FillEventCache:
             return True
         return False
 
-    def should_retry_gap(self, gap: KnownGap) -> bool:
-        """Check if a gap should be retried (retry_count < max)."""
-        return gap.get("retry_count", 0) < _GAP_MAX_RETRIES
-
     def get_coverage_summary(self) -> Dict[str, object]:
         """Return a summary of cache coverage for debugging."""
         metadata = self.load_metadata()
         gaps = metadata.get("known_gaps", [])
 
-        persistent_gaps = [g for g in gaps if not self.should_retry_gap(g)]
-        retryable_gaps = [g for g in gaps if self.should_retry_gap(g)]
+        def is_confirmed_legacy_gap(gap: object) -> bool:
+            if not isinstance(gap, dict):
+                return False
+            try:
+                confidence = float(gap.get("confidence", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                confidence = 0.0
+            return (
+                str(gap.get("reason", "") or "").lower() == GAP_REASON_CONFIRMED
+                or confidence >= GAP_CONFIDENCE_CONFIRMED
+            )
+
+        retryable_gaps = [
+            gap for gap in gaps if not is_confirmed_legacy_gap(gap)
+        ]
 
         total_gap_ms = sum(g["end_ts"] - g["start_ts"] for g in gaps)
 
@@ -2412,7 +2249,10 @@ class FillEventCache:
             "last_refresh_ms": metadata.get("last_refresh_ms", 0),
             "history_scope": self.get_history_scope(),
             "total_gaps": len(gaps),
-            "persistent_gaps": len(persistent_gaps),
+            # Compatibility fields retained for the fill dashboard. Unproven
+            # ranges no longer become terminal merely because a retry count is
+            # exhausted; orchestration owns indefinitely backed-off retries.
+            "persistent_gaps": 0,
             "retryable_gaps": len(retryable_gaps),
             "total_gap_hours": total_gap_ms / (1000 * 60 * 60) if total_gap_ms > 0 else 0,
             "gaps": [
@@ -2970,6 +2810,15 @@ class BitgetFetcher(BaseFetcher):
             return ""
         try:
             resolved = self._symbol_resolver(market_symbol)
+        except UnknownMarketIdentifier:
+            logger.warning(
+                "BitgetFetcher._resolve_symbol: historical symbol '%s' is absent from "
+                "current markets; preserving raw value",
+                market_symbol,
+            )
+            return str(market_symbol)
+        except (AmbiguousMarketIdentifier, MarketIdentifierExchangeMismatch):
+            raise
         except Exception as exc:
             logger.warning(
                 "BitgetFetcher._resolve_symbol: resolver failed for %s error_type=%s; using fallback",
@@ -3608,6 +3457,15 @@ class BinanceFetcher(BaseFetcher):
             resolved = self._symbol_resolver(value)
             if resolved:
                 return resolved
+        except UnknownMarketIdentifier:
+            logger.warning(
+                "BinanceFetcher._resolve_symbol: historical symbol '%s' is absent from "
+                "current markets; preserving raw value",
+                value,
+            )
+            return str(value)
+        except (AmbiguousMarketIdentifier, MarketIdentifierExchangeMismatch):
+            raise
         except Exception as exc:
             logger.warning(
                 "BinanceFetcher._resolve_symbol: resolver failed for %s error_type=%s",
@@ -3632,7 +3490,6 @@ class FillEventsManager:
         user: str,
         fetcher: BaseFetcher,
         cache_path: Path,
-        rate_limit_coordinator: Optional[RateLimitCoordinator] = None,
         fee_pct_fallback: float = DEFAULT_FEE_PCT_FALLBACK,
         fee_pct_sanity_abs_max: float = DEFAULT_FEE_PCT_SANITY_ABS_MAX,
         fee_conversion_max_age_ms: int = DEFAULT_FEE_CONVERSION_MAX_AGE_MS,
@@ -3642,7 +3499,6 @@ class FillEventsManager:
         self.user = user
         self.fetcher = fetcher
         self.cache = FillEventCache(cache_path)
-        self.rate_limiter = rate_limit_coordinator or RateLimitCoordinator(exchange, user)
         self.fee_pct_fallback = float(fee_pct_fallback)
         self.fee_pct_sanity_abs_max = float(fee_pct_sanity_abs_max)
         self.fee_conversion_max_age_ms = int(fee_conversion_max_age_ms)
@@ -5090,15 +4946,20 @@ class FillEventsManager:
                 fetched_events = await self.fetcher.fetch(
                     start_ms, end_ms, detail_cache, on_batch=collect_batch
                 )
-        except RateLimitExceeded:
-            # Preserve bounded-range failures as known gaps so retry logic can
-            # revisit them.  We still re-raise to fail loudly on critical input.
-            if start_ms is not None and end_ms is not None:
+        except Exception:
+            # Preserve failed bounded fill traversals as unproven ranges so
+            # coverage retry can revisit them. PnL-only enrichment does not
+            # invalidate already-proven structural fill coverage. Re-raise so
+            # the caller still owns failure policy.
+            if (
+                degraded_pnl_aux_range is None
+                and start_ms is not None
+                and end_ms is not None
+            ):
                 self.cache.add_known_gap(
                     start_ms,
                     end_ms,
                     reason=GAP_REASON_FETCH_FAILED,
-                    confidence=GAP_CONFIDENCE_UNKNOWN,
                 )
             raise
         finally:
@@ -5448,30 +5309,29 @@ class FillEventsManager:
         *,
         end_ms: Optional[int] = None,
         overlap: int = 20,
-        gap_hours: float = 12.0,
-        force_refetch_gaps: bool = False,
     ) -> bool:
-        """Refresh fills for a requested lookback window using cache-derived coverage.
+        """Prove a requested fill lookback through exchange traversal.
 
         Open-ended lookbacks are tracked in cache metadata so bots can avoid
         re-running the same expensive history bootstrap after restart when the
-        early portion of the lookback legitimately contains no fills.
+        early portion of the lookback legitimately contains no fills. Fill
+        density is not coverage evidence: only a completed exchange fetch may
+        prove an interval, and only a failed bounded fetch creates a known gap.
 
         Returns True only after at least one exchange fill fetch completes.
         """
         await self.ensure_loaded()
         start_ms = int(start_ms)
         if end_ms is not None:
-            await self.refresh_range(
+            await self.refresh(
                 start_ms=start_ms,
-                end_ms=end_ms,
-                gap_hours=gap_hours,
-                overlap=overlap,
-                force_refetch_gaps=force_refetch_gaps,
+                end_ms=int(end_ms),
+                mark_refreshed=False,
             )
             return True
 
         coverage_end_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+        latest_refreshed = False
 
         blocking_gaps = self._blocking_known_gaps(
             start_ms=start_ms,
@@ -5482,8 +5342,6 @@ class FillEventsManager:
             for gap in blocking_gaps:
                 bounds = self._known_gap_bounds(gap)
                 if bounds is None:
-                    continue
-                if not force_refetch_gaps and not self.cache.should_retry_gap(gap):
                     continue
                 gap_start, gap_end = bounds
                 retry_start = max(start_ms, gap_start)
@@ -5496,20 +5354,28 @@ class FillEventsManager:
                     _format_ms(retry_start),
                     _format_ms(retry_end),
                 )
-                await self.refresh(start_ms=retry_start, end_ms=retry_end)
+                await self.refresh(
+                    start_ms=retry_start,
+                    end_ms=retry_end,
+                    # A bounded historical retry does not prove the recent
+                    # tail. Let the subsequent tail refresh advance the
+                    # incremental checkpoint only after it succeeds.
+                    mark_refreshed=False,
+                )
             if retried_ranges:
                 await self.refresh_latest(overlap=overlap)
+                latest_refreshed = True
                 blocking_gaps = self._blocking_known_gaps(
                     start_ms=start_ms,
                     end_ms=coverage_end_ms,
                 )
             if blocking_gaps:
                 if not retried_ranges:
-                    # Historical coverage may remain blocked after its bounded
-                    # retry budget is exhausted. A recent refresh is still
-                    # required so trailing confirmation can prove its fill
-                    # cache current without weakening the PnL coverage gate.
+                    # Malformed legacy evidence cannot identify a bounded retry
+                    # range. Keep recent structural confirmation current while
+                    # the coverage verdict remains fail-closed.
                     await self.refresh_latest(overlap=overlap)
+                    latest_refreshed = True
                 gap = blocking_gaps[0]
                 bounds = self._known_gap_bounds(gap)
                 range_label = (
@@ -5519,12 +5385,11 @@ class FillEventsManager:
                 )
                 gap_info = gap if isinstance(gap, dict) else {}
                 logger.warning(
-                    "[fills] lookback coverage remains unproven because known gap overlaps requested window | start=%s gap=%s reason=%s retry_count=%s confidence=%s",
+                    "[fills] lookback coverage remains unproven because failed fetch range overlaps requested window | start=%s gap=%s reason=%s retry_count=%s",
                     _format_ms(start_ms),
                     range_label,
                     str(gap_info.get("reason", "malformed")),
                     str(gap_info.get("retry_count", "unknown")),
-                    str(gap_info.get("confidence", "unknown")),
                 )
                 return True
 
@@ -5541,7 +5406,8 @@ class FillEventsManager:
                 _format_ms(covered_start_ms) if covered_start_ms else "None",
                 _format_ms(oldest_event_ts) if oldest_event_ts else "None",
             )
-            await self.refresh_latest(overlap=overlap)
+            if not latest_refreshed:
+                await self.refresh_latest(overlap=overlap)
             return True
 
         if coverage_status.get("reason") == "cache_metadata_event_mismatch":
@@ -5550,30 +5416,11 @@ class FillEventsManager:
                 _format_ms(covered_start_ms),
             )
 
-        if self._events:
-            if oldest_event_ts > 0 and oldest_event_ts <= start_ms:
-                logger.info(
-                    "[fills] lookback coverage unproven from %s despite older cached fill at %s; refreshing full lookback",
-                    _format_ms(start_ms),
-                    _format_ms(oldest_event_ts),
-                )
-                await self.refresh(start_ms=start_ms, end_ms=None)
-                await self.refresh_latest(overlap=overlap)
-            else:
-                logger.info(
-                    "[fills] lookback uncovered from %s; refreshing missing range before latest",
-                    _format_ms(start_ms),
-                )
-                await self.refresh_range(
-                    start_ms=start_ms,
-                    end_ms=None,
-                    gap_hours=gap_hours,
-                    overlap=overlap,
-                    force_refetch_gaps=force_refetch_gaps,
-                )
-        else:
-            logger.info("[fills] cache empty; refreshing full lookback from %s", _format_ms(start_ms))
-            await self.refresh(start_ms=start_ms, end_ms=None)
+        logger.info(
+            "[fills] lookback coverage unproven from %s; traversing the full requested window",
+            _format_ms(start_ms),
+        )
+        await self.refresh(start_ms=start_ms, end_ms=None)
 
         self.cache.mark_covered_start(start_ms)
         return True
@@ -5700,101 +5547,21 @@ class FillEventsManager:
         self,
         start_ms: int,
         end_ms: Optional[int],
-        *,
-        gap_hours: float = 12.0,
-        overlap: int = 20,
-        force_refetch_gaps: bool = False,
     ) -> None:
-        """Fill missing data between `start_ms` and `end_ms` using gap heuristics.
+        """Refresh the exact requested interval.
 
-        Args:
-            start_ms: Start timestamp in milliseconds
-            end_ms: End timestamp in milliseconds (or None for now)
-            gap_hours: Threshold for detecting gaps (default 12 hours)
-            overlap: Number of events to overlap when fetching latest
-            force_refetch_gaps: If True, retry even persistent gaps
+        Fill timestamps are irregular, so spacing between cached events is not
+        evidence of missing history. The exchange fetcher owns complete
+        traversal of this interval.
         """
         await self.ensure_loaded()
-        intervals: List[Tuple[int, int]] = []
-
-        # Get known gaps from cache metadata
-        known_gaps = self.cache.get_known_gaps()
-
-        def is_in_persistent_gap(ts_start: int, ts_end: int) -> bool:
-            """Check if interval is fully within a persistent (max retries) gap."""
-            if force_refetch_gaps:
-                return False
-            for gap in known_gaps:
-                if ts_start >= gap["start_ts"] and ts_end <= gap["end_ts"]:
-                    if not self.cache.should_retry_gap(gap):
-                        return True
-            return False
-
-        if not self._events:
-            logger.debug("[fills] refresh_range: cache empty, refreshing entire interval")
-            await self.refresh(start_ms=start_ms, end_ms=end_ms)
-            if self._events:
-                await self.refresh_latest(overlap=overlap)
-            return
-
-        events_sorted = self._events
-        earliest = events_sorted[0].timestamp
-        latest = events_sorted[-1].timestamp
-        gap_ms = max(1, int(gap_hours * 60.0 * 60.0 * 1000.0))
-
-        # Fetch older data before earliest cached if requested
-        if start_ms < earliest:
-            upper = earliest if end_ms is None else min(earliest, end_ms)
-            if start_ms < upper and not is_in_persistent_gap(start_ms, upper):
-                intervals.append((start_ms, upper))
-
-        # Detect large gaps in cached data
-        prev_ts = earliest
-        for ev in events_sorted[1:]:
-            cur_ts = ev.timestamp
-            if end_ms is not None and cur_ts > end_ms:
-                break
-            if cur_ts - prev_ts >= gap_ms:
-                gap_start = max(prev_ts, start_ms)
-                gap_end = cur_ts
-                if gap_start < gap_end:
-                    if is_in_persistent_gap(gap_start, gap_end):
-                        logger.debug(
-                            "FillEventsManager.refresh_range: skipping persistent gap %s → %s",
-                            _format_ms(gap_start),
-                            _format_ms(gap_end),
-                        )
-                    else:
-                        intervals.append((gap_start, gap_end))
-                        # Record as potential gap for tracking
-                        self.cache.add_known_gap(
-                            gap_start,
-                            gap_end,
-                            reason=GAP_REASON_AUTO,
-                            confidence=GAP_CONFIDENCE_SUSPICIOUS,
-                        )
-            prev_ts = cur_ts
-
-        # Fetch newer data after latest cached if requested (if not already covered)
-        if end_ms is not None and end_ms > latest and (not intervals or intervals[-1][1] != end_ms):
-            lower = max(latest, start_ms)
-            if lower < end_ms and not is_in_persistent_gap(lower, end_ms):
-                intervals.append((lower, end_ms))
-
-        merged = self._merge_intervals(intervals)
-        if merged:
-            logger.debug(
-                "[fills] refresh_range: refreshing %d intervals: %s",
-                len(merged),
-                ", ".join(f"{_format_ms(start)} → {_format_ms(end)}" for start, end in merged),
-            )
-        else:
-            logger.debug("[fills] refresh_range: no gaps detected in requested interval")
-
-        for start, end in merged:
-            await self.refresh(start_ms=start, end_ms=end)
-
-        await self.refresh_latest(overlap=overlap)
+        await self.refresh(
+            start_ms=int(start_ms),
+            end_ms=None if end_ms is None else int(end_ms),
+            # A bounded historical repair does not prove the recent tail and
+            # must not advance the incremental refresh checkpoint.
+            mark_refreshed=end_ms is None,
+        )
 
     def get_events(
         self,
@@ -8392,6 +8159,8 @@ def _symbol_resolver(bot) -> Callable[[Optional[str]], str]:
             mapped = bot.coin_to_symbol(value, verbose=False)
             if mapped:
                 return mapped
+        except MarketIdentifierResolutionError:
+            raise
         except Exception:
             pass
         upper = value.upper()

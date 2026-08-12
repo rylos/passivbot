@@ -14,6 +14,7 @@ from candlestick_manager import (
     ONE_MIN_MS,
     _floor_minute,
 )
+from passivbot_exceptions import FatalBotException
 
 ONE_HOUR_MS = 3_600_000
 
@@ -64,115 +65,6 @@ async def test_get_latest_ema_close_no_candles_returns_nan(tmp_path, monkeypatch
     assert math.isnan(ema)
 
 
-# ---------------------------------------------------------------------------
-# MissingEma graceful handling in passivbot.py
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_missing_ema_raises_from_snapshot(monkeypatch):
-    """MissingEma in calc_ideal_orders_orchestrator_from_snapshot re-raises."""
-    try:
-        import passivbot as pb_mod
-    except ImportError:
-        pytest.skip("passivbot module not importable in test environment")
-
-    class FakeBot:
-        positions = {}
-        balance = 1000.0
-        PB_modes = {}
-        effective_min_cost = {}
-        _config_hedge_mode = False
-        hedge_mode = False
-        equity_hard_stop_loss = {"panic_close_order_type": "limit"}
-
-        def config_get(self, keys):
-            return None
-
-        def _bot_params_to_rust_dict(self, pside, symbol):
-            return {}
-
-        def live_value(self, key):
-            return False
-
-        def get_raw_balance(self):
-            return float(getattr(self, "balance", 0.0) or 0.0)
-
-        def get_hysteresis_snapped_balance(self):
-            return float(getattr(self, "balance", 0.0) or 0.0)
-
-    snapshot = {
-        "symbols": [],
-        "last_prices": {},
-        "m1_close_emas": {},
-        "m1_volume_emas": {},
-        "m1_log_range_emas": {},
-        "h1_log_range_emas": {},
-        "unstuck_allowances": {"long": 0.0, "short": 0.0},
-    }
-
-    def fake_compute(json_str):
-        raise Exception("MissingEma { symbol_idx: 0 }")
-
-    monkeypatch.setattr(pb_mod.pbr, "compute_ideal_orders_json", fake_compute)
-
-    bot = FakeBot()
-    method = pb_mod.Passivbot.calc_ideal_orders_orchestrator_from_snapshot
-    with pytest.raises(Exception, match="MissingEma"):
-        await method(bot, snapshot, return_snapshot=False)
-
-
-@pytest.mark.asyncio
-async def test_missing_ema_raises_from_snapshot_with_return(monkeypatch):
-    """MissingEma with return_snapshot=True also re-raises."""
-    try:
-        import passivbot as pb_mod
-    except ImportError:
-        pytest.skip("passivbot module not importable in test environment")
-
-    class FakeBot:
-        positions = {}
-        balance = 1000.0
-        PB_modes = {}
-        effective_min_cost = {}
-        _config_hedge_mode = False
-        hedge_mode = False
-        equity_hard_stop_loss = {"panic_close_order_type": "limit"}
-
-        def config_get(self, keys):
-            return None
-
-        def _bot_params_to_rust_dict(self, pside, symbol):
-            return {}
-
-        def live_value(self, key):
-            return False
-
-        def get_raw_balance(self):
-            return float(getattr(self, "balance", 0.0) or 0.0)
-
-        def get_hysteresis_snapped_balance(self):
-            return float(getattr(self, "balance", 0.0) or 0.0)
-
-    snapshot = {
-        "symbols": [],
-        "last_prices": {},
-        "m1_close_emas": {},
-        "m1_volume_emas": {},
-        "m1_log_range_emas": {},
-        "h1_log_range_emas": {},
-        "unstuck_allowances": {"long": 0.0, "short": 0.0},
-    }
-
-    def fake_compute(json_str):
-        raise Exception("MissingEma { symbol_idx: 0 }")
-
-    monkeypatch.setattr(pb_mod.pbr, "compute_ideal_orders_json", fake_compute)
-
-    bot = FakeBot()
-    method = pb_mod.Passivbot.calc_ideal_orders_orchestrator_from_snapshot
-    with pytest.raises(Exception, match="MissingEma"):
-        await method(bot, snapshot, return_snapshot=True)
 
 
 def _rust_bot_params(**overrides):
@@ -467,6 +359,8 @@ class _BundleReproBot:
                     raise TimeoutError("quote volume timeout")
                 if self.outer.qv_mode == "nan":
                     return float("nan")
+                if self.outer.qv_mode == "inf":
+                    return float("inf")
                 return 250000.0
 
             async def get_latest_ema_log_range(
@@ -493,6 +387,8 @@ class _BundleReproBot:
                     raise TimeoutError("log range timeout")
                 if self.outer.lr1m_mode == "nan":
                     return float("nan")
+                if self.outer.lr1m_mode == "inf":
+                    return float("inf")
                 return 0.0015
 
             def get_completed_candle_health(self, symbol, windows=None, now_ms=None):
@@ -665,7 +561,8 @@ class _BundleReproBot:
 
 
 @pytest.mark.asyncio
-async def test_held_symbol_missing_ema_is_explicitly_scoped_for_rust():
+@pytest.mark.parametrize("close_mode", ["timeout", "nan"])
+async def test_held_symbol_missing_ema_is_explicitly_scoped_for_rust(close_mode):
     try:
         import passivbot as pb_mod
         import passivbot_rust as pbr
@@ -676,7 +573,7 @@ async def test_held_symbol_missing_ema_is_explicitly_scoped_for_rust():
         pytest.skip("requires real passivbot_rust extension")
 
     symbol = "AVAX/USDT:USDT"
-    bot = _BundleReproBot(symbol, close_mode="timeout")
+    bot = _BundleReproBot(symbol, close_mode=close_mode)
     (
         m1_close_emas,
         m1_volume_emas,
@@ -707,15 +604,55 @@ async def test_held_symbol_missing_ema_is_explicitly_scoped_for_rust():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("close_mode", ["nan", "inf"])
-async def test_held_symbol_nonfinite_close_ema_remains_fatal(close_mode):
+async def test_nan_close_ema_scopes_only_the_affected_symbol():
+    try:
+        import passivbot as pb_mod
+    except ImportError:
+        pytest.skip("passivbot module not importable in test environment")
+
+    unavailable_symbol = "AVAX/USDT:USDT"
+    ready_symbol = "SOL/USDT:USDT"
+    symbols = [unavailable_symbol, ready_symbol]
+    bot = _BundleReproBot(unavailable_symbol, close_mode="value")
+    bot.PB_modes = {
+        "long": {symbol: "normal" for symbol in symbols},
+        "short": {symbol: "manual" for symbol in symbols},
+    }
+    bot.positions = {
+        symbol: {
+            "long": {"size": 0.0, "price": 0.0},
+            "short": {"size": 0.0, "price": 0.0},
+        }
+        for symbol in symbols
+    }
+
+    async def symbol_close(symbol, span, **_kwargs):
+        del span
+        return float("nan") if symbol == unavailable_symbol else 123.0
+
+    bot.cm.get_latest_ema_close = symbol_close
+
+    result = await pb_mod.Passivbot._load_orchestrator_ema_bundle(
+        bot, symbols, bot.PB_modes
+    )
+
+    assert result[0][unavailable_symbol] == {}
+    assert result[0][ready_symbol]
+    assert set(result[0][ready_symbol].values()) == {123.0}
+    assert bot._orchestrator_allow_missing_strategy_inputs_symbols == {
+        unavailable_symbol
+    }
+
+
+@pytest.mark.asyncio
+async def test_held_symbol_infinite_close_ema_remains_fatal():
     try:
         import passivbot as pb_mod
     except ImportError:
         pytest.skip("passivbot module not importable in test environment")
 
     symbol = "AVAX/USDT:USDT"
-    bot = _BundleReproBot(symbol, close_mode=close_mode)
+    bot = _BundleReproBot(symbol, close_mode="inf")
 
     with pytest.raises(RuntimeError, match="non-finite close EMA value"):
         await pb_mod.Passivbot._load_orchestrator_ema_bundle(
@@ -1017,12 +954,9 @@ async def test_disabled_opposite_side_does_not_block_flat_forager_degradation():
         {"long": {symbol: None}, "short": {symbol: None}},
     )
 
-    assert bot._orchestrator_ema_unavailable_symbols == {symbol}
-    assert bot._orchestrator_ema_unavailable_reasons == {
-        "missing_required_forager_volume+missing_required_forager_log_range": {
-            symbol
-        }
-    }
+    assert bot._orchestrator_ema_unavailable_symbols == set()
+    assert bot._orchestrator_ema_unavailable_reasons == {}
+    assert bot._orchestrator_allow_missing_strategy_inputs_symbols == {symbol}
     assert bot._orchestrator_ema_entry_cancellation_order_keys == {
         (symbol, "long", "exchange_id", "ondo-forager-entry")
     }
@@ -1129,9 +1063,7 @@ async def test_forager_ranking_ema_degradation_authorizes_resting_entry_cancel()
         bot, [symbol], mode_overrides
     )
 
-    assert bot._orchestrator_ema_unavailable_reasons == {
-        "missing_required_forager_volume": {symbol}
-    }
+    assert bot._orchestrator_ema_unavailable_reasons == {}
     assert bot._orchestrator_ema_entry_cancellation_order_keys == {
         (
             symbol,
@@ -1213,11 +1145,8 @@ async def test_forager_ranking_degradation_authorizes_only_affected_side():
         symbol: {"long", "short"}
     }
 
-    # Rust's symbol-level tradable=false result may move both sides to manual
-    # even though only the long ranking feature was missing. Preserve dynamic
-    # eligibility independently of cancellation scope: the remaining short
-    # entry must not turn the next identical gap into an account-fatal error,
-    # and it must not become cancellable.
+    # Preserve dynamic eligibility independently of cancellation scope: the
+    # remaining short entry must not become cancellable.
     bot.PB_modes = {
         "long": {symbol: "manual"},
         "short": {symbol: "manual"},
@@ -1232,9 +1161,7 @@ async def test_forager_ranking_degradation_authorizes_only_affected_side():
         [symbol],
         {"long": {symbol: None}, "short": {symbol: None}},
     )
-    assert bot._orchestrator_ema_unavailable_reasons == {
-        "missing_required_forager_volume": {symbol}
-    }
+    assert bot._orchestrator_ema_unavailable_reasons == {}
     assert bot._orchestrator_ema_entry_cancellation_order_keys == set()
     assert bot._orchestrator_dynamic_forager_eligibility_psides_by_symbol == {
         symbol: {"long", "short"}
@@ -1296,7 +1223,10 @@ def test_trailing_grid_v7_py_orchestrator_rejects_incomplete_strategy_params():
 
 
 @pytest.mark.asyncio
-async def test_kucoin_avax_close_ema_fallback_uses_previous_ema_not_price(caplog):
+@pytest.mark.parametrize("close_mode", ["timeout", "nan"])
+async def test_kucoin_avax_close_ema_fallback_uses_previous_ema_not_price(
+    caplog, close_mode
+):
     try:
         import passivbot as pb_mod
     except ImportError:
@@ -1307,7 +1237,12 @@ async def test_kucoin_avax_close_ema_fallback_uses_previous_ema_not_price(caplog
     span1 = 20.0
     span2 = (span0 * span1) ** 0.5
     prev = {span0: 100.04, span1: 100.03, span2: 100.02}
-    bot = _BundleReproBot(symbol, close_mode="timeout", close_value=110.37, prev_close_ema=prev)
+    bot = _BundleReproBot(
+        symbol,
+        close_mode=close_mode,
+        close_value=110.37,
+        prev_close_ema=prev,
+    )
 
     with caplog.at_level(logging.WARNING):
         (
@@ -1638,7 +1573,7 @@ def _enable_forager_required_ranking(bot):
 
 
 @pytest.mark.asyncio
-async def test_explicit_normal_missing_required_forager_features_fails_loudly():
+async def test_explicit_normal_missing_required_forager_features_are_scoped_to_rust():
     try:
         import passivbot as pb_mod
     except ImportError:
@@ -1658,13 +1593,227 @@ async def test_explicit_normal_missing_required_forager_features_fails_loudly():
     _enable_forager_required_ranking(bot)
     mode_overrides = {"long": {symbol: "normal"}, "short": {symbol: "manual"}}
 
-    with pytest.raises(
-        RuntimeError,
-        match=r"missing required forager EMA for active/normal symbol HYPE/USDT:USDT",
+    result = await pb_mod.Passivbot._load_orchestrator_ema_bundle(
+        bot, [symbol], mode_overrides
+    )
+
+    assert result[0][symbol]
+    assert result[1][symbol] == {}
+    assert bot._orchestrator_ema_unavailable_symbols == set()
+    assert bot._orchestrator_allow_missing_strategy_inputs_symbols == {symbol}
+    assert bot._orchestrator_candidate_ema_unavailable_symbols == set()
+    assert bot._forager_rank_feature_unavailable_by_side == {
+        "long": {symbol},
+        "short": {symbol},
+    }
+
+
+@pytest.mark.asyncio
+async def test_forager_internal_gap_retry_requires_actual_refresh_provenance():
+    try:
+        import passivbot as pb_mod
+    except ImportError:
+        pytest.skip("passivbot module not importable in test environment")
+
+    symbol = "HYPE/USDT:USDT"
+    bot = _BundleReproBot(symbol, close_mode="value")
+    _enable_forager_required_ranking(bot)
+    bot.cm.get_last_refresh_ms = lambda _symbol: 100
+
+    async def quote_volume(
+        _symbol,
+        span,
+        max_age_ms=60_000,
+        allow_remote_fetch=True,
+        allow_provisional_internal_gaps=None,
     ):
+        bot.qv_provisional_flags.append(allow_provisional_internal_gaps)
+        return 250000.0 if allow_provisional_internal_gaps else float("nan")
+
+    async def log_range(
+        _symbol,
+        span,
+        tf=None,
+        max_age_ms=60_000,
+        allow_remote_fetch=True,
+        allow_provisional_internal_gaps=None,
+    ):
+        bot.lr_provisional_flags.append((tf or "1m", allow_provisional_internal_gaps))
+        return 0.0015 if allow_provisional_internal_gaps else float("nan")
+
+    bot.cm.get_latest_ema_quote_volume = quote_volume
+    bot.cm.get_latest_ema_log_range = log_range
+
+    result = await pb_mod.Passivbot._load_orchestrator_ema_bundle(
+        bot, [symbol], bot.PB_modes
+    )
+
+    assert result[1][symbol] == {}
+    assert bot._orchestrator_forager_m1_log_range_emas[symbol] == {}
+    assert bot.qv_provisional_flags == [False]
+    assert [flag for _tf, flag in bot.lr_provisional_flags if flag is not None] == [
+        False
+    ]
+
+
+@pytest.mark.asyncio
+async def test_forager_internal_gap_retry_follows_successful_bundle_refresh():
+    try:
+        import passivbot as pb_mod
+    except ImportError:
+        pytest.skip("passivbot module not importable in test environment")
+
+    symbol = "HYPE/USDT:USDT"
+    bot = _BundleReproBot(symbol, close_mode="value")
+    _enable_forager_required_ranking(bot)
+    refresh = {"value": 100}
+    bot.cm.get_last_refresh_ms = lambda _symbol: refresh["value"]
+
+    async def quote_volume(
+        _symbol,
+        span,
+        max_age_ms=60_000,
+        allow_remote_fetch=True,
+        allow_provisional_internal_gaps=None,
+    ):
+        bot.qv_provisional_flags.append(allow_provisional_internal_gaps)
+        if not allow_provisional_internal_gaps:
+            refresh["value"] += 1
+            return float("nan")
+        return 250000.0
+
+    async def log_range(
+        _symbol,
+        span,
+        tf=None,
+        max_age_ms=60_000,
+        allow_remote_fetch=True,
+        allow_provisional_internal_gaps=None,
+    ):
+        bot.lr_provisional_flags.append((tf or "1m", allow_provisional_internal_gaps))
+        if not allow_provisional_internal_gaps:
+            refresh["value"] += 1
+            return float("nan")
+        return 0.0015
+
+    bot.cm.get_latest_ema_quote_volume = quote_volume
+    bot.cm.get_latest_ema_log_range = log_range
+
+    result = await pb_mod.Passivbot._load_orchestrator_ema_bundle(
+        bot, [symbol], bot.PB_modes
+    )
+
+    assert result[1][symbol][10.0] == pytest.approx(250000.0)
+    assert bot._orchestrator_forager_m1_log_range_emas[symbol][10.0] == pytest.approx(
+        0.0015
+    )
+    assert bot.qv_provisional_flags == [False, True]
+    assert [flag for _tf, flag in bot.lr_provisional_flags if flag is not None] == [
+        False,
+        True,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_forager_provisional_internal_gap_logs_use_count_and_recovery(caplog):
+    try:
+        import passivbot as pb_mod
+    except ImportError:
+        pytest.skip("passivbot module not importable in test environment")
+
+    symbol = "HYPE/USDT:USDT"
+    bot = _BundleReproBot(symbol, close_mode="value")
+    _enable_forager_required_ranking(bot)
+    context = {
+        "gap_count": 1,
+        "gap_candles": 2,
+        "max_gap_candles": 2,
+        "oldest_gap_age_ms": 180_000,
+    }
+    current_context = {"value": context}
+    refresh = {"value": 100}
+    authoritative = {"value": False}
+    bot.cm.get_last_refresh_ms = lambda _symbol: refresh["value"]
+
+    async def quote_volume(
+        _symbol,
+        span,
+        max_age_ms=60_000,
+        allow_remote_fetch=True,
+        allow_provisional_internal_gaps=None,
+    ):
+        if not allow_provisional_internal_gaps:
+            if authoritative["value"]:
+                return 250000.0
+            refresh["value"] += 1
+            return float("nan")
+        return 250000.0
+
+    async def log_range(
+        _symbol,
+        span,
+        tf=None,
+        max_age_ms=60_000,
+        allow_remote_fetch=True,
+        allow_provisional_internal_gaps=None,
+    ):
+        if not allow_provisional_internal_gaps:
+            if authoritative["value"]:
+                return 0.0015
+            refresh["value"] += 1
+            return float("nan")
+        return 0.0015
+
+    bot.cm.get_latest_ema_quote_volume = quote_volume
+    bot.cm.get_latest_ema_log_range = log_range
+    bot.cm.get_ema_provisional_internal_gap_context = (
+        lambda _symbol, _metric, _span, **_kwargs: current_context["value"]
+    )
+
+    with caplog.at_level(logging.DEBUG):
         await pb_mod.Passivbot._load_orchestrator_ema_bundle(
-            bot, [symbol], mode_overrides
+            bot, [symbol], bot.PB_modes
         )
+        await pb_mod.Passivbot._load_orchestrator_ema_bundle(
+            bot, [symbol], bot.PB_modes
+        )
+
+    assert bot._orchestrator_forager_gap_fallback_counts == {
+        (symbol, "quote_volume"): 2,
+        (symbol, "log_range"): 2,
+    }
+    fallback_logs = [
+        record
+        for record in caplog.records
+        if "forager ranking provisional internal-gap fallback" in record.message
+        and "recovered" not in record.message
+    ]
+    assert fallback_logs
+    assert any(record.levelno == logging.WARNING for record in fallback_logs)
+    assert any(
+        "source=synthetic_zero_volume_continuity" in record.message
+        for record in fallback_logs
+    )
+    assert any("consecutive_uses=2" in record.message for record in fallback_logs)
+
+    authoritative["value"] = True
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        await pb_mod.Passivbot._load_orchestrator_ema_bundle(
+            bot, [symbol], bot.PB_modes
+        )
+
+    assert bot._orchestrator_forager_gap_fallback_counts == {
+        (symbol, "quote_volume"): 0,
+        (symbol, "log_range"): 0,
+    }
+    recoveries = [
+        record.message
+        for record in caplog.records
+        if "provisional internal-gap fallback recovered" in record.message
+    ]
+    assert len(recoveries) == 2
+    assert all("after_consecutive_uses=2" in message for message in recoveries)
 
 
 @pytest.mark.asyncio
@@ -1712,6 +1861,42 @@ async def test_active_forager_required_features_use_bounded_cached_carry_forward
         int(call["max_staleness_ms"]) >= 60_000
         for call in bot.cached_metric_calls
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("qv_mode", "lr1m_mode", "error_match"),
+    [
+        ("inf", "value", "non-finite m1_volume value"),
+        ("value", "inf", "non-finite m1_log_range value"),
+    ],
+)
+async def test_required_forager_infinity_is_fatal_before_cached_carry_forward(
+    qv_mode, lr1m_mode, error_match
+):
+    try:
+        import passivbot as pb_mod
+    except ImportError:
+        pytest.skip("passivbot module not importable in test environment")
+
+    symbol = "AAVE/USDT:USDT"
+    bot = _BundleReproBot(
+        symbol,
+        close_mode="value",
+        qv_mode=qv_mode,
+        lr1m_mode=lr1m_mode,
+        cached_qv_ema={10.0: 250000.0},
+        cached_log_range_ema={10.0: 0.0015},
+    )
+    _enable_forager_required_ranking(bot)
+    mode_overrides = {"long": {symbol: "normal"}, "short": {symbol: "manual"}}
+
+    with pytest.raises(RuntimeError, match=error_match):
+        await pb_mod.Passivbot._load_orchestrator_ema_bundle(
+            bot, [symbol], mode_overrides
+        )
+
+    assert bot.cached_metric_calls == []
 
 
 @pytest.mark.asyncio
@@ -1830,7 +2015,7 @@ async def test_active_forager_open_tail_projects_strategy_required_log_range():
 
 
 @pytest.mark.asyncio
-async def test_candidate_only_missing_required_forager_features_marks_unavailable(caplog):
+async def test_candidate_only_missing_required_forager_features_stays_conditional(caplog):
     try:
         import passivbot as pb_mod
         from live.event_bus import EventTypes
@@ -1849,8 +2034,9 @@ async def test_candidate_only_missing_required_forager_features_marks_unavailabl
         lr1m_mode="nan",
     )
     bot.PB_modes = {"long": {}, "short": {}}
-    bot.cm.get_last_refresh_ms = lambda _symbol: int(time.time() * 1000)
-    bot.cm.get_last_final_ts = lambda _symbol: int(time.time() * 1000)
+    now_ms = int(time.time() * 1000)
+    bot.cm.get_last_refresh_ms = lambda _symbol: now_ms
+    bot.cm.get_last_final_ts = lambda _symbol: now_ms
     bot._candle_staleness_ms = lambda _symbol, now_ms=None: 0
     _enable_forager_required_ranking(bot)
     events = []
@@ -1878,8 +2064,13 @@ async def test_candidate_only_missing_required_forager_features_marks_unavailabl
     assert m1_log_range_emas[symbol] == {}
     assert symbol not in volumes_long
     assert symbol not in log_ranges_long
-    assert bot._orchestrator_ema_unavailable_symbols == {symbol}
-    assert bot._orchestrator_candidate_ema_unavailable_symbols == {symbol}
+    assert bot._orchestrator_ema_unavailable_symbols == set()
+    assert bot._orchestrator_allow_missing_strategy_inputs_symbols == {symbol}
+    assert bot._orchestrator_candidate_ema_unavailable_symbols == set()
+    assert bot._forager_rank_feature_unavailable_by_side == {
+        "long": {symbol},
+        "short": {symbol},
+    }
     assert not any(
         "missing required forager EMA HYPE" in record.message
         and "action=mark_nontradable_until_fresh" in record.message
@@ -1892,14 +2083,10 @@ async def test_candidate_only_missing_required_forager_features_marks_unavailabl
         if event_type == EventTypes.EMA_UNAVAILABLE
     ]
     assert len(unavailable_events) == 1
+    assert unavailable_events[0]["level"] == "debug"
     event_data = unavailable_events[0]["data"]
     assert event_data["candidate_unavailable"]["count"] == 0
-    assert event_data["unavailable"]["sample"] == [symbol]
-    assert any(
-        group["reason"] == "missing_required_forager_volume+missing_required_forager_log_range"
-        and group["symbols"]["sample"] == [symbol]
-        for group in event_data["unavailable_reasons"]
-    )
+    assert event_data["unavailable"]["count"] == 0
 
 
 @pytest.mark.asyncio
@@ -2043,7 +2230,7 @@ async def test_open_tail_projection_precedes_previous_close_ema_fallback():
 
 
 @pytest.mark.asyncio
-async def test_late_open_tail_projection_does_not_mask_nonfinite_close_ema():
+async def test_late_open_tail_projection_recovers_nan_close_ema():
     try:
         import passivbot as pb_mod
     except ImportError:
@@ -2062,18 +2249,18 @@ async def test_late_open_tail_projection_does_not_mask_nonfinite_close_ema():
     )
     bot.projected_open_tail_called = False
 
-    with pytest.raises(RuntimeError, match="non-finite close EMA value"):
-        await pb_mod.Passivbot._load_orchestrator_ema_bundle(
-            bot, [symbol], bot.PB_modes
-        )
+    result = await pb_mod.Passivbot._load_orchestrator_ema_bundle(
+        bot, [symbol], bot.PB_modes
+    )
 
     assert bot.completed_candle_health_calls >= 2
-    assert bot.projected_open_tail_called is False
+    assert bot.projected_open_tail_called is True
+    assert result[0][symbol] == pytest.approx(projected)
     assert bot._orchestrator_close_ema_fallback_counts == {}
 
 
 @pytest.mark.asyncio
-async def test_nonfinite_close_ema_is_fatal_before_projection_or_previous_fallback():
+async def test_infinite_close_ema_is_fatal_before_projection_or_previous_fallback():
     try:
         import passivbot as pb_mod
     except ImportError:
@@ -2084,13 +2271,10 @@ async def test_nonfinite_close_ema_is_fatal_before_projection_or_previous_fallba
     span1 = 20.0
     span2 = (span0 * span1) ** 0.5
     prev = {span0: 100.04, span1: 100.03, span2: 100.02}
-    projected = {span0: 201.0, span1: 202.0, span2: 203.0}
     bot = _BundleReproBot(
         symbol,
-        close_mode="nan",
+        close_mode="inf",
         prev_close_ema=prev,
-        project_open_tail_after_health_calls=1,
-        projected_close_ema=projected,
     )
     bot.projected_open_tail_called = False
 
@@ -2099,13 +2283,12 @@ async def test_nonfinite_close_ema_is_fatal_before_projection_or_previous_fallba
             bot, [symbol], bot.PB_modes
         )
 
-    assert bot.completed_candle_health_calls >= 2
     assert bot.projected_open_tail_called is False
     assert bot._orchestrator_close_ema_fallback_counts == {}
 
 
 @pytest.mark.asyncio
-async def test_late_open_tail_projection_does_not_mask_nonfinite_m1_log_range():
+async def test_late_open_tail_projection_recovers_nan_m1_log_range():
     try:
         import passivbot as pb_mod
     except ImportError:
@@ -2126,13 +2309,35 @@ async def test_late_open_tail_projection_does_not_mask_nonfinite_m1_log_range():
     )
     bot.projected_open_tail_called = False
 
+    result = await pb_mod.Passivbot._load_orchestrator_ema_bundle(
+        bot, [symbol], bot.PB_modes
+    )
+
+    assert bot.completed_candle_health_calls >= 2
+    assert bot.projected_open_tail_called is True
+    assert result[0][symbol][span0] == pytest.approx(201.0)
+    assert result[2][symbol][60.0] == pytest.approx(0.0042)
+
+
+@pytest.mark.asyncio
+async def test_required_m1_log_range_infinite_output_remains_fatal():
+    try:
+        import passivbot as pb_mod
+    except ImportError:
+        pytest.skip("passivbot module not importable in test environment")
+
+    symbol = "WLD/USDT:USDT"
+    bot = _BundleReproBot(
+        symbol,
+        close_mode="value",
+        lr1m_mode="inf",
+        entry_m1_weight=1.0,
+    )
+
     with pytest.raises(RuntimeError, match="non-finite m1_log_range value"):
         await pb_mod.Passivbot._load_orchestrator_ema_bundle(
             bot, [symbol], bot.PB_modes
         )
-
-    assert bot.completed_candle_health_calls == 1
-    assert bot.projected_open_tail_called is False
 
 
 @pytest.mark.asyncio
@@ -2221,7 +2426,7 @@ async def test_open_tail_projection_missing_close_span_scopes_only_its_consumers
 
 
 @pytest.mark.asyncio
-async def test_open_tail_projection_nonfinite_close_remains_fatal():
+async def test_open_tail_projection_nan_close_is_scoped_unavailable():
     try:
         import passivbot as pb_mod
     except ImportError:
@@ -2238,7 +2443,61 @@ async def test_open_tail_projection_nonfinite_close_remains_fatal():
         projected_close_ema={span0: float("nan"), span1: 202.0, span2: 203.0},
     )
 
+    result = await pb_mod.Passivbot._load_orchestrator_ema_bundle(
+        bot, [symbol], bot.PB_modes
+    )
+
+    assert result[0][symbol] == {}
+    assert bot._orchestrator_allow_missing_strategy_inputs_symbols == {symbol}
+
+
+@pytest.mark.asyncio
+async def test_open_tail_projection_infinite_close_remains_fatal():
+    try:
+        import passivbot as pb_mod
+    except ImportError:
+        pytest.skip("passivbot module not importable in test environment")
+
+    symbol = "AVAX/USDT:USDT"
+    span0 = 10.0
+    span1 = 20.0
+    span2 = (span0 * span1) ** 0.5
+    bot = _BundleReproBot(
+        symbol,
+        close_mode="timeout",
+        project_open_tail=True,
+        projected_close_ema={span0: float("inf"), span1: 202.0, span2: 203.0},
+    )
+
     with pytest.raises(RuntimeError, match="non-finite projected open-tail close EMA"):
+        await pb_mod.Passivbot._load_orchestrator_ema_bundle(
+            bot, [symbol], bot.PB_modes
+        )
+
+
+@pytest.mark.asyncio
+async def test_open_tail_projection_infinite_m1_log_range_remains_fatal():
+    try:
+        import passivbot as pb_mod
+    except ImportError:
+        pytest.skip("passivbot module not importable in test environment")
+
+    symbol = "AVAX/USDT:USDT"
+    span0 = 10.0
+    span1 = 20.0
+    span2 = (span0 * span1) ** 0.5
+    bot = _BundleReproBot(
+        symbol,
+        close_mode="timeout",
+        entry_m1_weight=1.0,
+        project_open_tail=True,
+        projected_close_ema={span0: 201.0, span1: 202.0, span2: 203.0},
+        projected_log_range_ema={10.0: 0.0015, 60.0: float("inf")},
+    )
+
+    with pytest.raises(
+        RuntimeError, match="non-finite projected open-tail m1 log-range EMA"
+    ):
         await pb_mod.Passivbot._load_orchestrator_ema_bundle(
             bot, [symbol], bot.PB_modes
         )
@@ -2422,9 +2681,14 @@ async def test_batched_ema_failure_retries_each_span_before_carry_forward(monkey
         _cm,
         _symbol,
         spans_by_metric,
-        **_kwargs,
+        **kwargs,
     ):
-        batch_requests.append(dict(spans_by_metric))
+        batch_requests.append(
+            (
+                dict(spans_by_metric),
+                kwargs.get("allow_provisional_internal_gaps"),
+            )
+        )
         raise RuntimeError("widest EMA window unavailable")
 
     original_close = bot.cm.get_latest_ema_close
@@ -2458,15 +2722,22 @@ async def test_batched_ema_failure_retries_each_span_before_carry_forward(monkey
     )
     assert m1_volume_emas[symbol][10.0] == pytest.approx(250000.0)
     assert m1_log_range_emas[symbol][10.0] == pytest.approx(0.0015)
-    assert {next(iter(request)) for request in batch_requests} >= {
+    assert {next(iter(request)) for request, _allow_provisional in batch_requests} >= {
         "close",
         "qv",
         "log_range",
     }
+    request_flags = [
+        (next(iter(request)), allow_provisional)
+        for request, allow_provisional in batch_requests
+    ]
+    assert ("close", True) in request_flags
+    assert ("qv", False) in request_flags
 
 
 @pytest.mark.asyncio
-async def test_required_h1_log_range_ema_is_scoped_when_missing():
+@pytest.mark.parametrize("h1_mode", ["timeout", "nan"])
+async def test_required_h1_log_range_ema_is_scoped_when_missing(h1_mode):
     try:
         import passivbot as pb_mod
     except ImportError:
@@ -2476,7 +2747,7 @@ async def test_required_h1_log_range_ema_is_scoped_when_missing():
     bot = _BundleReproBot(
         symbol,
         close_mode="value",
-        h1_mode="timeout",
+        h1_mode=h1_mode,
         entry_h1_span_hours=4.0,
         entry_m1_weight=1.0,
     )
@@ -2492,8 +2763,7 @@ async def test_required_h1_log_range_ema_is_scoped_when_missing():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("h1_mode", ["nan", "inf"])
-async def test_required_h1_log_range_nonfinite_output_remains_fatal(h1_mode):
+async def test_required_h1_log_range_infinite_output_remains_fatal():
     try:
         import passivbot as pb_mod
     except ImportError:
@@ -2503,7 +2773,7 @@ async def test_required_h1_log_range_nonfinite_output_remains_fatal(h1_mode):
     bot = _BundleReproBot(
         symbol,
         close_mode="value",
-        h1_mode=h1_mode,
+        h1_mode="inf",
         entry_h1_span_hours=4.0,
     )
 

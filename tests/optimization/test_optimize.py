@@ -514,7 +514,7 @@ class TestResolveCliLimitsOverride:
                 "metric": "adg_usd",
                 "penalize_if": "less_than_or_equal",
                 "value": 0.0008,
-                "stat": "mean",
+                "reducer": "mean",
             },
         ]
 
@@ -534,7 +534,7 @@ class TestResolveCliLimitsOverride:
                 "metric": "fills_gap_p99_hours",
                 "penalize_if": "greater_than_or_equal",
                 "value": 72.0,
-                "stat": "max",
+                "reducer": "max",
             }
         ]
 
@@ -696,7 +696,7 @@ def test_preselect_starting_configs_extracts_selected_pareto_configs(tmp_path):
         config,
         filter_by_limits=True,
         max_count=None,
-        aggregate_cfg=config["backtest"]["aggregate"],
+        reducer_cfg=config["backtest"]["reducer"],
     )
 
     assert len(selected) == 1
@@ -706,9 +706,9 @@ def test_preselect_starting_configs_extracts_selected_pareto_configs(tmp_path):
     )
 
 
-def test_preselect_starting_configs_uses_effective_aggregate_basis(tmp_path):
+def test_preselect_starting_configs_uses_effective_reducer_basis(tmp_path):
     config = get_template_config()
-    config["backtest"]["aggregate"] = {"default": "max"}
+    config["backtest"]["reducer"] = {"default": "max"}
     config["optimize"]["scoring"] = [
         {"metric": "adg_strategy_eq", "goal": "max"},
         {"metric": "drawdown_worst_strategy_eq", "goal": "min"},
@@ -763,7 +763,7 @@ def test_preselect_starting_configs_uses_effective_aggregate_basis(tmp_path):
         config,
         filter_by_limits=True,
         max_count=None,
-        aggregate_cfg={"default": "mean"},
+        reducer_cfg={"default": "mean"},
     )
 
     assert len(selected) == 1
@@ -774,7 +774,7 @@ def test_preselect_starting_configs_uses_effective_aggregate_basis(tmp_path):
         config,
         filter_by_limits=True,
         max_count=None,
-        aggregate_cfg=None,
+        reducer_cfg=None,
     )
 
     assert len(selected_non_suite) == 1
@@ -1659,7 +1659,7 @@ class TestIndividualToConfig:
         vector[key_to_idx["long_close_retracement_volatility_1h_weight"]] = 37.0
         vector[key_to_idx["long_close_retracement_volatility_1m_weight"]] = 38.0
         vector[key_to_idx["short_close_retracement_base_pct"]] = 0.002
-        vector[key_to_idx["short_close_retracement_volatility_1h_weight"]] = 41.0
+        vector[key_to_idx["short_close_retracement_volatility_1h_weight"]] = 71.0
 
         config = _canonicalize_optimizer_individual(
             vector,
@@ -1681,10 +1681,10 @@ class TestIndividualToConfig:
         )
         assert vector[key_to_idx["short_close_retracement_base_pct"]] == pytest.approx(0.002)
         assert vector[key_to_idx["short_close_retracement_volatility_1h_weight"]] == pytest.approx(
-            40.0
+            70.0
         )
         assert long_close["retracement_base_pct"] == pytest.approx(0.0)
-        assert short_close["retracement_volatility_1h_weight"] == pytest.approx(40.0)
+        assert short_close["retracement_volatility_1h_weight"] == pytest.approx(70.0)
 
     def test_anchored_fine_tune_materializes_fixed_values_from_anchor(self):
         template = {
@@ -3898,7 +3898,7 @@ class TestEvaluator:
                 "metric": "adg_strategy_pnl_rebased",
                 "penalize_if": "less_than_or_equal",
                 "value": 0.0,
-                "stat": "min",
+                "reducer": "min",
             },
             {
                 "metric": "drawdown_worst_hsl",
@@ -4521,6 +4521,62 @@ class TestEvaluator:
         assert mock_config["backtest"]["start_date"] == "2023-01-01"
         assert mock_config["live"]["approved_coins"] == {"long": ["BTC"], "short": []}
 
+    def test_suite_scenario_nested_overrides_preserve_candidate_config_sections(self):
+        from optimize import Evaluator, SuiteEvaluator
+        from config_utils import get_template_config
+        from suite_runner import build_scenarios
+
+        candidate_config = get_template_config()
+        candidate_config["bot"]["long"]["risk"]["n_positions"] = 7
+        candidate_config["live"]["approved_coins"] = {"long": ["ETH"], "short": ["ETH"]}
+        candidate_config["live"]["ignored_coins"] = {"long": [], "short": []}
+        scenario = build_scenarios(
+            {
+                "scenarios": [
+                    {
+                        "label": "nested",
+                        "overrides": {
+                            "live": {"hedge_mode": True},
+                            "bot": {
+                                "short": {"risk": {"total_wallet_exposure_limit": 0.0}}
+                            },
+                        },
+                    }
+                ]
+            },
+            base_exchanges=["binance"],
+        )[0][0]
+        ctx_config = deepcopy(candidate_config)
+        ctx = ScenarioEvalContext(
+            label=scenario.label,
+            config=ctx_config,
+            exchanges=["binance"],
+            hlcvs_specs={},
+            btc_usd_specs={},
+            msss={"binance": {}},
+            timestamps={"binance": None},
+            shared_hlcvs_np={"binance": np.zeros((1, 1, 5))},
+            shared_btc_np={},
+            attachments={"hlcvs": {}, "btc": {}},
+            coin_indices={"binance": None},
+            overrides=scenario.overrides,
+        )
+        evaluator = SuiteEvaluator(
+            Evaluator({}, {}, {}, candidate_config),
+            [ctx],
+            {},
+        )
+
+        scenario_config = evaluator._build_scenario_candidate_config(candidate_config, ctx)
+
+        assert scenario_config["live"]["approved_coins"] == {
+            "long": ["ETH"],
+            "short": ["ETH"],
+        }
+        assert scenario_config["live"]["hedge_mode"] is True
+        assert scenario_config["bot"]["long"]["risk"]["n_positions"] == 7
+        assert scenario_config["bot"]["short"]["risk"]["total_wallet_exposure_limit"] == 0.0
+
 
 def _remove_nested_path(mapping, path):
     target = mapping
@@ -4595,6 +4651,37 @@ def test_resume_config_mismatches_allows_suite_result_without_top_level_coins():
     }
     config = deepcopy(entry)
     config["backtest"]["coins"] = {"binance": ["XMR"]}
+
+    assert optimize._resume_config_mismatches(entry, config) == []
+
+
+def test_resume_config_mismatches_treats_reducer_aliases_as_equivalent():
+    entry = _resume_validation_entry()
+    entry["backtest"]["aggregate"] = {"default": "max"}
+    entry["optimize"]["scoring"] = [
+        {
+            "metric": "adg_strategy_eq",
+            "goal": "max",
+            "scenario": None,
+            "aggregate": "max",
+        }
+    ]
+    entry["optimize"]["limits"] = [
+        {
+            "metric": "strategy_eq_recovery_days_max",
+            "penalize_if": "greater_than",
+            "stat": "max",
+            "value": 100,
+        }
+    ]
+    config = deepcopy(entry)
+    config["backtest"]["reducer"] = config["backtest"].pop("aggregate")
+    config["optimize"]["scoring"][0]["reducer"] = config["optimize"]["scoring"][0].pop(
+        "aggregate"
+    )
+    config["optimize"]["limits"][0]["reducer"] = config["optimize"]["limits"][0].pop(
+        "stat"
+    )
 
     assert optimize._resume_config_mismatches(entry, config) == []
 

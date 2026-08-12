@@ -603,6 +603,9 @@ def _build_monitor_market_section(self) -> dict[str, dict]:
     rank_feature_unavailable_by_side = getattr(
         self, "_forager_rank_feature_unavailable_by_side", {}
     ) or {}
+    ranking_required_by_side = getattr(
+        self, "_forager_ranking_required_by_side", {}
+    ) or {}
     ema_bundle_completed = bool(
         getattr(self, "_orchestrator_ema_bundle_completed", False)
     )
@@ -715,11 +718,19 @@ def _build_monitor_market_section(self) -> dict[str, dict]:
             if forager_side and age_eligible_approved and min_cost_eligible:
                 forager_candidate_psides.append(pside)
         if forager_candidate_psides:
-            rank_feature_psides = sorted(
+            raw_rank_feature_psides = sorted(
                 pside
                 for pside in forager_candidate_psides
                 if symbol
                 in set(rank_feature_unavailable_by_side.get(pside, set()) or set())
+            )
+            rank_feature_psides = sorted(
+                pside
+                for pside in raw_rank_feature_psides
+                if bool(ranking_required_by_side.get(pside, False))
+            )
+            conditional_rank_feature_psides = sorted(
+                set(raw_rank_feature_psides) - set(rank_feature_psides)
             )
             rankability_reasons = []
             if not ema_bundle_completed or symbol not in ema_bundle_symbols:
@@ -740,6 +751,14 @@ def _build_monitor_market_section(self) -> dict[str, dict]:
                 "rankable": not rankability_reasons,
                 "rankability_reasons": sorted(set(rankability_reasons)),
                 "ranking_feature_unavailable_psides": rank_feature_psides,
+                "conditional_ranking_feature_unavailable_psides": (
+                    conditional_rank_feature_psides
+                ),
+                "ranking_required_psides": sorted(
+                    pside
+                    for pside in forager_candidate_psides
+                    if bool(ranking_required_by_side.get(pside, False))
+                ),
                 "ema_unavailable_reasons": matching_ema_reasons,
             }
         if symbol in trailing_unavailable_symbols:
@@ -1007,11 +1026,6 @@ def _build_monitor_unstuck_section(self) -> dict[str, Any]:
     # while an unstuck order is open. Disabled unstuck has no PnL-derived
     # allowance to report.
     unstuck_uses_realized_pnl = self._unstuck_uses_realized_pnl()
-    allowances_live = (
-        self._calc_unstuck_allowances_live()
-        if unstuck_uses_realized_pnl
-        else None
-    )
     out: dict[str, Any] = {
         "has_open_order": has_open,
         "open_orders": [],
@@ -1037,12 +1051,13 @@ def _build_monitor_unstuck_section(self) -> dict[str, Any]:
             if unstuck_uses_realized_pnl
             else {"status": "unstuck_disabled"}
         )
+        allowance_raw = info.get("allowance")
         side_payload: dict[str, Any] = {
             "status": info.get("status"),
             "allowance_live": (
-                float(allowances_live.get(pside, 0.0) or 0.0)
-                if allowances_live is not None
-                else None
+                max(0.0, float(allowance_raw))
+                if allowance_raw is not None
+                else (0.0 if unstuck_uses_realized_pnl else None)
             ),
             "configured_loss_allowance_pct": float(
                 self.bot_value(pside, "unstuck_loss_allowance_pct") or 0.0

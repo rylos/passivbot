@@ -4,7 +4,8 @@ from .optimize_bounds import get_optimize_bounds_defaults
 from .strategy import get_all_strategy_defaults
 
 
-CONFIG_SCHEMA_VERSION = "v8.0.0"
+CONFIG_SCHEMA_VERSION = "v8.2.0"
+SUPPORTED_PREVIOUS_CONFIG_SCHEMA_VERSIONS = frozenset({"v8.0.0", "v8.1.0"})
 DEFAULT_EXAMPLE_CONFIG_PATH = "configs/examples/default_trailing_martingale_long.json"
 # A symbol suspension is temporary policy, not an indefinite timestamp. This
 # generous bound also keeps hours-to-milliseconds conversion finite and well
@@ -17,13 +18,13 @@ def _get_shared_bot_defaults():
         "long": {
             "forager": {
                 "score_weights": {
-                    "ema_readiness": 0.18,
-                    "volatility": 0.36,
-                    "volume": 0.46
+                    "ema_readiness": 0.21,
+                    "volatility": 0.61,
+                    "volume": 0.18
                 },
-                "volatility_ema_span_1m": 360.0,
-                "volume_drop_pct": 0.06,
-                "volume_ema_span_1m": 1400.0
+                "volatility_ema_span_1m": 2274.0,
+                "volume_drop_pct": 0.04,
+                "volume_ema_span_1m": 310.0
             },
             "hsl": {
                 "cooldown_minutes_after_red": 2160.0,
@@ -48,25 +49,25 @@ def _get_shared_bot_defaults():
                 "osc_exit_threshold": 24.845
             },
             "risk": {
-                "entry_cooldown_minutes": 7.4,
-                "n_positions": 5.0,
+                "entry_cooldown_minutes": 24.1,
+                "n_positions": 7.0,
                 "position_exposure_enforcer_enabled": False,
                 "position_exposure_enforcer_threshold": 1.0,
-                "total_exposure_enforcer_enabled": True,
+                "total_exposure_enforcer_enabled": False,
                 "total_exposure_enforcer_policy": "reduce_overweight",
                 "total_exposure_enforcer_threshold": 1.0,
                 "total_exposure_entry_gate_enabled": True,
                 "total_wallet_exposure_limit": 1.5,
                 "we_excess_allowance_mode": "bounded",
-                "we_excess_allowance_pct": 0.5
+                "we_excess_allowance_pct": 0.37
             },
             "unstuck": {
-                "close_pct": 0.105,
-                "ema_dist": -0.0809,
+                "close_pct": 0.041,
+                "ema_dist": -0.0269,
                 "ema_gating_enabled": True,
                 "enabled": True,
-                "loss_allowance_pct": 0.0071,
-                "threshold": 0.425
+                "loss_allowance_pct": 0.0052,
+                "threshold": 0.466
             }
         },
         "short": {
@@ -133,7 +134,7 @@ def get_template_config():
         {
             "config_version": CONFIG_SCHEMA_VERSION,
             "backtest": {
-                "aggregate": {
+                "reducer": {
                     "default": "mean"
                 },
                 "balance_sample_divider": 60,
@@ -322,38 +323,38 @@ def get_template_config():
                         "TRX",
                         "HYPE",
                         "DOGE",
-                        "XLM",
-                        "XMR",
-                        "ADA",
-                        "CC",
                         "ZEC",
+                        "XLM",
+                        "ADA",
                         "LINK",
+                        "XMR",
+                        "CC",
                         "BCH",
+                        "TON",
                         "GRAM",
-                        "HBAR",
                         "LTC",
-                        "AVAX",
+                        "HBAR",
                         "SUI",
-                        "CRO",
+                        "AVAX",
                         "NEAR",
-                        "TAO",
-                        "MNT",
-                        "ASTER",
-                        "WLD",
-                        "DOT",
-                        "ONDO",
                         "UNI",
-                        "MORPHO",
+                        "TAO",
+                        "ASTER",
+                        "ONDO",
                         "AAVE",
+                        "DOT",
+                        "WLD",
+                        "MNT",
+                        "MORPHO",
+                        "POL",
                         "ATOM",
                         "RENDER",
                         "KAS",
-                        "ALGO",
-                        "POL",
                         "ENA",
+                        "ALGO",
                         "FIL",
-                        "APT",
                         "ARB",
+                        "APT",
                         "INJ"
                     ],
                     "short": [
@@ -365,38 +366,38 @@ def get_template_config():
                         "TRX",
                         "HYPE",
                         "DOGE",
-                        "XLM",
-                        "XMR",
-                        "ADA",
-                        "CC",
                         "ZEC",
+                        "XLM",
+                        "ADA",
                         "LINK",
+                        "XMR",
+                        "CC",
                         "BCH",
+                        "TON",
                         "GRAM",
-                        "HBAR",
                         "LTC",
-                        "AVAX",
+                        "HBAR",
                         "SUI",
-                        "CRO",
+                        "AVAX",
                         "NEAR",
-                        "TAO",
-                        "MNT",
-                        "ASTER",
-                        "WLD",
-                        "DOT",
-                        "ONDO",
                         "UNI",
-                        "MORPHO",
+                        "TAO",
+                        "ASTER",
+                        "ONDO",
                         "AAVE",
+                        "DOT",
+                        "WLD",
+                        "MNT",
+                        "MORPHO",
+                        "POL",
                         "ATOM",
                         "RENDER",
                         "KAS",
-                        "ALGO",
-                        "POL",
                         "ENA",
+                        "ALGO",
                         "FIL",
-                        "APT",
                         "ARB",
+                        "APT",
                         "INJ"
                     ]
                 },
@@ -541,7 +542,7 @@ def get_template_config():
                             "enabled": True,
                             "metric": "drawdown_worst_strategy_eq",
                             "penalize_if": "greater_than",
-                            "stat": "mean",
+                            "reducer": "mean",
                             "value": 0.8
                         },
                         {

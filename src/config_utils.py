@@ -590,9 +590,7 @@ def parse_overrides(config, verbose=True):
 
 
 def load_override_config(config, coin):
-    return staged_load_override_config(
-        config, coin, config_loader=lambda path: load_config(path, verbose=False)
-    )
+    return staged_load_override_config(config, coin)
 
 
 def parse_old_coin_flags(config) -> dict:
@@ -785,7 +783,7 @@ def _clean_with_template(template_node, source_node, path: Path = ()):
                     )
                 else:
                     cleaned[key] = _clean_dynamic_node(value)
-            if path == ("backtest", "aggregate") and "default" not in cleaned:
+            if path == ("backtest", "reducer") and "default" not in cleaned:
                 cleaned["default"] = _clean_with_template(
                     template_node["default"],
                     None,
@@ -1396,16 +1394,26 @@ RESERVED_CLI_ARGS = {
         "group": {"backtest": "Backtest Runtime"},
         "help": "Starting balance for the backtest.",
     },
-    "backtest.aggregate.default": {
-        "visible": ["--aggregate-default"],
-        "hidden": ["--backtest.aggregate.default", "--backtest_aggregate_default"],
+    "backtest.reducer.default": {
+        "visible": ["--reducer-default"],
+        "hidden": [
+            "--backtest.reducer.default",
+            "--backtest_reducer_default",
+            "--aggregate-default",
+            "--backtest.aggregate.default",
+            "--backtest_aggregate_default",
+            "--backtest.stat.default",
+            "--backtest_stat_default",
+            "--backtest.scenario_stat.default",
+            "--backtest_scenario_stat_default",
+        ],
         "type": str,
         "metavar": "MODE",
-        "commands": {"backtest"},
-        "group": {"backtest": "Suite"},
+        "commands": {"backtest", "optimize"},
+        "group": {"backtest": "Suite", "optimize": "Suite"},
         "help": (
-            "Suite-only default aggregation for scenario metrics. Allowed modes: "
-            "mean, min, max, std, median. Metric-specific backtest.aggregate entries "
+            "Suite-only default reducer for scenario metrics. Allowed modes: "
+            "mean, min, max, std, median. Metric-specific backtest.reducer entries "
             "override this default."
         ),
     },
@@ -1640,7 +1648,7 @@ CLI_HELP_OVERRIDES = {
         "Terminal metric visibility config. null uses optimize scoring/limits; "
         "[] shows all; a list adds named metrics. Full analysis is still saved."
     ),
-    "config_version": "Config schema version. Canonical V8 configs use v8.0.0.",
+    "config_version": "Config schema version. Canonical V8 configs use v8.2.0.",
 }
 
 for _pside in ("long", "short"):
@@ -1779,7 +1787,7 @@ def _classify_backtest_argument(full_name: str, help_all: bool) -> Optional[str]
         "backtest.start_date",
     }
     runtime = {
-        "backtest.aggregate.default",
+        "backtest.reducer.default",
         "backtest.balance_sample_divider",
         "backtest.btc_collateral_cap",
         "backtest.btc_collateral_ltv_cap",
@@ -1832,7 +1840,7 @@ def _classify_optimize_argument(full_name: str, help_all: bool) -> Optional[str]
         "optimize.scoring",
     }
     backtest_runtime = {
-        "backtest.aggregate.default",
+        "backtest.reducer.default",
         "backtest.balance_sample_divider",
         "backtest.btc_collateral_cap",
         "backtest.btc_collateral_ltv_cap",

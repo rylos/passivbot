@@ -4,6 +4,142 @@ All notable user-facing changes will be documented in this file.
 
 ## Unreleased
 
+- Skip forager ranking and its feature requirements when each side's exact remaining candidate
+  universe fits its remaining position slots, including when ineligible held positions consume
+  slots. Python now scopes missing ranking-only inputs to Rust selection instead of making the
+  whole symbol non-tradable. Freshly fetched forager candidates may also bridge bounded,
+  later-bracketed internal candle gaps under `live.max_active_candle_tail_gap_minutes`, with
+  per-symbol/metric consecutive-use and recovery diagnostics; cache-only stale candidates remain
+  strict.
+- Standardize suite reduction configuration on `reducer` across `backtest`, optimizer scoring,
+  limits, CLI parsing, examples, and serialized configs. The former `aggregate`, `stat`, and
+  `scenario_stat` spellings remain accepted as input aliases (plus legacy limit `field`),
+  same-valued aliases collapse to `reducer`, conflicting aliases fail validation, and existing
+  Pareto/suite result artifacts remain readable without rewriting their historical payload keys.
+- Hash backtest cache arrays while writing their NPY artifacts, avoiding a second full-array read
+  solely to build the cache manifest after multi-gigabyte cache publication.
+- Speed up multi-coin backtest HLCV validation with bounded time-major scans, and report frame
+  flush and valid-window validation timings separately during data preparation.
+- Preserve the full configured exchange pool for combined optimizer and backtest suite datasets
+  when every selected coin happens to use the same venue, so single-coin multi-exchange suites no
+  longer reject valid unselected candidate venues as unavailable.
+- Normalize nested suite scenario override documents to leaf config paths while keeping dynamic
+  `coin_overrides` mappings atomic, preventing partial `live` or `bot` overrides from replacing the
+  complete section during optimizer evaluation.
+- Bound coin-mode HSL `always` restart reconstruction to its canonical fill-proven replay start.
+  Older sparse fills still seed exact balance and position state, but discarded closed episodes no
+  longer expand candle fetches, minute arrays, panic markers, or replay-event iteration;
+  ambiguous evidence and strict restart policies retain the full configured lookback.
+- Remove the persisted HSL replay cache and reconstruct every restart from authoritative fill/PnL
+  history, candles, exchange state, config, and current time. Compact/sparse replay remains the
+  performance path; obsolete replay-cache artifacts are ignored and no longer inspected by the
+  cache doctor.
+
+## v8.1.0 - 2026-08-10
+
+- Scope coin-mode HSL fill-history readiness for `restart_after_red_policy=always` to the
+  fill-proven held episode plus the flat-scope cooldown horizon. Recent fills for a currently flat
+  scope, ambiguous held reconstruction, `threshold`/`never`, and pside/unified modes retain the full
+  configured lookback; effective per-coin HSL settings are honored, pending/degraded PnL blockers
+  use each pair's own active episode, and the requirement is rechecked after refresh so delayed or
+  side-ambiguous fills fail closed. Coin finalization no longer requests unused account-wide PnL.
+
+- Gate.io multi-currency futures balance events now publish bounded settle-currency
+  composition diagnostics (wallet amount, available margin, reserved IM/order
+  margin, unrealized PnL) and select the quote-matched futures-account row instead
+  of blindly using `info[0]`. Trading wallet balance continues to reconstruct from
+  available + position IM + order margin − unrealized PnL so resting-order
+  reservations do not resize risk inputs.
+- Prevent unrelated spot or unloaded-DEX rows in Hyperliquid's public `allMids` payload from
+  aborting live ticker snapshots. Unknown exchange-returned identifiers are filtered at the
+  connector boundary, while requested-market completeness and malformed known-market prices
+  remain fail-closed.
+
+- Allow the complete per-side HSL group in coin overrides when the global
+  `live.hsl_signal_mode` is `"coin"`. Resolved per-coin HSL settings now drive both live
+  supervision and Rust backtests; inline HSL patches fail in `pside` or `unified` mode, while HSL
+  fields from complete override files are warned about and ignored outside coin mode. The signal
+  mode remains global and cannot be changed by a coin override.
+
+- Refine the coin-override policy: allow per-coin
+  `bot.<side>.risk.entry_cooldown_minutes` and
+  `bot.<side>.unstuck.ema_gating_enabled`, retain
+  `bot.<side>.unstuck.loss_allowance_pct`, and stop allowing per-coin
+  `bot.<side>.risk.we_excess_allowance_mode`. Configure the allowance mode globally.
+
+- Make coin overrides explicit, typed patches instead of hydrated config diffs. File values now
+  precede inline values without losing intentional resets to defaults, false, or zero; each resolved
+  per-coin config is validated before use; normalized symbol collisions and strategy-kind mismatches
+  are rejected; and configured override files fail closed when missing, unreadable, malformed, or
+  invalid. Live and backtest consumers now resolve canonical grouped bot fields consistently.
+
+- Refresh hardcoded schema defaults and the mirrored example config from the latest
+  long-only trailing-martingale canon candidate: update `bot.long` parameters,
+  `optimize.bounds`, and `live.approved_coins` (replace CRO with TON; reorder coin
+  list). Backtest suite scenarios and unrelated defaults are unchanged.
+
+- Stop inferring missing fill history from long periods without executions. Fill lookback
+  coverage is now proven by successful exchange-endpoint traversal; only actual failed bounded
+  fetches create unproven ranges, which remain retryable under the live execution loop's backoff
+  until a successful response (including an empty response) clears them.
+- TWEL-gated market entries and their final minimum-order guard use executable touch, and next-only
+  short entry quantities are re-cropped after directional price quantization.
+- Directionally quantize passive WEL auto-reducer prices away from off-tick executable touches so
+  limit reducers cannot become crossing orders merely through price-step rounding.
+- Resolve exchange market identifiers without lossy pre-normalization: exact CCXT symbols,
+  native market IDs, multiplier-prefixed bases, and `exchange::<native-id>` identities now take
+  precedence on every exchange. Convenience aliases that match multiple markets fail closed with
+  their candidates instead of selecting an order-dependent first match, missing exact identifiers
+  and namespaced HIP-3 aliases fail closed instead of normalizing to another market,
+  suffix-bearing native IDs remain lossless,
+  contradictory qualified source mappings are rejected, unqualified native IDs that identify
+  different contracts across configured exchanges require venue scope, and ordinary convenience
+  aliases are compared by underlying while scaled or exact inputs retain denomination identity;
+  suite scenario identifiers
+  are validated and reconciled after union, inception discovery is limited to requested/live
+  venues and uses the offline fake timeline locally,
+  source and approved-market aliases are coalesced before dataset preparation, conflicting
+  duplicate coin and market-settings overrides are rejected consistently, unresolved delisted
+  fill IDs preserve their raw historical symbol, resolver changes invalidate old HLCV and
+  first-timestamp/inception caches now retain and revalidate resolved-symbol provenance, prepared
+  HLCV cache keys track current resolved venue symbols
+  after refreshing configured and source-only venue metadata,
+  unknown combined-market inception cannot satisfy positive minimum-age rules,
+  backtest-only coin sources cannot rewrite live approvals,
+  invalid live identifiers disable only their own eligibility while unresolved ignored IDs retain
+  only their own prior restrictions, `approved_coins="all"`
+  unifies quote variants and venue denomination spellings under one underlying while exact
+  scaled identifiers remain lossless, rejects unavailable exact source overrides for active coins,
+  emits exchange-scoped identities for remaining collisions, and generated symbol maps plus durable
+  per-exchange ambiguity tombstones remain deterministic across cache refresh order. Live coin
+  overrides are rebuilt atomically so a failed metadata refresh cannot expose a partial override map.
+
+- Resolve plain underlying names across exchange denomination conventions. Prefix forms such as
+  `1000SHIB`, suffix forms such as `SHIB1000`, and Hyperliquid's `kSHIB` notation now share one
+  denomination-aware identity when established by that venue's market convention. Numeric ticker
+  affixes outside a recognized convention remain part of the asset name. A plain coin selects one
+  active venue market deterministically, while exact identifiers continue to request a specific
+  contract. Combined backtests keep market settings on the OHLCV denomination when an override
+  venue uses a different scale.
+
+- Reconstruct trailing extrema for positions older than an exchange's retained 1m candles with
+  the shared 1m, 5m, 15m, then 1h historical-resolution ladder. Coarser candles are limited to
+  the old leading prefix, their source counts and exact-1m boundary are logged, and a real recent
+  1m suffix remains mandatory; missing or internally sparse recent data still makes only the
+  affected trailing input unavailable.
+- Move live trailing-input availability into Rust's side-scoped planning contract. Missing
+  trailing extrema now suppress only entry or close branches that actually consume them while the
+  other branch, other position side, panic, and independent reducers remain available. Remove the
+  Python post-reconciliation exception matrix so stale orders absent from current Rust intent are
+  cancelled normally.
+- Make HSL restart price reconstruction portable across exchanges with limited candle retention.
+  Replay now uses the finest available historical resolution in a fixed 1m, 5m, 15m, then 1h
+  ladder for the older leading prefix, reports approximate source counts, and never uses coarser
+  candles to conceal gaps inside the available 1m era. Fill-based episode boundaries, realized
+  PnL, and fees remain exact.
+- Route Bitget public OHLCV requests through the complete classic futures history endpoint even
+  when the authenticated account uses UTA/Elite v3, preventing older available candles from being
+  omitted from live EMA windows while retaining UTA routing for private account and order calls.
 - Recognize repeated exclusive switching between complete order cohorts as live
   order-churn evidence. Alternating long/short or order-type intent can now use
   the existing account-wide far-order allowance without merging position-side
@@ -14,6 +150,18 @@ All notable user-facing changes will be documented in this file.
   emitting the existing history-reset telemetry. Short switching intervals do
   not mask later sustained price or quantity drift, and ladder cardinality must
   remain consistent for every recurring cohort.
+- Short market entries and promoted partial market closes are sized and trimmed from their
+  executable touch so
+  minimum-notional validation remains consistent across Rust planning, live execution, and
+  backtesting, including after TWEL entry gating. Blocked
+  loss-gate closes use that same execution price when validating their diagnostic exchange minimum.
+  Limit-close minimums use each emitted limit price, drop below-minimum legs from mixed ladders before
+  absorbing the remaining position dust, preserve an exact below-step remaining position when that is
+  the only executable full close, and clamp short close prices to the minimum positive tick. Live
+  execution-policy validation also canonicalizes only representation-noisy, tick-aligned
+  submitted books to the same float Rust decodes from JSON.
+  Off-tick trailing-strategy entry prices now quantize away from the spread in both next-only and
+  expanded-grid paths so a passive bid is never rounded up and a passive ask is never rounded down.
 - WEEX now recognizes exact structured error code `-1058` as a temporary per-symbol API-trading
   suspension. The affected symbol enters a configurable RAM-only cooldown (six hours by default):
   flat symbols use graceful stop, held symbols use TP-only while retaining close and panic
@@ -34,8 +182,10 @@ All notable user-facing changes will be documented in this file.
   remain explicit and value-free; backtests and unannotated Rust inputs stay strict, stale resting
   strategy orders are cancelled through normal Rust-authoritative reconciliation, entry and close
   strategy branches remain independent when their input needs differ, and independent panic,
-  WEL, and TWEL reducers may continue when their own inputs are complete.
-
+  WEL, and TWEL reducers may continue when their own inputs are complete. The live producer-boundary
+  validator accepts and strictly validates Rust's corresponding scoped-unavailability warning. A
+  `NaN` returned by the completed-candle EMA API now follows that unavailable-input path instead of
+  restarting the whole execution cycle; positive or negative infinity remains fatal.
 - Harden combined-exchange HLCV preparation across independently downloaded datasets: equivalent
   full-range sources now follow configured exchange priority instead of total volume, robust
   complete-day median-log estimates replace arithmetic volume averaging, and underdetermined
@@ -61,6 +211,93 @@ All notable user-facing changes will be documented in this file.
   the current run's side membership separately from cache-build provenance, and
   optimizer data preparation derives reachable sides from optimization bounds
   so fixed-bound starts and Pareto restarts resolve consistently.
+- Live Rust orchestrator output now fails fatally before diagnostics or reconciliation when its JSON
+  (including duplicate keys, non-standard numeric constants, exponent-overflow floats, or decoder failures), required order
+  batch, order fields, aggregate
+  close quantity relative to the submitted position using representation-scale tolerance even for
+  tiny contracts, conversion identities, complete per-symbol
+  mode state, or required consumed diagnostic collections are missing or malformed. Diagnostic
+  validation rejects impossible realized-loss blocks. Order-field validation includes overflowing
+  numeric values, execution type
+  inconsistent with the submitted market policy, order book, and near-touch threshold, and priority
+  inconsistent with Rust's order and submitted-mode rule. It also rejects order families forbidden
+  by the submitted mode or flat-side eligibility, rejects all orders for globally disabled sides,
+  requires each flat-side entry batch to contain the strategy's valid initial family while
+  preserving Rust's recursive initial-plus-grid ladders,
+  rejects initial-normal entries for held trailing-strategy sides, multiple initial-partial entries,
+  and multiple EMA Anchor entries for one symbol-side,
+  enforces flat active-set caps, forced-normal active-slot reservations, and one-way initial-side
+  exclusion, requires flat entries to agree
+  with their active/allow-initial diagnostics, rejects foreign-strategy families and competing
+  protective reducers, rejects protective reducers whose direct submitted unstuck, WEL, or TWEL
+  enablement is disabled, requires panic reducers to close the full submitted position, rejects
+  entry quantities below the submitted effective exchange minimum or
+  outside the submitted quantity step, rejects close quantities below their effective minimum or
+  outside the submitted quantity step except for an exact remaining position, rejects limit
+  prices outside the submitted price step, requires diagnostic effective modes to match Rust's
+  submitted mode/position/global-enable rule,
+  requires order-type names to round-trip through Rust's
+  canonical ID mapping, rejects legacy inflated-entry enum variants which have no Rust producer,
+  and validates active-state diagnostics in both directions for ineligible
+  sides and eligible managed positions, while preserving Rust's
+  held-position DCA and configured HSL panic market closes as explicit Rust
+  behavior (the latter is the protective exception to `live.market_orders_allowed`). The bot no longer
+  converts a fabricated empty batch or usable subset which could cancel existing orders. Normal
+  live calls emit a correlated failed-return event before propagating the error, and HSL RED
+  supervisors no longer swallow fatal producer failures. Impossible loss-gate blocks are rejected
+  when Rust bypasses that gate for panic reducers, the submitted policy disables the gate, or the
+  block reports a different loss percentage than the submitted policy, and when the submitted
+  side is flat, manual, panic, globally disabled, or uses a different strategy family. They are
+  also rejected for reducer families disabled by their submitted unstuck, WEL, or TWEL gates,
+  including the global auto-unstuck gate, or when their quantities violate the submitted close
+  step, effective minimum, or position cap. Rust now
+  also quantizes effective minimum quantities to the submitted quantity step without overshooting
+  already aligned floating-point values, including valid quantities below ten decimal places, or
+  collapsing a positive sub-step minimum to zero, including when an aligned step multiplication is
+  represented one ULP below the exchange minimum, while quantities genuinely above a step still
+  round up, preserves exchange-step precision in all shared Rust rounding paths while retaining
+  ten-decimal cleanup for ordinary steps, and recomputes minimum entry quantity after the final
+  strategy price is quantized so minimum-cost orders remain valid. Live validation scales cost
+  tolerance to floating-point precision instead of admitting orders below tiny exchange minimum
+  costs, and quantity-minimum
+  tolerance is likewise restricted to floating representation error for both entries and partial
+  closes. Market-entry minimum cost is validated against the submitted executable touch rather
+  than the producer's reference price. Positive entry cooldowns retain Rust's single-entry staging
+  rule after the time window expires, and positive trailing-martingale entry retracement retains
+  Rust's single-entry staging rule even when cooldown is zero, canonical martingale entry and close
+  families must match their submitted grid-versus-retracement branches, and EMA Anchor emits at
+  most one entry and one close per symbol-side. EMA Anchor closes promoted to market execution are
+  resized from the executable touch before aggregate-close and realized-loss gating. Canonical
+  trailing-martingale retracement emits at
+  most one trailing close per symbol-side, and close minimum-cost validation uses the emitted limit
+  price or executable market touch. Held positions in enabled panic mode require Rust's
+  full-position panic close. Loss-gate diagnostic prices must match the submitted exchange step.
+  WEL and auto-unstuck limit prices are
+  directionally quantized from off-tick book quotes before minimum sizing and
+  loss projection. It quantizes EMA Anchor
+  touch prices in the protective direction without moving float-noisy aligned touches, preserves
+  positive bid and ask ticks below ten decimal places, keeps the minimum positive tick for short
+  closes while suppressing long entries when no positive tick exists at or below the selected bid,
+  restricts aligned-tick snapping to floating representation error, and keeps panic limit prices
+  valid when the submitted top-of-book quote itself is off tick, including low-priced books at or
+  near one price step and valid tiny increments, without skipping a tick because of ordinary
+  floating-point noise. Quantity-step and price-step validation admit only floating representation
+  error, so genuinely off-step values cannot hide inside a fixed fraction of the increment. Close validation rejects
+  positions at or below Rust's final
+  close-trimming dust threshold before applying the exact-position exception, and panic-limit
+  prices must match Rust's exact one-tick protective formula for the submitted book. Full-position
+  close checks tolerate only floating representation noise between Rust's step-rounded quantity
+  and the submitted position. Entries are
+  rejected when the submitted fill timestamp and cooldown make Rust's deterministic add-order gate
+  active. The complete
+  serialized diagnostic envelope now requires and
+  validates every Rust warning variant. Enum-shaped producer fields fail fatally even when
+  malformed as JSON arrays or objects, including loss-gate warning policies, and graceful-stop
+  mode uses Rust's exact nonzero-position rule. Unstuck reducers must agree with Rust's submitted
+  global auto-unstuck gate. Forager selections and flat active state must agree in both directions:
+  selected symbols are flat and active, and every non-forced active flat symbol appears in the
+  corresponding selection, while allowing Rust's later one-way tie-break to disable initial entry
+  on one selected side.
 - Live fill readiness now separates proven structural fill history from realized-PnL
   quality. Pending or synthetic PnL continues to block and repair before enabled HSL,
   auto-unstuck, or realized-loss logic can run, but no longer defers all fill-dependent
