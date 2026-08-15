@@ -6,6 +6,7 @@ sopravvivere a una ricostruzione del server e a versionare le modifiche.
 | file | dove gira | cron |
 |---|---|---|
 | `watchdog_ry_hl.py` | amazon, `~/watchdog/watchdog.py` | `*/10 * * * *` |
+| `hl_report.py` | amazon, `~/watchdog/hl_report.py` | `0 9,21 * * *` |
 
 Dopo ogni modifica qui, ricopiare sul server e verificare che l'md5 combaci:
 
@@ -42,3 +43,25 @@ due notifiche dello stesso evento da due bot diversi.
 
 ⚠️ L'URL di ping **è una credenziale**: sta solo in `~/watchdog/healthchecks.env`
 (chmod 600) sul server, mai nel repo.
+
+## hl_report.py
+
+Report periodico su Telegram (Claude RyLoS Bot), **sola lettura**: non riavvia e
+non tocca il bot. Nato per il periodo di ferie del 2026-08-15 → 25.
+
+Risponde alla domanda che il watchdog non copre: *"va tutto bene?"*. Healthchecks
+notifica solo quando qualcosa rompe, e il silenzio non è distinguibile da un
+watchdog morto senza aprire il telefono e controllare a mano.
+
+Manda pid, riga `[health]` corrente (up, posizione, balance, ordini, contatore
+errori), età dell'ultima riga di log e il conteggio 24h di errori/riavvii
+interni/fill.
+
+Verde vs giallo: il giallo deve voler dire *"guarda adesso"*, quindi pesano solo
+gli **errori delle ultime 2 ore** — non quelli delle 24h, che includono gli
+hiccup dell'API Hyperliquid da cui il bot si riprende da solo con un riavvio
+interno. Giallo anche se il processo è assente, il log è fermo da >35 min, o i
+riavvii interni in 24h sono ≥5 (uno o due sono fisiologici, una raffica no).
+
+Le credenziali stanno in `~/watchdog/telegram.json` (chmod 600), già presente e
+condiviso col watchdog.
