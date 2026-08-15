@@ -3,7 +3,7 @@
 
 Complementare al watchdog: quello avvisa quando qualcosa ROMPE (via
 healthchecks.io), questo dice periodicamente "sto vivo e sto facendo questo".
-Nato per il periodo di ferie di Marco (15-25 agosto 2026), quando nessuno
+Nato per il periodo di ferie di Marco (15-27 agosto 2026), quando nessuno
 guarda i log e il silenzio di healthchecks non e' distinguibile da un
 watchdog morto senza aprire il telefono.
 

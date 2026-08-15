@@ -47,7 +47,7 @@ due notifiche dello stesso evento da due bot diversi.
 ## hl_report.py
 
 Report periodico su Telegram (Claude RyLoS Bot), **sola lettura**: non riavvia e
-non tocca il bot. Nato per il periodo di ferie del 2026-08-15 → 25.
+non tocca il bot. Nato per il periodo di ferie del 2026-08-15 → 27.
 
 Risponde alla domanda che il watchdog non copre: *"va tutto bene?"*. Healthchecks
 notifica solo quando qualcosa rompe, e il silenzio non è distinguibile da un
