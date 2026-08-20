@@ -29,7 +29,9 @@ Il gate d'ingresso vale per **una sola candela 5m**: il bot piazza un `entry_ini
 - In un drift al rialzo si possono accumulare giorni senza un solo fill pur piazzando decine di ordini al giorno (47 ordini in 2 giorni, zero fill, il più vicino mancato per 0.18%). **Non è un guasto**: prima di sospettare il codice, misurare.
 - Ricetta di diagnosi: estrarre dal log le righe `post HYPE | buy long <qty>@<prezzo> entry_initial_normal_long` con il loro timestamp, scaricare le candele 1m da ccxt e confrontare il prezzo dell'ordine col **minimo dei 5 minuti successivi**. Se il gap è positivo il prezzo non è mai sceso al limite. Confrontando la stessa statistica prima e dopo un deploy si verifica anche che il pricing degli ingressi non sia cambiato (13/08: mediana +0.85% prima, +0.53% dopo → invariato nella sostanza).
 - ⚠️ Riferimento per capire se un periodo flat è anomalo: nel backtest `entry_interval_hours` ha mediana 10h, p95 ~40h, p99 ~62h.
-- **L'uscita 4RSI non è ancora mai scattata in live** dopo il merge del 13/08: il percorso panic close + validazione del reconciler resta verificato solo dai test.
+- ✅ **L'uscita 4RSI è scattata in live la prima volta il 2026-08-20 alle 02:30Z, e la patch ha retto**: `close_panic_long` emesso con il lato in modalità **normale**, accettato dal reconciler, nessun `FatalBotException` né `order family inconsistent`, processo vivo con PID invariato. È esattamente lo scenario che senza la patch del 13/08 avrebbe ucciso il bot **con posizione aperta**. Il percorso non è più solo teoria: è validato sul campo.
+  - Trade completo: entrata `entry_initial_normal_long` 15.28 HYPE @ 68.639 (01:16Z) → uscita in 4 fill @ 69.873/69.884 (02:30-02:31Z), durata 1h14m, **+17.89 USDC netti** (11709.64 → 11727.53). Chiusura totale, nessun residuo, posizione a zero.
+  - Da notare: l'uscita è arrivata in 2 ondate (l'ordine da 15.28 riempito in parte, poi ripiazzato per i 7.3 residui con `replace reason=qty Δq=109%`). La riga `missing order ... src=fetch_open_orders` in mezzo è normale: l'ordine era già stato consumato dal fill.
 
 ## Vincoli noti
 - `candle_interval_minutes` deve restare 1.
