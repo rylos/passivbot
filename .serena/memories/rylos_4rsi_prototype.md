@@ -26,7 +26,21 @@ Upstream valida ogni ordine prodotto da Rust contro l'input inviato e rifiuta la
 
 ## Caratterizzazione del comportamento (misurata il 2026-08-21)
 Su 68 posizioni di un backtest giugno→agosto 2026:
-- **L'uscita 4RSI domina**: **68 `close_panic_long` contro 12 `close_grid_long`**. La griglia di chiusura di `trailing_grid_v7` è quasi decorativa — chi chiude le posizioni è l'oscillatore.
+- **L'uscita 4RSI domina in frequenza**: **68 `close_panic_long` contro 12 `close_grid_long`**. Chi chiude quasi sempre è l'oscillatore.
+- ❌ **MA "la griglia di chiusura è quasi decorativa" è FALSO** — l'avevo scritto il 21/08 leggendo quel 12-contro-68, ed è smentito da un A/B su 2 anni (2024-08-01 → 2026-08-21, bybit, tick pinnato) fatto il 22/08:
+
+  | | base | solo trailing close | markup 1,5% | markup 3% |
+  |---|---|---|---|---|
+  | adg | 0,983% | 0,756% | 0,733% | 0,763% |
+  | **adg_w** | **+0,486%** | **−2,45%** | −2,46% | −2,45% |
+  | **drawdown** | **28,0%** | **99,96%** | 99,96% | 99,96% |
+  | sortino | 0,205 | 0,045 | 0,045 | 0,046 |
+  | `position_held_days_max` | **3,99 gg** | **47,16 gg** | 47,16 | 47,16 |
+  | `loss_profit_ratio` | 0,0085 | **0,0** | 0,0 | 0,0 |
+
+  Disattivarla in qualunque modo (sostituendola col trailing, o alzando `grid_markup_start` sopra ~0,3%) porta il drawdown **al 99,96%** e le posizioni a restare aperte **47 giorni**. `loss_profit_ratio` a 0 significa che non realizza più nessuna perdita: tiene le posizioni perdenti all'infinito.
+- **Quindi il ruolo vero è: valvola di sicurezza, non generatore di profitto.** Il 4RSI chiude i casi buoni, la griglia smaltisce i casi carichi che il segnale non raggiunge — ed è il markup interpolato fino a **−1,86%** (`mem:strategy_mechanics_trailing_grid_v7` §4) a permetterle di uscire in perdita quando l'esposizione è alta. È rara *proprio perché* è un'assicurazione.
+- ⚠️ **Lezione di metodo**: quel "12 su 68" veniva da una finestra di due mesi calmi. Una statistica di frequenza su una finestra breve e benigna **non dice niente sul ruolo di un meccanismo nella coda**. Le assicurazioni si vedono poco per definizione — contarle non le valuta, spegnerle sì.
 - **Gradini di griglia riempiti**: media **3,25**, mediana 1, **max 12** (36 posizioni su 68 chiudono al primo gradino). Durata posizione: mediana 2,83h, media 4,76h, max 95,75h.
 - ⚠️ Conseguenza da ricordare quando si ragiona sui bounds: la profondità teorica della griglia a budget TWE esaurito è ~17 gradini (formula `n = log(1 + TWE/(first·leva)·(mult−1))/log(mult)`, con `initial_qty_pct` 0.00812 e double-down 1.32), ma se ne osservano 12 perché **l'uscita 4RSI arriva prima che il budget si saturi**. Qualsiasi ragionamento sulla griglia che ignori l'uscita sovrastima i gradini reali.
 
