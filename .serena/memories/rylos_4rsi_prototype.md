@@ -24,6 +24,12 @@ Upstream valida ogni ordine prodotto da Rust contro l'input inviato e rifiuta la
 - ⚠️ `reconciler.py` è un file che upstream tocca spesso: aspettarsi attrito a ogni merge futuro. Se i test di quel file falliscono dopo un merge, guardare prima lì.
 - Valutata e scartata una famiglia d'ordine dedicata (`close_rylos_*`): richiederebbe enum Rust + mappa custom_id + tutti i validatori per prefisso + contabilità fill in backtest/analysis, e perderebbe i comportamenti impliciti di `_order_is_panic` (priorità `risk_critical`, esenzione churn gate). Più superficie di divergenza, non meno.
 
+## Caratterizzazione del comportamento (misurata il 2026-08-21)
+Su 68 posizioni di un backtest giugno→agosto 2026:
+- **L'uscita 4RSI domina**: **68 `close_panic_long` contro 12 `close_grid_long`**. La griglia di chiusura di `trailing_grid_v7` è quasi decorativa — chi chiude le posizioni è l'oscillatore.
+- **Gradini di griglia riempiti**: media **3,25**, mediana 1, **max 12** (36 posizioni su 68 chiudono al primo gradino). Durata posizione: mediana 2,83h, media 4,76h, max 95,75h.
+- ⚠️ Conseguenza da ricordare quando si ragiona sui bounds: la profondità teorica della griglia a budget TWE esaurito è ~17 gradini (formula `n = log(1 + TWE/(first·leva)·(mult−1))/log(mult)`, con `initial_qty_pct` 0.00812 e double-down 1.32), ma se ne osservano 12 perché **l'uscita 4RSI arriva prima che il budget si saturi**. Qualsiasi ragionamento sulla griglia che ignori l'uscita sovrastima i gradini reali.
+
 ## Comportamento live degli ingressi (osservato 13-15/08/2026)
 Il gate d'ingresso vale per **una sola candela 5m**: il bot piazza un `entry_initial_normal_long` alla chiusura della candela che soddisfa il segnale e lo **ritira** (`reasons=retire`) quando la candela successiva non lo conferma. La finestra utile per il fill è quindi di ~5 minuti, e il limite sta sotto il mercato: serve un ritracciamento dello 0.2-0.9% dentro quei 5 minuti.
 - In un drift al rialzo si possono accumulare giorni senza un solo fill pur piazzando decine di ordini al giorno (47 ordini in 2 giorni, zero fill, il più vicino mancato per 0.18%). **Non è un guasto**: prima di sospettare il codice, misurare.
