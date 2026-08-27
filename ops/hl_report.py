@@ -1,40 +1,40 @@
 #!/usr/bin/env python3
-"""Report periodico del bot live ry-hl su Telegram (Claude RyLoS Bot).
+"""Notifica Telegram sui trade di ry-hl (Claude RyLoS Bot).
 
-Complementare al watchdog: quello avvisa quando qualcosa ROMPE (via
-healthchecks.io), questo dice periodicamente "sto vivo e sto facendo questo".
-Nato per il periodo di ferie di Marco (15-27 agosto 2026), quando nessuno
-guarda i log e il silenzio di healthchecks non e' distinguibile da un
-watchdog morto senza aprire il telefono.
+Nato come report a orari fissi per le ferie (15-27 agosto 2026); dal 27/08 e'
+event-driven, perche' due messaggi al giorno che dicono sempre la stessa cosa
+si smettono di leggere. Ora parla solo quando **cambia lo stato della
+posizione**: apertura e chiusura. I gradini intermedi della griglia non
+generano messaggi — finirebbero per essere il grosso del traffico — ma vengono
+contati e riassunti alla chiusura.
 
-Sola lettura: non riavvia e non tocca il bot. Cron 2 volte al giorno.
+Sola lettura: non riavvia e non tocca il bot. Il guasto resta compito del
+watchdog (`watchdog.py`, cron ogni 10 min, con healthchecks come dead man
+switch); questo file si occupa solo di raccontare i trade.
 """
 from __future__ import annotations
 
-import calendar
 import glob
 import json
 import os
 import re
 import subprocess
-import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
 BASE = Path.home() / "watchdog"
 CREDS = BASE / "telegram.json"
+STATE = BASE / "trades_state.json"
 LOGDIR = Path("/opt/passivbot-hl/logs")
 LOG_GLOB = str(LOGDIR / "*config_hl_4rsi.json.log")
 
-TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z")
-HEALTH_RE = re.compile(
-    r"\[health\] up=(\S+) loop=(\S+) pos=(\S+) bal=([\d.]+) \S+ ord=(\S+) fills=(\d+) err=(\d+)/(\d+)"
+POS_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}):\d{2}Z.*\[pos\]\s+(new|added|reduced|closed)\s+HYPE\s+"
+    r"long\s+[\d.]+ @ [\d.]+\s+-> ([\d.]+) @ ([\d.]+)"
 )
-
-
-def esc(s: str) -> str:
-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+FILL_RE = re.compile(r"\[fill\].*HYPE long (\S+) ([+\-\d.]+) @ ([\d.]+)(?:, pnl=([+\-\d.]+))?")
+BAL_RE = re.compile(r"\[health\].*bal=([\d.]+)")
 
 
 def send(text: str) -> None:
@@ -47,14 +47,13 @@ def send(text: str) -> None:
         r.read()
 
 
-def bot_pid() -> str | None:
+def bot_alive() -> bool:
     r = subprocess.run(
         ["pgrep", "-f", r"python src/main\.py configs/live/config_hl_4rsi\.json"],
         capture_output=True,
         text=True,
     )
-    pids = [p for p in r.stdout.split() if p.strip()]
-    return pids[0] if pids else None
+    return bool(r.stdout.strip())
 
 
 def current_log() -> str | None:
@@ -62,90 +61,121 @@ def current_log() -> str | None:
     return max(files, key=os.path.getmtime) if files else None
 
 
-def ts_of(line: str) -> float | None:
-    m = TS_RE.match(line)
-    return calendar.timegm(time.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S")) if m else None
+def load_state() -> dict:
+    if STATE.exists():
+        try:
+            return json.loads(STATE.read_text())
+        except json.JSONDecodeError:
+            pass
+    return {}
 
 
 def main() -> None:
-    pid = bot_pid()
     path = current_log()
     if path is None:
-        send("🔴 <b>ry-hl</b>: nessun log trovato in /opt/passivbot-hl/logs.")
         return
+    state = load_state()
 
-    # Ultime 24h di log: bastano gli ultimi MB, il log cresce ~300 KB/giorno.
+    # Bastano gli ultimi MB: il log cresce ~300 KB/giorno e qui interessa
+    # solo cosa e' successo dall'ultimo giro.
     with open(path, "rb") as f:
-        f.seek(max(0, os.path.getsize(path) - 3_000_000))
+        f.seek(max(0, os.path.getsize(path) - 2_000_000))
         lines = f.read().decode(errors="replace").splitlines()
 
-    cutoff = time.time() - 24 * 3600
-    recent = [l for l in lines if (t := ts_of(l)) is not None and t >= cutoff]
-
-    health = None
-    for l in reversed(lines):
-        m = HEALTH_RE.search(l)
+    events = []
+    for line in lines:
+        m = POS_RE.match(line)
         if m:
-            health = m
-            break
-
-    # Gli stessi filtri del watchdog: il ciclo degraded e il backoff sono
-    # rumore previsto, non guasti.
-    errs = [
-        l
-        for l in recent
-        if (" ERROR " in l or " CRITICAL " in l or "Traceback (most recent" in l)
-        and "[cycle] degraded" not in l
-        and "action=record_error_restart_backoff" not in l
-    ]
-    restarts = [l for l in recent if "restarting bot..." in l]
-    fills = [l for l in recent if "[fill]" in l or " filled " in l.lower()]
-
-    last_ts = next((t for l in reversed(lines) if (t := ts_of(l)) is not None), None)
-    age_min = (time.time() - last_ts) / 60 if last_ts else None
-
-    # Il giallo deve significare "guarda ADESSO", non "9 ore fa l'API di
-    # Hyperliquid e' stata giu' e il bot si e' ripreso da solo". Quindi pesano
-    # solo gli errori delle ultime 2h; quelli delle 24h restano come contatore
-    # informativo. Idem per i riavvii interni: qualcuno e' fisiologico, una
-    # raffica no.
-    recent_cut = time.time() - 2 * 3600
-    errs_2h = [l for l in errs if (t := ts_of(l)) is not None and t >= recent_cut]
-    ok = (
-        pid is not None
-        and not errs_2h
-        and len(restarts) < 5
-        and (age_min is not None and age_min < 35)
-    )
-    # Quando va tutto bene il messaggio deve essere UNA riga: chi lo legge dal
-    # telefono vuole sapere che il bot e' vivo e quanto ha in cassa, non
-    # rileggere sei righe di diagnostica identiche a quelle di ieri. Il
-    # dettaglio serve solo quando c'e' qualcosa da guardare, ed e' proprio il
-    # contrasto con la riga breve a farlo notare.
-    if ok:
-        bal = f"{health.group(4)} USDC" if health else "bal ?"
-        pos = health.group(3) if health else "?"
-        stato = "flat" if pos.startswith("0L/0S") else f"pos {pos}"
-        send(f"🟢 ry-hl · {bal} · {stato} · {len(fills)} fill/24h")
+            events.append(
+                {
+                    "key": f"{m.group(1)}T{m.group(2)}|{m.group(3)}|{m.group(4)}",
+                    "day": m.group(1),
+                    "time": m.group(2),
+                    "kind": m.group(3),
+                    "size": float(m.group(4)),
+                    "price": float(m.group(5)),
+                }
+            )
+    if not events:
         return
 
-    rows = ["🟠 <b>ry-hl da guardare</b>"]
-    rows.append(f"pid: {pid or '<b>ASSENTE</b>'}")
-    if health:
-        rows.append(
-            f"up={health.group(1)} pos={health.group(3)} bal={health.group(4)} USDC "
-            f"ord={health.group(5)} err={health.group(7)}/{health.group(8)}"
-        )
-    if age_min is not None:
-        rows.append(f"ultima riga di log: {age_min:.0f} min fa")
-    rows.append(
-        f"24h: {len(errs)} errori ({len(errs_2h)} nelle ultime 2h), "
-        f"{len(restarts)} riavvii interni, {len(fills)} fill"
-    )
-    if errs_2h:
-        rows.append("<code>" + esc(errs_2h[-1][:200]) + "</code>")
+    last_key = state.get("last_key")
+    # Primo giro dopo l'installazione: registra il presente senza inondare
+    # la chat con lo storico.
+    if last_key is None:
+        state["last_key"] = events[-1]["key"]
+        state["steps"] = 0
+        STATE.write_text(json.dumps(state))
+        return
 
-    send("\n".join(rows))
+    known = {e["key"] for e in events}
+    if last_key in known:
+        idx = next(i for i, e in enumerate(events) if e["key"] == last_key)
+        fresh = events[idx + 1 :]
+    else:
+        # last_key fuori dal buffer (log ruotato, o script fermo abbastanza a
+        # lungo da farlo scorrere via). Rigiocare tutto manderebbe una raffica
+        # di messaggi su trade vecchi: mi risincronizzo in silenzio, che e' il
+        # comportamento sicuro. Il rischio e' perdere la notifica di un trade,
+        # non inondare la chat — e i trade restano nel log.
+        state["last_key"] = events[-1]["key"]
+        state["steps"] = 0
+        STATE.write_text(json.dumps(state))
+        return
+
+    steps = state.get("steps", 0)
+    balance = None
+    for line in reversed(lines):
+        b = BAL_RE.search(line)
+        if b:
+            balance = b.group(1)
+            break
+
+    for ev in fresh:
+        if ev["kind"] == "new":
+            steps = 1
+            send(
+                f"📈 <b>ry-hl aperta</b> · {ev['size']:.2f} HYPE @ {ev['price']:.3f}"
+                f" · {ev['time']}"
+            )
+        elif ev["kind"] in ("added", "reduced"):
+            steps += 1  # niente messaggio: si riassume alla chiusura
+        elif ev["kind"] == "closed":
+            # Sommo solo i fill di QUESTA chiusura. Una chiusura puo' essere
+            # spezzata su piu' fill e scavallare il minuto (visto il 20/08:
+            # 02:30 e 02:31), quindi prendo una finestra di 3 minuti che
+            # finisce sull'evento. Scorrere all'indietro "fino a un timestamp
+            # minore" sommava anche le chiusure precedenti dello stesso
+            # giorno: +44,13 dove il fill vero era +25,78.
+            end_min = int(ev["time"][:2]) * 60 + int(ev["time"][3:])
+            pnl = 0.0
+            for line in lines:
+                if not line.startswith(ev["day"]) or "[fill]" not in line:
+                    continue
+                if "close" not in line:
+                    continue
+                hhmm = line.split("T")[1][:5]
+                fill_min = int(hhmm[:2]) * 60 + int(hhmm[3:])
+                if not (end_min - 3 <= fill_min <= end_min):
+                    continue
+                m = FILL_RE.search(line)
+                if m and m.group(4):
+                    pnl += float(m.group(4))
+            grad = f" · {steps} gradini" if steps > 1 else ""
+            bal = f" · cassa {balance}" if balance else ""
+            send(
+                f"✅ <b>ry-hl chiusa</b> · <b>{pnl:+.2f}</b> USDT{grad}{bal}"
+                f" · {ev['time']}"
+            )
+            steps = 0
+
+    if fresh:
+        state["last_key"] = fresh[-1]["key"]
+    state["steps"] = steps
+    STATE.write_text(json.dumps(state))
+
+    if not bot_alive():
+        send("🔴 <b>ry-hl: processo assente</b> — se ne occupa il watchdog, ma tienilo d'occhio.")
 
 
 if __name__ == "__main__":

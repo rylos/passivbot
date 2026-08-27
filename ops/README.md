@@ -6,7 +6,7 @@ sopravvivere a una ricostruzione del server e a versionare le modifiche.
 | file | dove gira | cron |
 |---|---|---|
 | `watchdog_ry_hl.py` | amazon, `~/watchdog/watchdog.py` | `*/10 * * * *` |
-| `hl_report.py` | amazon, `~/watchdog/hl_report.py` | `0 9,21 * * *` |
+| `hl_report.py` | amazon, `~/watchdog/hl_report.py` | `*/5 * * * *` |
 
 Dopo ogni modifica qui, ricopiare sul server e verificare che l'md5 combaci:
 
@@ -46,22 +46,36 @@ due notifiche dello stesso evento da due bot diversi.
 
 ## hl_report.py
 
-Report periodico su Telegram (Claude RyLoS Bot), **sola lettura**: non riavvia e
-non tocca il bot. Nato per il periodo di ferie del 2026-08-15 → 27.
+Notifiche Telegram sui **trade** di ry-hl (Claude RyLoS Bot), **sola lettura**:
+non riavvia e non tocca il bot. Il guasto resta compito del watchdog.
 
-Risponde alla domanda che il watchdog non copre: *"va tutto bene?"*. Healthchecks
-notifica solo quando qualcosa rompe, e il silenzio non è distinguibile da un
-watchdog morto senza aprire il telefono e controllare a mano.
+Nato come report a orari fissi per le ferie del 2026-08-15 → 27; dal 27/08 è
+**event-driven**, perché due messaggi al giorno che dicono sempre la stessa
+cosa si smettono di leggere — e un report che non si legge non protegge.
 
-Manda pid, riga `[health]` corrente (up, posizione, balance, ordini, contatore
-errori), età dell'ultima riga di log e il conteggio 24h di errori/riavvii
-interni/fill.
+Parla solo quando **cambia lo stato della posizione**:
 
-Verde vs giallo: il giallo deve voler dire *"guarda adesso"*, quindi pesano solo
-gli **errori delle ultime 2 ore** — non quelli delle 24h, che includono gli
-hiccup dell'API Hyperliquid da cui il bot si riprende da solo con un riavvio
-interno. Giallo anche se il processo è assente, il log è fermo da >35 min, o i
-riavvii interni in 24h sono ≥5 (uno o due sono fisiologici, una raffica no).
+- `📈 ry-hl aperta · 13.62 HYPE @ 80.629 · 13:25`
+- `✅ ry-hl chiusa · +25.78 USDT · 2 gradini · cassa 12271.96 · 17:35`
 
-Le credenziali stanno in `~/watchdog/telegram.json` (chmod 600), già presente e
-condiviso col watchdog.
+I gradini intermedi della griglia **non generano messaggi** (sarebbero il grosso
+del traffico: fino a 12 per posizione) ma vengono contati e riassunti alla
+chiusura.
+
+Stato in `~/watchdog/trades_state.json`: ultimo evento `[pos]` notificato più il
+contatore dei gradini.
+
+Due trappole già pagate, entrambe verificate con un test:
+
+- **il PnL di una chiusura** va sommato su una **finestra di 3 minuti che
+  finisce sull'evento**, non scorrendo all'indietro "fino a un timestamp
+  minore": quella versione sommava anche le chiusure precedenti dello stesso
+  giorno e dava +44,13 dove il fill vero era +25,78. Una chiusura può essere
+  spezzata su più fill e scavallare il minuto (20/08: 02:30 e 02:31).
+- **se `last_key` esce dal buffer** letto dal log (rotazione, o script fermo a
+  lungo), NON si rigioca lo storico — si risincronizza in silenzio. Rigiocare
+  manderebbe una raffica di notifiche su trade vecchi. Si preferisce perdere
+  una notifica che inondare la chat; i trade restano comunque nel log.
+
+Le credenziali stanno in `~/watchdog/telegram.json` (chmod 600), condiviso col
+watchdog.
