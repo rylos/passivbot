@@ -117,9 +117,19 @@ def main() -> None:
         and len(restarts) < 5
         and (age_min is not None and age_min < 35)
     )
-    head = "🟢 <b>ry-hl OK</b>" if ok else "🟠 <b>ry-hl da guardare</b>"
+    # Quando va tutto bene il messaggio deve essere UNA riga: chi lo legge dal
+    # telefono vuole sapere che il bot e' vivo e quanto ha in cassa, non
+    # rileggere sei righe di diagnostica identiche a quelle di ieri. Il
+    # dettaglio serve solo quando c'e' qualcosa da guardare, ed e' proprio il
+    # contrasto con la riga breve a farlo notare.
+    if ok:
+        bal = f"{health.group(4)} USDC" if health else "bal ?"
+        pos = health.group(3) if health else "?"
+        stato = "flat" if pos.startswith("0L/0S") else f"pos {pos}"
+        send(f"🟢 ry-hl · {bal} · {stato} · {len(fills)} fill/24h")
+        return
 
-    rows = [head]
+    rows = ["🟠 <b>ry-hl da guardare</b>"]
     rows.append(f"pid: {pid or '<b>ASSENTE</b>'}")
     if health:
         rows.append(
