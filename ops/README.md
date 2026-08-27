@@ -56,7 +56,7 @@ cosa si smettono di leggere — e un report che non si legge non protegge.
 Parla solo quando **cambia lo stato della posizione**:
 
 - `📈 ry-hl aperta · 13.62 HYPE @ 80.629 · 13:25`
-- `✅ ry-hl chiusa · +25.78 USDT · 2 gradini · cassa 12271.96 · 17:35`
+- `✅ ry-hl chiusa · +25.78 USDT · 2 gradini · wallet 12271.96 · 17:35`
 
 I gradini intermedi della griglia **non generano messaggi** (sarebbero il grosso
 del traffico: fino a 12 per posizione) ma vengono contati e riassunti alla

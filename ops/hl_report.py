@@ -162,7 +162,7 @@ def main() -> None:
                 if m and m.group(4):
                     pnl += float(m.group(4))
             grad = f" · {steps} gradini" if steps > 1 else ""
-            bal = f" · cassa {balance}" if balance else ""
+            bal = f" · wallet {balance}" if balance else ""
             send(
                 f"✅ <b>ry-hl chiusa</b> · <b>{pnl:+.2f}</b> USDT{grad}{bal}"
                 f" · {ev['time']}"
