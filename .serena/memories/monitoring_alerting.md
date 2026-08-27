@@ -24,12 +24,20 @@ Scelta di Marco, la stessa applicata al watchdog freqtrade. Un bot **vivo ma blo
 ## Riavvio INTERNO del bot (da non confondere con un crash)
 Su raffiche di errori dell'API Hyperliquid (`ExchangeNotAvailable` su `refresh_authoritative_state`) il bot raggiunge il proprio budget errori — riga `[health] error_budget count=10 limit=10 window=1h action=restart_at_limit` — solleva `RestartBotException` e **si riavvia dentro lo stesso processo**: PID invariato, contatore `up=` che riparte da zero, nessuna rotazione del log, watchdog non coinvolto (il processo non è mai morto). Ripartenza completa in ~3-4 minuti, con un `RequestTimeout` sul caricamento mercati che è normale in quella fase. Visto il 2026-08-08 e il 2026-08-15, entrambe le volte con recupero autonomo e riconciliazione corretta della posizione. Quindi: `up=` basso con PID vecchio non è un mistero, è questo.
 
-## Report periodico su Telegram (dal 2026-08-15, per le ferie)
-`~/watchdog/hl_report.py` su amazon, cron `0 9,21 * * *` (server in Europe/Rome), log `~/watchdog/hl_report.log`. Copia versionata in **`ops/hl_report.py`**. **Sola lettura**: non riavvia e non tocca il bot — il riavvio resta esclusiva del watchdog.
-Nato per le ferie di Marco (15 → 27 agosto 2026, rientro il 27), quando nessuno guarda i log. Risponde alla domanda che healthchecks **non** copre: *"va tutto bene?"*. Healthchecks notifica solo quando qualcosa rompe, e il suo silenzio non è distinguibile da un watchdog morto senza controllare a mano. È l'unico canale con `TELEGRAM_ENABLED` di fatto attivo (usa `send()` propria, con `~/watchdog/telegram.json`), e non duplica gli alert perché manda a orari fissi, non sugli eventi.
-Contenuto: pid, riga `[health]` corrente (up, pos, balance, ordini, `err=N/10`), età dell'ultima riga di log, conteggio 24h di errori/riavvii interni/fill.
-- **Verde vs giallo**: il giallo deve voler dire *"guarda adesso"*, quindi pesano solo gli **errori delle ultime 2 ore**, non quelli delle 24h — che includono gli hiccup dell'API Hyperliquid da cui il bot si riprende da solo col riavvio interno (vedi sezione sopra). Prima versione: contava le 24h e segnava giallo per errori vecchi di 9 ore già risolti. Giallo anche se: processo assente, log fermo >35 min, o **≥5 riavvii interni in 24h** (uno o due sono fisiologici, una raffica no).
-- Filtri sugli errori identici a quelli del watchdog (`[cycle] degraded` e `action=record_error_restart_backoff` esclusi: sono rumore previsto).
+## Notifiche trade su Telegram (dal 2026-08-15; **event-driven dal 2026-08-27**)
+`~/watchdog/hl_report.py` su amazon, cron **`*/5 * * * *`**, log `~/watchdog/hl_report.log`, stato `~/watchdog/trades_state.json`. Copia versionata in **`ops/hl_report.py`**. **Sola lettura**: non riavvia e non tocca il bot — guasti e riavvii restano esclusiva del watchdog. È l'unico canale con invio Telegram diretto attivo (`send()` propria, con `~/watchdog/telegram.json`).
+
+**Storia del cambiamento, perché è la lezione**: nato per le ferie (15→27 agosto 2026) come report a **orari fissi** (`0 9,21`) che diceva "va tutto bene" — la domanda che healthchecks non copre, dato che notifica solo sul fail e il suo silenzio non è distinguibile da un watchdog morto. Il 27/08 Marco ha detto che era **troppo verboso**: sei righe di diagnostica identiche a quelle di ieri, due volte al giorno, si smettono di leggere — e un report che non si legge non protegge. Prima l'ho ridotto a una riga, poi lui ha chiesto di spegnere gli orari fissi e **notificare solo i trade**.
+
+Ora manda solo quando **cambia lo stato della posizione**:
+- `📈 ry-hl aperta · 13.62 HYPE @ 80.629 · 13:25`
+- `✅ ry-hl chiusa · +25.78 USDT · 2 gradini · wallet 12271.96 · 17:35`
+
+I gradini intermedi della griglia **non generano messaggi** (fino a 12 per posizione: sarebbero il grosso del traffico) ma vengono contati e riassunti alla chiusura.
+
+⚠️ **Due trappole già pagate, entrambe con un test a dimostrarle**:
+1. **Il PnL di una chiusura** va sommato su una **finestra di 3 minuti che finisce sull'evento**, non scorrendo all'indietro "fino a un timestamp minore": quella versione inglobava le chiusure precedenti dello stesso giorno e dava **+44,13 dove il fill vero era +25,78**. Una chiusura può essere spezzata su più fill e scavallare il minuto (20/08: 02:30 e 02:31; 25/08: tre fill sullo stesso minuto).
+2. **Se `last_key` esce dal buffer letto dal log** (rotazione, o script fermo a lungo) NON si rigioca lo storico: ci si **risincronizza in silenzio**. Rigiocare manderebbe una raffica di notifiche su trade vecchi. Meglio perdere una notifica che inondare la chat — i trade restano nel log.
 
 ## Monitor fronte di Pareto — su debian
 `~/pareto_monitor/monitor.py` (marco@debian), cron `*/20`. Confronta i membri del fronte con la config live girata **sullo stesso dataset**. Baseline in `~/pareto_monitor/baseline_live.json`: dal 2026-08-05 è il backtest del candidato live **`afe61aed`** (`backtests/combined/2026-08-04T18_22_09/analysis.json`, 733gg, bybit, candele al 04/08). **Quando si cambia config live va rigenerato**, altrimenti il monitor confronta con la config vecchia (errore già commesso una volta). Avvisa su due livelli: DOMINANTE (meglio-o-uguale su tutti gli 8 obiettivi, meglio su ≥1) e FORTE (batte entrambi gli adg senza peggiorare `drawdown_worst_strategy_eq`). Dedup per hash, max 4 messaggi per giro, riepilogo finale e auto-spegnimento quando l'optimize termina.
@@ -41,6 +49,7 @@ Dal 2026-08-06 anche il bot **freqtrade RyLoS T4G** su amazon ha il suo watchdog
 
 ## Controllo agentico
 Cron di sessione Claude Code ogni 30 min (:08 e :38) che ispeziona ry-hl ed è autorizzato da Marco a fixare e riavviare, avvisando su Telegram prima e dopo. Vive solo finché la sessione è aperta (scade dopo 7 giorni): il watchdog di sistema su amazon è la rete di sicurezza sempre attiva.
-⚠️ **Limite da dire sempre a Marco**: monitor e cron di sessione **non sopravvivono a un'assenza lunga** (sessione chiusa, PC spento, riavvio). Per le assenze — es. le ferie del 15-27 agosto 2026 — la copertura vera è solo quella server-side: watchdog `*/10` con riavvio automatico + healthchecks come dead man switch + `hl_report.py` due volte al giorno. Non spacciare un monitor di sessione per sorveglianza continua.
+⚠️ **Limite da dire sempre a Marco**: monitor e cron di sessione **non sopravvivono a un'assenza lunga** (sessione chiusa, PC spento, riavvio). Per le assenze — es. le ferie del 15-27 agosto 2026 — la copertura vera è solo quella server-side: watchdog `*/10` con riavvio automatico + healthchecks come dead man switch + `hl_report.py`. Non spacciare un monitor di sessione per sorveglianza continua.
+✅ **Confermato dai fatti**: il monitor di sessione è morto il 22/08 per un errore ssh (exit 255) e me ne sono accorto **quattro giorni dopo**, il 26. In quei giorni la copertura server-side ha retto senza aiuto — bot vivo, 13 chiusure di cui 12 in profitto, +422 USDC. Quando si riarma il monitor, far sì che la caduta del canale ssh **si annunci** invece di morire in silenzio.
 
 Vedi anche `mem:live_deployment`, `mem:optimize_workflow`.
