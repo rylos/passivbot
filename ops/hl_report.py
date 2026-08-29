@@ -34,7 +34,12 @@ POS_RE = re.compile(
     r"long\s+[\d.]+ @ [\d.]+\s+-> ([\d.]+) @ ([\d.]+)"
 )
 FILL_RE = re.compile(r"\[fill\].*HYPE long (\S+) ([+\-\d.]+) @ ([\d.]+)(?:, pnl=([+\-\d.]+))?")
-BAL_RE = re.compile(r"\[health\].*bal=([\d.]+)")
+# Il wallet va letto dalla riga piu' recente fra due sorgenti: [health] esce
+# ogni ~15 minuti, quindi alla chiusura di un trade e' quasi sempre vecchia e
+# riporta il saldo PRE-chiusura (visto il 28/08: messaggio con 12290.05 quando
+# il wallet reale era gia' 12521.68). [balance] invece viene emessa nello
+# stesso secondo del fill che muove il saldo: e' quella che vale.
+BAL_RE = re.compile(r"\[health\].*bal=([\d.]+)|\[balance\].*equity=([\d.]+)")
 
 
 def send(text: str) -> None:
@@ -128,12 +133,15 @@ def main() -> None:
     for line in reversed(lines):
         b = BAL_RE.search(line)
         if b:
-            balance = b.group(1)
+            balance = f"{float(b.group(1) or b.group(2)):.2f}"
             break
+
+    opened_at = state.get("opened_at")
 
     for ev in fresh:
         if ev["kind"] == "new":
             steps = 1
+            opened_at = f"{ev['day']}T{ev['time']}"
             send(
                 f"📈 <b>ry-hl aperta</b> · {ev['size']:.2f} HYPE @ {ev['price']:.3f}"
                 f" · {ev['time']}"
@@ -141,26 +149,33 @@ def main() -> None:
         elif ev["kind"] in ("added", "reduced"):
             steps += 1  # niente messaggio: si riassume alla chiusura
         elif ev["kind"] == "closed":
-            # Sommo solo i fill di QUESTA chiusura. Una chiusura puo' essere
-            # spezzata su piu' fill e scavallare il minuto (visto il 20/08:
-            # 02:30 e 02:31), quindi prendo una finestra di 3 minuti che
-            # finisce sull'evento. Scorrere all'indietro "fino a un timestamp
-            # minore" sommava anche le chiusure precedenti dello stesso
-            # giorno: +44,13 dove il fill vero era +25,78.
-            end_min = int(ev["time"][:2]) * 60 + int(ev["time"][3:])
+            # Il PnL della posizione e' la somma dei fill di chiusura da
+            # quando e' stata aperta a quando si e' chiusa. Due errori gia'
+            # pagati su questa riga:
+            #  - scorrere all'indietro "fino a un timestamp minore" sommava
+            #    anche le chiusure PRECEDENTI dello stesso giorno: +44,13
+            #    dove il fill vero era +25,78 (20/08);
+            #  - la finestra di 3 minuti che chiudeva il buco sopra escludeva
+            #    pero' le riduzioni intermedie della griglia di chiusura:
+            #    +237,81 dove la posizione aveva reso +246,57 (28/08).
+            # L'istante di apertura e' in stato, quindi la finestra e' esatta.
+            # Senza (risincronizzazione) resto sui 3 minuti prudenziali.
+            start = opened_at or f"{ev['day']}T{ev['time']}"
+            end = f"{ev['day']}T{ev['time']}"
+            if opened_at is None:
+                end_min = int(ev["time"][:2]) * 60 + int(ev["time"][3:])
+                start = f"{ev['day']}T{(end_min - 3) // 60:02d}:{(end_min - 3) % 60:02d}"
             pnl = 0.0
             for line in lines:
-                if not line.startswith(ev["day"]) or "[fill]" not in line:
+                if "[fill]" not in line or "close" not in line:
                     continue
-                if "close" not in line:
-                    continue
-                hhmm = line.split("T")[1][:5]
-                fill_min = int(hhmm[:2]) * 60 + int(hhmm[3:])
-                if not (end_min - 3 <= fill_min <= end_min):
+                stamp = line[:16]  # YYYY-MM-DDTHH:MM
+                if not (start <= stamp <= end):
                     continue
                 m = FILL_RE.search(line)
                 if m and m.group(4):
                     pnl += float(m.group(4))
+            opened_at = None
             grad = f" · {steps} gradini" if steps > 1 else ""
             bal = f" · wallet {balance}" if balance else ""
             send(
@@ -172,6 +187,7 @@ def main() -> None:
     if fresh:
         state["last_key"] = fresh[-1]["key"]
     state["steps"] = steps
+    state["opened_at"] = opened_at
     STATE.write_text(json.dumps(state))
 
     if not bot_alive():

@@ -62,16 +62,23 @@ I gradini intermedi della griglia **non generano messaggi** (sarebbero il grosso
 del traffico: fino a 12 per posizione) ma vengono contati e riassunti alla
 chiusura.
 
-Stato in `~/watchdog/trades_state.json`: ultimo evento `[pos]` notificato più il
-contatore dei gradini.
+Stato in `~/watchdog/trades_state.json`: ultimo evento `[pos]` notificato, il
+contatore dei gradini e **l'istante di apertura** della posizione in corso.
 
-Due trappole già pagate, entrambe verificate con un test:
+Tre trappole già pagate, tutte verificate con un test:
 
-- **il PnL di una chiusura** va sommato su una **finestra di 3 minuti che
-  finisce sull'evento**, non scorrendo all'indietro "fino a un timestamp
-  minore": quella versione sommava anche le chiusure precedenti dello stesso
-  giorno e dava +44,13 dove il fill vero era +25,78. Una chiusura può essere
-  spezzata su più fill e scavallare il minuto (20/08: 02:30 e 02:31).
+- **il PnL di una posizione** è la somma dei fill di chiusura fra la sua
+  apertura e la sua chiusura — per questo l'istante di apertura sta in stato.
+  Due versioni sbagliate prima di questa: scorrere all'indietro "fino a un
+  timestamp minore" sommava anche le chiusure precedenti dello stesso giorno
+  (+44,13 dove il fill vero era +25,78, il 20/08); la finestra di 3 minuti che
+  turava quel buco escludeva però le riduzioni intermedie della griglia di
+  chiusura (+237,81 dove la posizione aveva reso +246,57, il 28/08).
+- **il wallet** si legge dalla riga `[balance] ... equity=`, non da `[health]
+  bal=`: la health esce ogni ~15 minuti, quindi alla chiusura riporta quasi
+  sempre il saldo *pre*-chiusura (28/08: notificato 12290,05 quando il wallet
+  reale era già 12521,68). La riga `[balance]` esce invece nello stesso secondo
+  del fill che muove il saldo.
 - **se `last_key` esce dal buffer** letto dal log (rotazione, o script fermo a
   lungo), NON si rigioca lo storico — si risincronizza in silenzio. Rigiocare
   manderebbe una raffica di notifiche su trade vecchi. Si preferisce perdere
