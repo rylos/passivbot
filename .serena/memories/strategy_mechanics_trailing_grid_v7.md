@@ -48,6 +48,33 @@ se pnl_clip < 0 e |pnl| > allowance:  close_qty *= allowance/|pnl|
 ```
 Il budget **si ricarica quando il bot guadagna** (sale il picco) e **si erode col drawdown fino ad azzerarsi**, spegnendo l'unstuck da solo. Non può andare in spirale. La differenza fra questo e un unstuck senza tetto è tutta qui.
 
+## Quali pezzi reggono davvero l'impianto (A/B misurate il 2026-08-31)
+Tre ablazioni sulla **stessa** finestra 2024-12-10 → 2026-08-06, dati bybit, saldo 7353, config live, cambiando **un solo parametro** per volta. Configs su debian: `bt_cmp_full.json` (base), `bt_cmp_full_nogrid.json`, `bt_cmp_th1475.json`, `bt_cmp_th300.json`.
+```
+                            adg      drawdown   completion  giorni_max_in_pos
+base                     1,0408%      27,99%       1,00           4,0
+close grid OFF           0,7771%      99,97%       0,67          47,2
+  (close.trailing_grid_ratio 0,1 -> 1,0)
+exit_min_gain 0,646 -> 1,475%   0,1760%   99,19%   0,14          11,7
+exit_min_gain 0,646 -> 3,0%     0,4564%   99,36%   0,14          12,5
+```
+**Entrambi i pezzi contribuiscono pochissimo al pnl diretto e reggono tutto l'impianto.** L'attribuzione contabile del pnl per tipo di fill dice: `close_panic_long` (uscita 4RSI) 96%, close grid 1,7%, trailing 2,3%. Ma togliere la close grid porta il drawdown al 99,97%, e alzare `exit_min_gain` liquida il conto al 14% della finestra.
+⚠️ **Regola generale: l'attribuzione del pnl per tipo di fill misura chi incassa, non chi rende possibile incassare.** Il 4RSI chiude in guadagno posizioni che la griglia d'ingresso ha mediato e la close grid ha alleggerito. Ci sono cascato in entrambe le direzioni: prima chiamando la close grid "quasi decorativa" perché faceva 12 chiusure su 68, poi la sessione freqtrade stava per scartarla perché rende l'1,7%. Solo l'ablazione risponde.
+Il meccanismo comune: **soglia d'uscita bassa e close grid servono a liberare esposizione in fretta**, non a incassare. Alzando la soglia le posizioni restano appese (durata massima da 4 a 12 giorni), la WE resta al tetto, la griglia non ha spazio per mediare il ribasso successivo, il conto salta.
+
+## Commissioni effettive per tipo (misurate sui fill, non dedotte dalla config)
+```
+entry_grid / entry_initial / close_grid / close_trailing   0,0150%   maker
+close_panic_long (uscita 4RSI)                             0,0550%   TAKER
+```
+`calc_panic_close` prezza a `ask − 1 tick` per il long: **attraversa lo spread**. La gamba che porta il 96% del pnl è taker. Giro completo 0,070%; fee totali 220.269 su 3.671.682 di lordo = **6,0%**.
+⚠️ Nel confrontare i costi con un'altra strategia: **la leva si semplifica** nel rapporto fee/lordo (moltiplica costo e guadagno lordo nella stessa misura). La variabile che comanda è il **guadagno per trade**, non la leva.
+
+## Distribuzione dei guadagni realizzati dall'uscita 4RSI (994 fill)
+Mediana **+1,278%** di prezzo vs `pprice`, p5 +0,552%, max +7,346%. **Oltre +2% sta il 45,9% del pnl lordo, prodotto dal 25,5% dei fill**: la coda destra non è un residuo.
+⚠️ 117 fill su 994 hanno realizzato **meno** della soglia nominale 0,646%, minimo +0,127%: il cancello si valuta su `ob.bid` al segnale, l'esecuzione esce taker con slippage. La soglia effettiva è più morbida di quella nominale.
+Terzo cancello che non è un parametro e non sta nella config: `candle_color > 0.0` — l'ultima candela 5m chiusa dev'essere **verde** (`orchestrator.rs:2575`), in AND con osc, stoch e gain.
+
 ## Disattivato nel candidato live
 - **`hsl` (hard stop loss)**: `enabled: false`. La meccanica esiste (tier giallo/arancione/rosso, `red_threshold` 0.0522, cooldown 2780 min dopo un rosso). ⚠️ **Non verificato** se sia stato bocciato in ablazione o semplicemente non selezionato dal fronte — non spacciare la non-selezione per bocciatura.
 - short completamente disattivato.
