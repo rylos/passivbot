@@ -73,6 +73,19 @@ geometria freqtrade           LIQUIDATO 2025-03-11 (15%)          +52%    dd 53,
 **L'edge sta nell'ingresso selettivo; la griglia densa serve a sopravvivere dato quell'ingresso, non regge da sola.** A `-12,5/37` si entra sul primo cedimento e la griglia si carica *durante* la vera discesa: la media resta troppo alta per il rimbalzo di +0,65%. Nel ribasso bastano 54 posizioni e 2 a WE piena per morire: non uccide la coda lunga, uccide **una** posizione aperta troppo presto. Senza stop, una sola basta.
 Meccanismo di sopravvivenza nel ribasso (6 posizioni a WE piena, tutte chiuse in utile in 6–25 h): l'esposizione piena arriva a −8/−12% dalla prima entrata con media a **−5,2/−6,4%**, da lì non si compra più; l'uscita chiede media+0,65% cioè **+5/+8% dal minimo**, che HYPE ha sempre fatto. Peggior equity non realizzata −15,8% di conto (22/11/2025). Unstuck ed enforcer TWEL: **zero fill in tutta la storia**, sono valvole mai aperte. Il limite reale è la liquidazione a circa −30% dalla media (leva 10 cross, notional 2,93× equity), mai avvicinata in-sample.
 
+### I vincoli d'esecuzione contano quanto la strategia (ablazioni del 2026-09-02, pomeriggio)
+La sessione freqtrade non riesce a riprodurre l'equilibrio nel suo motore (max 11x contro 470x). Simulati due dei suoi vincoli fissi sul nostro bot, tutto il resto invariato. Configs su debian: `abl_exec_{cool,reb2,coolreb2}_{full,ribasso}.json`.
+- **cooldown 10 min fra fill d'ingresso** → `risk.entry_cooldown_minutes = 10` (gate nativo).
+- **DCA solo dopo rimbalzo +0,3% dal minimo, al prezzo del momento** → `entry.trailing_grid_ratio = 1.0`, soglia = spaziatura griglia con gli stessi pesi WE/vol, `trailing_retracement_pct` 0,003 senza pesi, `trailing_double_down_factor` = `grid_double_down_factor`. ⚠️ Con soglia 0 (solo rimbalzo) entra ogni 2-3 minuti su micro-rimbalzi: non è il meccanismo, scartato.
+```
+                     full                                ribasso
+live                 3.056.942  dd 25%   39 WE piene     +144%  dd 15,8%   6 WE piene
+cooldown 10m           799.471  dd 36%   29              +96%   dd 16,4%   5
+rimbalzo 0,3%        LIQUIDATO 2025-03-06 (10 WE piene)  +125%  dd 17,8%  10
+entrambi             LIQUIDATO 2025-03-06                +98%   dd 17,8%   9
+```
+**Comprare 0,3% sopra il livello invece che sul limit appoggiato alza la media e fa arrivare al tetto prima**: nel ribasso lento costa poco, nel crash di marzo 2025 (HYPE −40% in due settimane) non resta spazio per il rimbalzo di +0,65% e il conto salta. Il cooldown taglia i gradini nelle discese veloci (max 29→26) e costa un fattore ~4 sull'equity finale, ma la geometria regge. Le entrate della griglia **devono** essere limit appoggiati ai livelli e riempiti intra-candela: un motore che decide solo a chiusura candela non riproduce questa strategia, qualunque parametro usi.
+
 ## Commissioni effettive per tipo (misurate sui fill, non dedotte dalla config)
 ```
 entry_grid / entry_initial / close_grid / close_trailing   0,0150%   maker
