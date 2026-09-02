@@ -170,6 +170,21 @@ def _resolve_objective_columns(entry: dict, objective_keys: Iterable[str]) -> Li
     return resolved
 
 
+def _prefer_objective_basis(row: Dict[str, float], objective_values: Dict[str, float]) -> None:
+    """In suite mode the plain metric columns are the reducer aggregate over
+    ALL scenarios (whole period + segments), while the optimizer scores on
+    `optimize.objective_scenario`. Axes, frontier, filters and tooltips must
+    talk about the same numbers the optimizer saw, so the plain column takes
+    the objective value; the aggregate stays reachable as `<metric>_mean`."""
+    for column, value in objective_values.items():
+        if not column.startswith(OBJECTIVE_PREFIX):
+            continue
+        metric = column[len(OBJECTIVE_PREFIX):]
+        if metric in row and f"{metric}_mean" not in row:
+            row[f"{metric}_mean"] = row[metric]
+        row[metric] = value
+
+
 def _extract_objectives(entry: dict) -> Tuple[Dict[str, float], Dict[str, str], List[str]]:
     metrics_block = entry.get("metrics") or {}
     objectives = metrics_block.get("objectives") or {}
@@ -251,6 +266,7 @@ def load_pareto_dataframe(run_dir: str) -> RunData:
         params = _flatten_numeric(entry.get("bot", {}), prefix="bot")
         row = {**base, **suite_values, **params}
         row.update(objective_values)
+        _prefer_objective_basis(row, objective_values)
         for key in row:
             if key.startswith("bot."):
                 param_cols.add(key)
@@ -301,6 +317,7 @@ def load_history_dataframe(run_dir: str, max_points: int = 400) -> pd.DataFrame:
                 row.update(_flatten_stats_block(stats))
         objective_values, _, _ = _extract_objectives(record)
         row.update(objective_values)
+        _prefer_objective_basis(row, objective_values)
         for scenario, metric_values in scenario_values.items():
             for metric, value in metric_values.items():
                 row[f"{scenario}__{metric}"] = value
@@ -1986,6 +2003,8 @@ def serve_dash(data_root: str, host: str = "127.0.0.1", port: int = 8050):
                         # reducer aggregate over ALL scenarios (base + segments),
                         # so the same metric shows up twice: say which is which.
                         if suite_active and not metric.startswith(OBJECTIVE_PREFIX):
+                            if f"{OBJECTIVE_PREFIX}{metric}" in row.columns:
+                                continue  # gia' mostrato fra gli obiettivi
                             label += " [media scenari]"
                         summary_items.append(html.Div(f"{label}: {val:.4f}"))
         raw_entry = run_data.raw_configs.get(selected_id, {})
