@@ -1974,14 +1974,54 @@ def serve_dash(data_root: str, host: str = "127.0.0.1", port: int = 8050):
             for m in ["gain_strategy_eq"]:
                 if m not in metrics:
                     metrics.append(m)
+            suite_active = bool(
+                (run_data.raw_configs.get(selected_id, {}) or {}).get("suite_metrics")
+            )
             for metric in metrics:
                 if metric in row.columns:
                     val = row[metric].values[0]
                     if pd.notna(val):
-                        summary_items.append(
-                            html.Div(f"{_metric_label(run_data, metric)}: {val:.4f}")
-                        )
+                        label = _metric_label(run_data, metric)
+                        # In suite mode plain (non "objective.") columns are the
+                        # reducer aggregate over ALL scenarios (base + segments),
+                        # so the same metric shows up twice: say which is which.
+                        if suite_active and not metric.startswith(OBJECTIVE_PREFIX):
+                            label += " [media scenari]"
+                        summary_items.append(html.Div(f"{label}: {val:.4f}"))
         raw_entry = run_data.raw_configs.get(selected_id, {})
+        # Per-scenario values (suite mode): the whole-period scenario and the
+        # worst segment, which the aggregate above hides.
+        suite_payload = ((raw_entry.get("suite_metrics") or {}).get("metrics")) or {}
+        if suite_payload:
+            def _scen(metric, scenario):
+                return ((suite_payload.get(metric) or {}).get("scenarios") or {}).get(scenario)
+
+            def _stat(metric, field):
+                return ((suite_payload.get(metric) or {}).get("stats") or {}).get(field)
+
+            labels = (raw_entry.get("suite_metrics") or {}).get("scenario_labels") or []
+            if "base" in labels:
+                summary_items.append(
+                    html.Strong("base (periodo intero)", style={"display": "block", "marginTop": "8px"})
+                )
+                for metric in ("adg_strategy_eq", "gain_strategy_eq", "drawdown_worst_strategy_eq", "position_held_days_max"):
+                    val = _scen(metric, "base")
+                    if isinstance(val, (int, float)) and np.isfinite(val):
+                        summary_items.append(html.Div(f"{metric}: {val:.4f}", className="text-warning"))
+            segs = [s for s in labels if s != "base"]
+            if segs:
+                summary_items.append(
+                    html.Strong("segmenti (dd / mdg)", style={"display": "block", "marginTop": "8px"})
+                )
+                for s in segs:
+                    dd, mdg = _scen("drawdown_worst_strategy_eq", s), _scen("mdg_strategy_eq", s)
+                    if isinstance(dd, (int, float)) and isinstance(mdg, (int, float)):
+                        summary_items.append(html.Div(f"{s}: dd {dd:.3f} / mdg {mdg:.5f}"))
+                dd_max, mdg_min = _stat("drawdown_worst_strategy_eq", "max"), _stat("mdg_strategy_eq", "min")
+                if isinstance(dd_max, (int, float)) and isinstance(mdg_min, (int, float)):
+                    summary_items.append(
+                        html.Div(f"peggiore: dd max {dd_max:.3f} / mdg min {mdg_min:.5f}", className="text-danger")
+                    )
         # gain lives only in the raw stats block, not in the dataframe columns
         stats = (raw_entry.get("metrics") or {}).get("stats") or {}
         for gain_key in ("gain_strategy_eq", "gain_usd"):
