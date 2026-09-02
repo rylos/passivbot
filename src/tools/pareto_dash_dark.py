@@ -2003,9 +2003,10 @@ def serve_dash(data_root: str, host: str = "127.0.0.1", port: int = 8050):
                         # reducer aggregate over ALL scenarios (base + segments),
                         # so the same metric shows up twice: say which is which.
                         if suite_active and not metric.startswith(OBJECTIVE_PREFIX):
-                            if f"{OBJECTIVE_PREFIX}{metric}" in row.columns:
-                                continue  # gia' mostrato fra gli obiettivi
-                            label += " [media scenari]"
+                            # Reducer mean over whole period + segments: it
+                            # mixes bases and means nothing. The per-scenario
+                            # block below carries the real values.
+                            continue
                         summary_items.append(html.Div(f"{label}: {val:.4f}"))
         raw_entry = run_data.raw_configs.get(selected_id, {})
         # Per-scenario values (suite mode): the whole-period scenario and the
@@ -2023,7 +2024,7 @@ def serve_dash(data_root: str, host: str = "127.0.0.1", port: int = 8050):
                 summary_items.append(
                     html.Strong("base (periodo intero)", style={"display": "block", "marginTop": "8px"})
                 )
-                for metric in ("adg_strategy_eq", "gain_strategy_eq", "drawdown_worst_strategy_eq", "position_held_days_max"):
+                for metric in ("adg_strategy_eq", "gain_strategy_eq", "drawdown_worst_strategy_eq", "position_held_days_max", "backtest_completion_ratio"):
                     val = _scen(metric, "base")
                     if isinstance(val, (int, float)) and np.isfinite(val):
                         summary_items.append(html.Div(f"{metric}: {val:.4f}", className="text-warning"))
