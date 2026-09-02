@@ -62,6 +62,17 @@ exit_min_gain 0,646 -> 3,0%     0,4564%   99,36%   0,14          12,5
 ⚠️ **Regola generale: l'attribuzione del pnl per tipo di fill misura chi incassa, non chi rende possibile incassare.** Il 4RSI chiude in guadagno posizioni che la griglia d'ingresso ha mediato e la close grid ha alleggerito. Ci sono cascato in entrambe le direzioni: prima chiamando la close grid "quasi decorativa" perché faceva 12 chiusure su 68, poi la sessione freqtrade stava per scartarla perché rende l'1,7%. Solo l'ablazione risponde.
 Il meccanismo comune: **soglia d'uscita bassa e close grid servono a liberare esposizione in fretta**, non a incassare. Alzando la soglia le posizioni restano appese (durata massima da 4 a 12 giorni), la WE resta al tetto, la griglia non ha spazio per mediare il ribasso successivo, il conto salta.
 
+### Le soglie d'ingresso sono il pezzo che regge di più (ablazioni del 2026-09-02)
+Richieste dalla sessione freqtrade per capire dove sta l'edge: il nostro bot con le **loro** soglie d'ingresso (osc `-12,505`, stoch `37,369`, EMA `-0,9%` invece di `-23,87` / `12,70` / `-1,2%`), oppure con la **loro** geometria (`initial_qty_pct` 0,069, `grid_double_down_factor` 1,365, TWEL 2,19), tutto il resto invariato. Configs su debian: `abl_ftentry_{full,ribasso}.json`, `abl_ftgeom_{full,ribasso}.json`.
+```
+                              full 2024-12-05→2026-08-31          ribasso 2025-09-18→12-18
+live                          +41.474%  dd 25,2%  1029 pos        +144%   dd 15,8%  170 pos, 6 WE piene
+soglie ingresso freqtrade     LIQUIDATO 2025-03-06 (14%)          LIQUIDATO 2025-10-10 (25%), 54 pos, 2 WE piene
+geometria freqtrade           LIQUIDATO 2025-03-11 (15%)          +52%    dd 53,3%  116 pos, 18 WE piene
+```
+**L'edge sta nell'ingresso selettivo; la griglia densa serve a sopravvivere dato quell'ingresso, non regge da sola.** A `-12,5/37` si entra sul primo cedimento e la griglia si carica *durante* la vera discesa: la media resta troppo alta per il rimbalzo di +0,65%. Nel ribasso bastano 54 posizioni e 2 a WE piena per morire: non uccide la coda lunga, uccide **una** posizione aperta troppo presto. Senza stop, una sola basta.
+Meccanismo di sopravvivenza nel ribasso (6 posizioni a WE piena, tutte chiuse in utile in 6–25 h): l'esposizione piena arriva a −8/−12% dalla prima entrata con media a **−5,2/−6,4%**, da lì non si compra più; l'uscita chiede media+0,65% cioè **+5/+8% dal minimo**, che HYPE ha sempre fatto. Peggior equity non realizzata −15,8% di conto (22/11/2025). Unstuck ed enforcer TWEL: **zero fill in tutta la storia**, sono valvole mai aperte. Il limite reale è la liquidazione a circa −30% dalla media (leva 10 cross, notional 2,93× equity), mai avvicinata in-sample.
+
 ## Commissioni effettive per tipo (misurate sui fill, non dedotte dalla config)
 ```
 entry_grid / entry_initial / close_grid / close_trailing   0,0150%   maker
