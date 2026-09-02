@@ -1,10 +1,17 @@
 # Workflow optimize + refinement (server debian, tmux "opt")
 
-## ⚠️ PRIMO PASSO DEL PROSSIMO RUN (in sospeso dal 2026-08-13)
-Prima di lanciare il prossimo optimize va riarmato il monitor del fronte di Pareto su debian: il suo baseline è del 04/08 ed è stato prodotto col tick di HYPE vecchio (0.001), quindi confronterebbe candidati calcolati in regimi di tick diversi. Tre cose:
-1. **Baseline** = `analysis.json` di un backtest della config live, prodotto **sullo stesso dataset del run** (stessa finestra, stessa `end_date`, stessi metadati di mercato), copiato su `~/pareto_monitor/baseline_live.json`. Se la finestra arriva a oggi servono prima le candele (`src/ohlcv_download.py`, poi cancellare il dataset combinato stale in `caches/hlcvs_data/`). Config pronta: `configs/bt_verify_merge_20260813.json` (è la config live, basta aggiornare `end_date`).
-2. **`RUN_DIR`** in `~/pareto_monitor/monitor.py` (riga ~18) è hardcoded e punta ancora al run r3 del 04/08: va fatto puntare alla nuova directory di run.
-3. **`~/pareto_monitor/state.json`** va azzerato: contiene `finished: true` (il monitor esce subito) e gli hash dei candidati già notificati.
+## Run r4 (2026-09-02): suite a 6 segmenti, seme live, obiettivo "segmento peggiore"
+Config `configs/opt_suite6_live_seed_r4.json` su debian, run `optimize_results/2026-09-02T16_43_51_bybit_634days_suite_1_coins_b89f4bea`, tmux `opt`, 250k iter, 26 cpu. Dati bybit 2024-12-05 → 2026-08-31, 7353 USDT, fee HL (maker 0,015% / taker 0,055%), `bot` = live come seme (**passare `--start <config>`**, altrimenti "No starting configs provided" e la popolazione parte casuale), bounds = live ±20% clampati al range full di r1, pin invariati.
+- `backtest.suite_enabled: true`, scenari `base` + `seg1..seg6` da ~105 giorni (`start_date`/`end_date` per scenario). Vincolo della suite: `live.approved_coins.short` deve essere uguale al long (lo short resta a TWEL 0).
+- `optimize.objective_scenario: "base"` → gli 8 obiettivi storici restano sul periodo intero. Nono obiettivo `{"metric": "mdg_strategy_eq", "goal": "max", "scenario": null, "reducer": "min"}` = mdg del segmento peggiore. Limite aggiunto: `drawdown_worst_strategy_eq` con `reducer: "max"` > 0,45 (nessun segmento oltre). Ogni metrica può comparire una sola volta in `scoring`.
+- Costo: base + 6 segmenti = il doppio dei giorni per candidato → ~300 iter/min, 250k ≈ 14 h.
+- **Perché**: la config live sui 6 segmenti (`backtests/suite_runs/2026-09-02T16_43_26`) ha drawdown **69,4% nel segmento 05-08/2026** contro 27,7% sul periodo intero. Il 4/6/2026 la close grid del periodo intero a 68,79 riempie sulla candela delle 08:30 (massimo 68,811); nel segmento la media è 14 centesimi più alta (EMA di volatilità a 1825 h non convergente), l'ordine sta a 68,93 e il massimo fino al 16/6 è 68,929: 12 giorni a WE 2,93 con equity −67%. Il 27,7% del periodo intero è in parte fortuna. Dettagli in `mem:strategy_mechanics_trailing_grid_v7`.
+- Limite del metodo: ogni segmento riparte con l'EMA di volatilità (span 1825 h ≈ 76 giorni) non convergente, quindi le prime settimane non coincidono col percorso intero. Con segmenti ≥100 giorni è accettabile; sotto i 60 no.
+- Monitor Pareto riarmato: baseline = `analysis.json` dello scenario `base` della suite + `mdg_strategy_eq` = min sui segmenti; `OBJECTIVES` in `monitor.py` ha 9 voci; cron `*/20` reinstallato (era sparito dal crontab).
+
+## ⚠️ Il download delle candele può rifiutarsi di scaricare la coda (2026-09-02)
+`ohlcv_download.py -ed <data>` può terminare con `valid data ends before requested end` **senza fetchare**: se nel catalogo (`caches/ohlcvs/catalog.sqlite`, tabella `gaps`) c'è un gap persistente che si sovrappone alla finestra (per HYPE: le prime 13 ore del 2024-12-05, `leading_unavailable`) e il suo `next_retry_at` non è scaduto, `hlcv_preparation.py` prende il ramo "using verified partial v2 coverage despite known gap(s)" e restituisce la copertura parziale, coda compresa. Rimedio: `UPDATE gaps SET next_retry_at = <adesso ms>` per quel simbolo, cancellare la dir in `caches/hlcvs_data/` e rilanciare il download: compare `retrying N persistent v2 gap window(s)` e scarica anche la coda. Verificare sempre `symbols.last_ts` nel catalogo dopo.
+⚠️ `pkill -f "src/optimize.py"` via ssh uccide la propria shell (la riga di comando contiene la stringa): usare `pkill -INT -f "^python3 src/optimize"`.
 
 Metodologia consolidata (dettagli e storico nel wiki Joplin, nota "passivbot"):
 
