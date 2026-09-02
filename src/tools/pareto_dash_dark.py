@@ -2031,16 +2031,20 @@ def serve_dash(data_root: str, host: str = "127.0.0.1", port: int = 8050):
             segs = [s for s in labels if s != "base"]
             if segs:
                 summary_items.append(
-                    html.Strong("segmenti (dd / mdg)", style={"display": "block", "marginTop": "8px"})
+                    html.Strong("segmenti (dd / mdg / giorni max)", style={"display": "block", "marginTop": "8px"})
                 )
                 for s in segs:
                     dd, mdg = _scen("drawdown_worst_strategy_eq", s), _scen("mdg_strategy_eq", s)
+                    held = _scen("position_held_days_max", s)
                     if isinstance(dd, (int, float)) and isinstance(mdg, (int, float)):
-                        summary_items.append(html.Div(f"{s}: dd {dd:.3f} / mdg {mdg:.5f}"))
+                        held_txt = f" / {held:.2f}g" if isinstance(held, (int, float)) else ""
+                        summary_items.append(html.Div(f"{s}: dd {dd:.3f} / mdg {mdg:.5f}{held_txt}"))
                 dd_max, mdg_min = _stat("drawdown_worst_strategy_eq", "max"), _stat("mdg_strategy_eq", "min")
+                held_max = _stat("position_held_days_max", "max")
                 if isinstance(dd_max, (int, float)) and isinstance(mdg_min, (int, float)):
+                    held_txt = f" / {held_max:.2f}g" if isinstance(held_max, (int, float)) else ""
                     summary_items.append(
-                        html.Div(f"peggiore: dd max {dd_max:.3f} / mdg min {mdg_min:.5f}", className="text-danger")
+                        html.Div(f"peggiore: dd max {dd_max:.3f} / mdg min {mdg_min:.5f}{held_txt}", className="text-danger")
                     )
         # gain lives only in the raw stats block, not in the dataframe columns
         stats = (raw_entry.get("metrics") or {}).get("stats") or {}
