@@ -1,5 +1,8 @@
 # Workflow optimize + refinement (server debian, tmux "opt")
 
+## Run r4d (2026-09-03 12:30): come r4c ma `close.trailing_grid_ratio` in [0, 0,12]
+In r4c il 38% del fronte premeva sul bordo 0,03 di `close.trailing_grid_ratio` ("close grid già dal primo gradino"). Marco **non vuole il regime negativo** (trailing solo a esposizione alta), quindi bound [0, 0,12] e non [−1, 1]. r4c fermata a 8k iter, fronte in `optimize_results/seed_r4c_pareto/`, rilanciata come r4d: `configs/opt_suite13_live_seed_r4d.json`, run `optimize_results/2026-09-03T10_29_56_bybit_634days_suite_1_coins_0360ad20`, 250k iter, ~94 iter/min → fine sabato 5/09 mattina. Monitor ripuntato, baseline invariata (suite a 13 del live).
+
 ## Run r4c (2026-09-03): due partizioni di segmenti, perché i tagli fissi si aggirano
 Il test dei segmenti spostati (+50 giorni, `configs/bt_shifted_*.json`, suite `backtests/suite_runs/2026-09-03T07_5*`) ha **bocciato** i due migliori di r4b: `a1b369a6` e `ee61828a` sul taglio 2025-01-24 → 05-01 (crollo HYPE 25 → 12) vengono **liquidati** (dd 96,7% / 96,9%, posizione aperta il 23/02 a WE piena mai chiusa), il live nello stesso taglio fa 45,4% e sopravvive; `ee61828a` ripete la trappola di giugno (70,5%). Avevano guadagnato sui 6 tagli fissi **indebolendo la close grid** (`grid_qty_pct` 0,29 → 0,12/0,22): nessun taglio fisso partiva subito prima del crollo. L'optimizer aggira i tagli se i tagli sono pochi e fissi.
 ⚠️ **Anche il live**: 27,7% è il drawdown del percorso fortunato; su tagli diversi fa 45% (gen-mag 2025) e 69,5% (mag-ago 2026). L'esito di un crollo dipende dallo stato con cui ci si arriva, non solo dai parametri.
