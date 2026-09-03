@@ -1,5 +1,10 @@
 # Workflow optimize + refinement (server debian, tmux "opt")
 
+## Run r4e (2026-09-03 13:51): tre partizioni (19 scenari), perché anche due si aggirano
+Terza partizione (+25 giorni, `t1..t6` dal 2024-12-30, suite `backtests/suite_runs/2026-09-03T11_3*`): `76ab052b`, il migliore di r4d sui 12 tagli, **liquidato** su t1 (dd 98,4%, di nuovo la posizione del 23/02/2025). Il fronte di r4d aveva `grid_qty_pct` mediano 0,12-0,14 (live 0,29). Pinnare le fette ≥0,25 **non basta**: 3 su 4 dei migliori con fette grandi vengono liquidati su t1 o t4 (`15e0db25`: posizione di **47 giorni** ott 25 → feb 26); l'unico che passa (`a2c06aeb`) fa adg 0,55%, metà del live. **Il live non viene liquidato su nessuno dei 18 tagli** (peggio: 45% e 69,5%), pur non essendo stato ottimizzato su nessuno.
+r4d fermata a 7k iter (fronte in `optimize_results/seed_r4d_pareto/`), rilanciata come **r4e**: `configs/opt_suite19_live_seed_r4e.json`, run `optimize_results/2026-09-03T11_51_29_bybit_634days_suite_1_coins_b9861089`, 19 scenari = base + seg + sh + t, mdg `min` e dd `max` su 18 segmenti, 200k iter, ~69 iter/min → ~48 h, fine sabato 5/09 pomeriggio. Baseline del monitor: suite a 19 del live (`backtests/suite_runs/2026-09-03T11_50_28`), mdg min 0,00140, dd max 0,695. Test finale: **quarta partizione (+75 giorni)**.
+Se anche così emergono solo candidati da ~0,55% di adg, la conclusione è che il live è già vicino al miglior compromesso robusto, con i numeri per dirlo.
+
 ## Run r4d (2026-09-03 12:30): come r4c ma `close.trailing_grid_ratio` in [0, 0,12]
 In r4c il 38% del fronte premeva sul bordo 0,03 di `close.trailing_grid_ratio` ("close grid già dal primo gradino"). Marco **non vuole il regime negativo** (trailing solo a esposizione alta), quindi bound [0, 0,12] e non [−1, 1]. r4c fermata a 8k iter, fronte in `optimize_results/seed_r4c_pareto/`, rilanciata come r4d: `configs/opt_suite13_live_seed_r4d.json`, run `optimize_results/2026-09-03T10_29_56_bybit_634days_suite_1_coins_0360ad20`, 250k iter, ~94 iter/min → fine sabato 5/09 mattina. Monitor ripuntato, baseline invariata (suite a 13 del live).
 
