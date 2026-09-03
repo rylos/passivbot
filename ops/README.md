@@ -98,9 +98,9 @@ sostituito da una seconda istanza passivbot, **ry-bybit**: `/opt/passivbot-bybit
 Watchdog e report sono gli stessi file con un **profilo scelto dal primo
 argomento** (`hl` di default, `bybit`): file di stato, flag di manutenzione
 (`hl_maintenance` / `bybit_maintenance`), sessione tmux e check healthchecks
-sono per istanza. Il check healthchecks di ry-bybit è quello ereditato da
-freqtrade (`HC_FREQTRADE` in `healthchecks.env`): va rinominato sul sito, non
-nello script.
+sono per istanza. Il check healthchecks di ry-bybit, "passivbot (bybit)"
+(`HC_PASSIVBOT_BYBIT` in `healthchecks.env`), è l'ex check di freqtrade
+rinominato via API il 2026-09-03: stesso uuid, stesso URL di ping.
 
 ⚠️ Bybit in hedge mode: passivbot lo imposta all'avvio e Bybit non permette di
 cambiare position mode con una posizione aperta. Se freqtrade dovesse tornare su

@@ -50,9 +50,9 @@ PROFILES = {
         tmux="ry-bybit",
         state="state_bybit.json",
         maintenance="bybit_maintenance",
-        # check healthchecks ereditato dal bot freqtrade fermato il 2026-09-03:
-        # stesso account Bybit, stesso ruolo. Rinominarlo sul sito, non qui.
-        hc_key="HC_FREQTRADE",
+        # check healthchecks "passivbot (bybit)": e' l'ex check di freqtrade,
+        # rinominato via API il 2026-09-03 (stesso uuid, stesso URL di ping).
+        hc_key="HC_PASSIVBOT_BYBIT",
     ),
 }
 INSTANCE = sys.argv[1] if len(sys.argv) > 1 else "hl"
