@@ -19,15 +19,26 @@ import json
 import os
 import re
 import subprocess
+import sys
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
+# Istanza dal primo argomento (`hl_report.py bybit`); default "hl" per non
+# toccare il cron storico. Stato separato per istanza.
+PROFILES = {
+    "hl": dict(name="ry-hl", logdir="/opt/passivbot-hl/logs", config="config_hl_4rsi.json", state="trades_state.json"),
+    "bybit": dict(name="ry-bybit", logdir="/opt/passivbot-bybit/logs", config="config_bybit_4rsi.json", state="trades_state_bybit.json"),
+}
+INSTANCE = sys.argv[1] if len(sys.argv) > 1 else "hl"
+P = PROFILES[INSTANCE]
+NAME = P["name"]
+
 BASE = Path.home() / "watchdog"
 CREDS = BASE / "telegram.json"
-STATE = BASE / "trades_state.json"
-LOGDIR = Path("/opt/passivbot-hl/logs")
-LOG_GLOB = str(LOGDIR / "*config_hl_4rsi.json.log")
+STATE = BASE / P["state"]
+LOGDIR = Path(P["logdir"])
+LOG_GLOB = str(LOGDIR / f"*{P['config']}.log")
 
 POS_RE = re.compile(
     r"^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}):\d{2}Z.*\[pos\]\s+(new|added|reduced|closed)\s+HYPE\s+"
@@ -54,7 +65,7 @@ def send(text: str) -> None:
 
 def bot_alive() -> bool:
     r = subprocess.run(
-        ["pgrep", "-f", r"python src/main\.py configs/live/config_hl_4rsi\.json"],
+        ["pgrep", "-f", r"python src/main\.py configs/live/" + re.escape(P["config"])],
         capture_output=True,
         text=True,
     )
@@ -143,7 +154,7 @@ def main() -> None:
             steps = 1
             opened_at = f"{ev['day']}T{ev['time']}"
             send(
-                f"📈 <b>ry-hl aperta</b> · {ev['size']:.2f} HYPE @ {ev['price']:.3f}"
+                f"📈 <b>{NAME} aperta</b> · {ev['size']:.2f} HYPE @ {ev['price']:.3f}"
                 f" · {ev['time']}"
             )
         elif ev["kind"] in ("added", "reduced"):
@@ -179,7 +190,7 @@ def main() -> None:
             grad = f" · {steps} gradini" if steps > 1 else ""
             bal = f" · wallet {balance}" if balance else ""
             send(
-                f"✅ <b>ry-hl chiusa</b> · <b>{pnl:+.2f}</b> USDT{grad}{bal}"
+                f"✅ <b>{NAME} chiusa</b> · <b>{pnl:+.2f}</b> USDT{grad}{bal}"
                 f" · {ev['time']}"
             )
             steps = 0
@@ -191,7 +202,7 @@ def main() -> None:
     STATE.write_text(json.dumps(state))
 
     if not bot_alive():
-        send("🔴 <b>ry-hl: processo assente</b> — se ne occupa il watchdog, ma tienilo d'occhio.")
+        send(f"🔴 <b>{NAME}: processo assente</b> — se ne occupa il watchdog, ma tienilo d'occhio.")
 
 
 if __name__ == "__main__":

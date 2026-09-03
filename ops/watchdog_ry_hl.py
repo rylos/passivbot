@@ -20,25 +20,59 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
+# Un solo script, due bot. L'istanza si sceglie dal primo argomento
+# (`watchdog.py bybit`); senza argomento e' "hl", cosi' il cron storico di ry-hl
+# non cambia. Ogni istanza ha i suoi file di stato e di manutenzione: il flag
+# di manutenzione di un bot non deve fermare i riavvii dell'altro.
+PROFILES = {
+    "hl": dict(
+        name="ry-hl",
+        bot_dir="/opt/passivbot-hl",
+        config="configs/live/config_hl_4rsi.json",
+        # passivbot mantiene in logs/ un symlink <user>.log al log del run corrente
+        log_alias="hyperliquid_vault.log",
+        tmux="ry-hl",
+        state="state.json",
+        maintenance="hl_maintenance",
+        hc_key="HC_PASSIVBOT",
+    ),
+    "bybit": dict(
+        name="ry-bybit",
+        bot_dir="/opt/passivbot-bybit",
+        config="configs/live/config_bybit_4rsi.json",
+        log_alias="bybit_02.log",
+        tmux="ry-bybit",
+        state="state_bybit.json",
+        maintenance="bybit_maintenance",
+        # check healthchecks ereditato dal bot freqtrade fermato il 2026-09-03:
+        # stesso account Bybit, stesso ruolo. Rinominarlo sul sito, non qui.
+        hc_key="HC_FREQTRADE",
+    ),
+}
+INSTANCE = sys.argv[1] if len(sys.argv) > 1 else "hl"
+P = PROFILES[INSTANCE]
+NAME = P["name"]
+
 BASE = Path.home() / "watchdog"
-LOG = Path("/opt/passivbot-hl/logs/hyperliquid_vault.log")
-STATE = BASE / "state.json"
+LOG = Path(P["bot_dir"]) / "logs" / P["log_alias"]
+STATE = BASE / P["state"]
 CREDS = BASE / "telegram.json"
 ENV = BASE / "healthchecks.env"
 # Se questo file esiste il watchdog non riavvia nulla: interruttore per le fermate
 # volute (deploy, ricompilazione Rust, manutenzione).
-MAINTENANCE = BASE / "hl_maintenance"
+MAINTENANCE = BASE / P["maintenance"]
 
-BOT_DIR = Path("/opt/passivbot-hl")
-TMUX_SESSION = "ry-hl"
+BOT_DIR = Path(P["bot_dir"])
+TMUX_SESSION = P["tmux"]
 # ⚠️ Python del PROPRIO venv, esplicito: `python` generico e' l'origine della
 # trappola del 2026-07-29 (il venv copiato puntava a /opt/passivbot).
-BOT_CMD = f"cd {BOT_DIR} && venv/bin/python src/main.py configs/live/config_hl_4rsi.json"
+BOT_CMD = f"cd {BOT_DIR} && venv/bin/python src/main.py {P['config']}"
 
 # Un bot che non riparte da solo ha un problema che il riavvio non risolve.
 MAX_RESTARTS = 2
@@ -86,7 +120,7 @@ def hc_url() -> str | None:
         return None
     for line in ENV.read_text().splitlines():
         line = line.strip()
-        if line.startswith("HC_PASSIVBOT="):
+        if line.startswith(P["hc_key"] + "="):
             return line.split("=", 1)[1].strip().strip('"').strip("'") or None
     return None
 
@@ -110,7 +144,7 @@ def tmux(*args: str) -> subprocess.CompletedProcess:
 
 
 def try_restart(state: dict) -> list[str]:
-    """Rilancia ry-hl nel suo tmux. Ritorna le righe di esito per il body del ping."""
+    """Rilancia il bot nel suo tmux. Ritorna le righe di esito per il body del ping."""
     if MAINTENANCE.exists():
         return [f"riavvio NON tentato: manutenzione attiva ({MAINTENANCE})"]
 
@@ -193,7 +227,7 @@ def bot_pid() -> str | None:
         # "venv/bin/python src/main.py" (BOT_CMD usa il python del venv):
         # un pattern ancorato a ^python non vedeva il bot avviato dal venv e
         # il watchdog lo avrebbe considerato assente, avviandone un secondo.
-        ["pgrep", "-f", r"python src/main\.py configs/live/config_hl_4rsi\.json"],
+        ["pgrep", "-f", r"python src/main\.py " + re.escape(P["config"])],
         capture_output=True,
         text=True,
     )
@@ -250,7 +284,7 @@ def main() -> None:
     pid = bot_pid()
 
     if not LOG.exists():
-        alert(state, "log_stale", "⚠️ <b>ry-hl</b>: log non trovato su amazon.")
+        alert(state, "log_stale", f"⚠️ <b>{NAME}</b>: log non trovato su amazon.")
         STATE.write_text(json.dumps(state))
         return
 
@@ -261,7 +295,7 @@ def main() -> None:
         alert(
             state,
             "restart",
-            "ℹ️ <b>ry-hl riavviato</b>\nnuovo log: <code>"
+            f"ℹ️ <b>{NAME} riavviato</b>\nnuovo log: <code>"
             + os.path.basename(target)
             + "</code>\npid: "
             + (pid or "assente"),
@@ -271,7 +305,7 @@ def main() -> None:
         alert(
             state,
             "process_down",
-            "🔴 <b>ry-hl NON in esecuzione</b> su amazon.\n"
+            f"🔴 <b>{NAME} NON in esecuzione</b> su amazon.\n"
             "Nessun processo <code>python src/main.py</code>. Il bot non sta gestendo la posizione.",
         )
         PROBLEMS.extend(try_restart(state))
@@ -287,7 +321,7 @@ def main() -> None:
             alert(
                 state,
                 "log_stale",
-                f"🟠 <b>ry-hl: log fermo da {age_min:.0f} min</b> (pid {pid} vivo, "
+                f"🟠 <b>{NAME}: log fermo da {age_min:.0f} min</b> (pid {pid} vivo, "
                 f"normale è &lt;16 min).\nPossibile loop bloccato o connettività persa.\n"
                 f"Ultima riga:\n<code>{esc(tail[:220])}</code>",
             )
@@ -308,7 +342,7 @@ def main() -> None:
         alert(
             state,
             "errors",
-            f"🔴 <b>ry-hl: {len(errs)} righe ERROR/CRITICAL</b>\n<code>{esc(sample)}</code>",
+            f"🔴 <b>{NAME}: {len(errs)} righe ERROR/CRITICAL</b>\n<code>{esc(sample)}</code>",
         )
 
     # Il warning di trailing warmup è normale per qualche minuto dopo un fill o un
@@ -325,7 +359,7 @@ def main() -> None:
             alert(
                 state,
                 "trailing_blocked",
-                f"🟠 <b>ry-hl: trading bloccato da {span_min:.0f} min</b> "
+                f"🟠 <b>{NAME}: trading bloccato da {span_min:.0f} min</b> "
                 f"({len(blocked)} righe in questo giro)\n<code>{esc(sample)}</code>\n"
                 "È la firma del bug fill same-ms / trailing bloccato.",
             )
@@ -340,7 +374,7 @@ def main() -> None:
                 alert(
                     state,
                     "err_counter",
-                    f"🟠 <b>ry-hl: contatore errori a {m.group(1)}/{m.group(2)}</b>\n"
+                    f"🟠 <b>{NAME}: contatore errori a {m.group(1)}/{m.group(2)}</b>\n"
                     f"<code>{esc(l[:220])}</code>",
                 )
             break
@@ -369,6 +403,6 @@ def summary() -> str:
 if __name__ == "__main__":
     main()
     ok = not PROBLEMS
-    head = "passivbot ry-hl (amazon) — " + ("OK" if ok else "ANOMALIA")
+    head = f"passivbot {NAME} (amazon) — " + ("OK" if ok else "ANOMALIA")
     body = "\n".join([head, *(f"[!] {p}" for p in PROBLEMS), summary()])
     hc_ping(ok, body)

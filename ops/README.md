@@ -5,8 +5,8 @@ sopravvivere a una ricostruzione del server e a versionare le modifiche.
 
 | file | dove gira | cron |
 |---|---|---|
-| `watchdog_ry_hl.py` | amazon, `~/watchdog/watchdog.py` | `*/10 * * * *` |
-| `hl_report.py` | amazon, `~/watchdog/hl_report.py` | `*/5 * * * *` |
+| `watchdog_ry_hl.py` | amazon, `~/watchdog/watchdog.py` | `*/10 * * * *` (ry-hl) e `3-59/10 * * * *` con argomento `bybit` (ry-bybit) |
+| `hl_report.py` | amazon, `~/watchdog/hl_report.py` | `*/5 * * * *` (ry-hl) e `*/5 * * * *` con argomento `bybit` (ry-bybit) |
 
 Dopo ogni modifica qui, ricopiare sul server e verificare che l'md5 combaci:
 
@@ -86,3 +86,22 @@ Tre trappole già pagate, tutte verificate con un test:
 
 Le credenziali stanno in `~/watchdog/telegram.json` (chmod 600), condiviso col
 watchdog.
+
+## Due istanze, un solo script (dal 2026-09-03)
+
+Il 2026-09-03 il bot freqtrade su Bybit (account `bybit_02`) è stato fermato e
+sostituito da una seconda istanza passivbot, **ry-bybit**: `/opt/passivbot-bybit`
+(copia di `/opt/passivbot-hl` allo stesso commit, venv e Rust inclusi),
+`configs/live/config_bybit_4rsi.json` (candidato `f6b2b013` dell'optimize r4e,
+10x cross, hedge mode), tmux `ry-bybit`, log alias `logs/bybit_02.log`.
+
+Watchdog e report sono gli stessi file con un **profilo scelto dal primo
+argomento** (`hl` di default, `bybit`): file di stato, flag di manutenzione
+(`hl_maintenance` / `bybit_maintenance`), sessione tmux e check healthchecks
+sono per istanza. Il check healthchecks di ry-bybit è quello ereditato da
+freqtrade (`HC_FREQTRADE` in `healthchecks.env`): va rinominato sul sito, non
+nello script.
+
+⚠️ Bybit in hedge mode: passivbot lo imposta all'avvio e Bybit non permette di
+cambiare position mode con una posizione aperta. Se freqtrade dovesse tornare su
+questo account, va rimesso one-way **a conto piatto**.

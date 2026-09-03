@@ -53,3 +53,6 @@ Cron di sessione Claude Code ogni 30 min (:08 e :38) che ispeziona ry-hl ed è a
 ✅ **Confermato dai fatti**: il monitor di sessione è morto il 22/08 per un errore ssh (exit 255) e me ne sono accorto **quattro giorni dopo**, il 26. In quei giorni la copertura server-side ha retto senza aiuto — bot vivo, 13 chiusure di cui 12 in profitto, +422 USDC. Quando si riarma il monitor, far sì che la caduta del canale ssh **si annunci** invece di morire in silenzio.
 
 Vedi anche `mem:live_deployment`, `mem:optimize_workflow`.
+
+## Dal 2026-09-03: watchdog e report a profili (hl / bybit)
+`~/watchdog/watchdog.py` e `~/watchdog/hl_report.py` su amazon scelgono l'istanza dal primo argomento (`bybit`), default `hl` → il cron storico di ry-hl è invariato. Per istanza: stato (`state.json`/`state_bybit.json`, `trades_state.json`/`trades_state_bybit.json`), flag di manutenzione (`hl_maintenance`/`bybit_maintenance`), tmux, log alias (`hyperliquid_vault.log`/`bybit_02.log` = `<user>.log` creato da passivbot), check healthchecks (`HC_PASSIVBOT`/`HC_FREQTRADE`). Cron ry-bybit: `3-59/10` watchdog, `*/5` report. Il watchdog freqtrade e `ft_report.py` sono commentati nel crontab (freqtrade fermo). Copie versionate: `ops/watchdog_ry_hl.py`, `ops/hl_report.py`, `ops/README.md`.
