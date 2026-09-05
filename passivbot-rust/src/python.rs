@@ -108,6 +108,7 @@ fn apply_fill_activity_metrics(analysis: &mut Analysis, metrics: FillActivityMet
     analysis.fills_gap_median_hours = metrics.fills_gap_median_hours;
     analysis.fills_gap_p95_hours = metrics.fills_gap_p95_hours;
     analysis.fills_gap_p99_hours = metrics.fills_gap_p99_hours;
+    analysis.fills_gap_time_weighted_mean_hours = metrics.fills_gap_time_weighted_mean_hours;
     analysis.fills_per_day = metrics.fills_per_day;
     analysis.fills_per_day_close = metrics.fills_per_day_close;
     analysis.fills_per_day_entry = metrics.fills_per_day_entry;
@@ -2517,6 +2518,7 @@ fn bot_params_from_dict(dict: &PyDict) -> PyResult<BotParams> {
             .transpose()?
             .unwrap_or_default(),
         is_forced_active: extract_optional_bool(dict, "is_forced_active", false)?,
+        entry_eligible: extract_optional_bool(dict, "entry_eligible", true)?,
         ema_span_0: extract_optional_f64(dict, "ema_span_0")?,
         ema_span_1: extract_optional_f64(dict, "ema_span_1")?,
         hsl_enabled,

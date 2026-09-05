@@ -3,6 +3,7 @@ import hashlib
 import json
 import logging
 import time
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -23,6 +24,7 @@ from custom_endpoint_overrides import (
     ResolvedEndpointOverride,
 )
 from exchanges.bitunix import BitunixBot, BitunixClient, BitunixOrderStream
+from live.state_refresh import AuthoritativeSurfaceUnavailable
 from fill_events_manager import (
     BitunixFetcher,
     _build_fetcher_for_bot,
@@ -58,12 +60,89 @@ def _market():
     }
 
 
+def _market_for(market_id: str, symbol: str):
+    market = deepcopy(_market())
+    market["id"] = market_id
+    market["symbol"] = symbol
+    return market
+
+
 def _prepared_client() -> BitunixClient:
     client = BitunixClient({"apiKey": "key", "secret": "secret"})
     client.markets = {"BTC/USDT:USDT": _market()}
     client.markets_by_id = {"BTCUSDT": client.markets["BTC/USDT:USDT"]}
     client.symbols = ["BTC/USDT:USDT"]
     return client
+
+
+def _kline_payload(
+    market_id: str = "BTCUSDT",
+    *,
+    timestamp: int = 1_700_000_065_123,
+    **data_overrides,
+):
+    data = {
+        "o": "100",
+        "h": "103",
+        "l": "99",
+        "c": "102",
+        "b": "4.5",
+        "q": "454.5",
+    }
+    data.update(data_overrides)
+    return {
+        "ch": "market_kline_1min",
+        "symbol": market_id,
+        "ts": timestamp,
+        "data": data,
+    }
+
+
+class _PublicKlineSocket:
+    def __init__(self):
+        self.closed = False
+        self.sent = []
+        self.messages = asyncio.Queue()
+
+    async def send_json(self, payload):
+        self.sent.append(payload)
+
+    async def receive(self):
+        return await self.messages.get()
+
+    async def close(self):
+        self.closed = True
+
+
+class _PublicKlineSocketContext:
+    def __init__(self, socket):
+        self.socket = socket
+
+    async def __aenter__(self):
+        return self.socket
+
+    async def __aexit__(self, *_args):
+        await self.socket.close()
+
+
+class _PublicKlineSession:
+    def __init__(self, socket):
+        self.socket = socket
+        self.connect_calls = []
+
+    def ws_connect(self, url, **kwargs):
+        self.connect_calls.append((url, kwargs))
+        return _PublicKlineSocketContext(self.socket)
+
+
+class _PublicKlineSessionPool:
+    def __init__(self, sockets):
+        self.sockets = iter(sockets)
+        self.connect_calls = []
+
+    def ws_connect(self, url, **kwargs):
+        self.connect_calls.append((url, kwargs))
+        return _PublicKlineSocketContext(next(self.sockets))
 
 
 def _order_row(**overrides):
@@ -196,8 +275,10 @@ def test_private_websocket_signature_uses_seconds(monkeypatch):
     ],
 )
 def test_api_errors_map_to_ccxt_exception_contract(code, error_type):
-    with pytest.raises(error_type):
+    with pytest.raises(error_type) as exc_info:
         BitunixClient._raise_api_error(code, "test")
+
+    assert exc_info.value.code == str(code)
 
 
 def test_observed_code_one_network_envelope_is_retryable():
@@ -243,25 +324,468 @@ async def test_load_markets_retries_observed_network_error(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("as_list", [False, True])
-async def test_balance_reconstructs_wallet_and_accepts_both_account_shapes(as_list):
+async def test_balance_sums_disjoint_components_after_transfer_reconciliation(as_list):
     client = _prepared_client()
     raw = {
         "marginCoin": "USDT",
         "available": "1000",
         "frozen": "4",
         "margin": "10",
+        "transfer": "1000",
+        "bonus": "0",
         "positionMode": "HEDGE",
         "crossUnrealizedPNL": "2",
         "isolationUnrealizedPNL": "-1",
     }
-    client._request = AsyncMock(return_value=[raw] if as_list else raw)
+    response = [raw] if as_list else raw
+    client._request = AsyncMock(return_value=response)
 
     balance = await client.fetch_balance()
 
     assert balance["free"]["USDT"] == 1000.0
     assert balance["used"]["USDT"] == 14.0
-    assert balance["total"]["USDT"] == 1013.0
+    assert balance["total"]["USDT"] == 1014.0
     assert client._request.await_args.kwargs["params"] == {"marginCoin": "USDT"}
+
+
+@pytest.mark.asyncio
+async def test_balance_transfer_reconciliation_does_not_net_isolated_profit():
+    client = _prepared_client()
+    client._request = AsyncMock(
+        return_value={
+            "marginCoin": "USDT",
+            "available": "100",
+            "frozen": "0",
+            "margin": "10",
+            "transfer": "90",
+            "bonus": "0",
+            "positionMode": "HEDGE",
+            "crossUnrealizedPNL": "-10",
+            "isolationUnrealizedPNL": "10",
+        }
+    )
+
+    balance = await client.fetch_balance()
+
+    assert balance["free"]["USDT"] == 100.0
+    assert balance["used"]["USDT"] == 10.0
+    assert balance["total"]["USDT"] == 110.0
+    assert client._accepted_balance_components == (100.0, 0.0, 10.0)
+
+
+@pytest.mark.asyncio
+async def test_balance_zero_transfer_floor_cannot_confirm_locked_funds():
+    client = _prepared_client()
+    client._request = AsyncMock(
+        return_value={
+            "marginCoin": "USDT",
+            "available": "10",
+            "frozen": "0",
+            "margin": "10",
+            "transfer": "0",
+            "bonus": "0",
+            "positionMode": "HEDGE",
+            "crossUnrealizedPNL": "-10",
+            "isolationUnrealizedPNL": "0",
+        }
+    )
+
+    with pytest.raises(AuthoritativeSurfaceUnavailable) as exc_info:
+        await client.fetch_balance()
+
+    assert exc_info.value.reason == "balance_consistency_check"
+    assert client._accepted_balance_components is None
+    assert client._pending_balance_components == (10.0, 0.0, 10.0)
+
+
+@pytest.mark.asyncio
+async def test_balance_wallet_is_invariant_to_unrealized_pnl():
+    client = _prepared_client()
+    client._accepted_balance_components = (90.0, 4.0, 6.0)
+    responses = []
+    for upnl, transfer in (("-25", "65"), ("0", "90"), ("25", "90")):
+        raw = {
+            "marginCoin": "USDT",
+            "available": "90",
+            "frozen": "4",
+            "margin": "6",
+            "transfer": transfer,
+            "positionMode": "HEDGE",
+            "crossUnrealizedPNL": upnl,
+            "isolationUnrealizedPNL": "0",
+        }
+        client._request = AsyncMock(return_value=raw)
+        responses.append(await client.fetch_balance())
+
+    assert [response["total"]["USDT"] for response in responses] == [100.0] * 3
+
+
+@pytest.mark.asyncio
+async def test_balance_defers_duplicated_locked_funds_until_response_recovers():
+    client = _prepared_client()
+    client._accepted_balance_components = (85.3, 0.4, 1.2)
+
+    def account(*, available, transfer):
+        return {
+            "marginCoin": "USDT",
+            "available": str(available),
+            "frozen": "0.4",
+            "margin": "1.2",
+            "transfer": str(transfer),
+            "positionMode": "HEDGE",
+            "crossUnrealizedPNL": "-0.2",
+            "isolationUnrealizedPNL": "0",
+        }
+
+    client._request = AsyncMock(
+        side_effect=[
+            account(available=85.3, transfer=85.1),
+            account(available=86.9, transfer=85.1),
+            account(available=86.9, transfer=85.1),
+            account(available=85.3, transfer=85.1),
+        ]
+    )
+
+    initial = await client.fetch_balance()
+    with pytest.raises(AuthoritativeSurfaceUnavailable) as first:
+        await client.fetch_balance()
+    with pytest.raises(AuthoritativeSurfaceUnavailable):
+        await client.fetch_balance()
+    recovered = await client.fetch_balance()
+
+    assert initial["total"]["USDT"] == pytest.approx(86.9)
+    assert first.value.surface == "balance"
+    assert first.value.reason == "balance_consistency_check"
+    assert recovered["total"]["USDT"] == pytest.approx(86.9)
+    assert client._pending_balance_components is None
+
+
+@pytest.mark.asyncio
+async def test_balance_accepts_exact_increase_when_transfer_reconciles():
+    client = _prepared_client()
+    client._accepted_balance_components = (90.0, 4.0, 6.0)
+    client._request = AsyncMock(
+        side_effect=[
+            {
+                "marginCoin": "USDT",
+                "available": "90",
+                "frozen": "4",
+                "margin": "6",
+                "transfer": "90",
+                "positionMode": "HEDGE",
+                "crossUnrealizedPNL": "0",
+                "isolationUnrealizedPNL": "0",
+            },
+            {
+                "marginCoin": "USDT",
+                "available": "100",
+                "frozen": "4",
+                "margin": "6",
+                "transfer": "100",
+                "positionMode": "HEDGE",
+                "crossUnrealizedPNL": "0",
+                "isolationUnrealizedPNL": "0",
+            },
+            {
+                "marginCoin": "USDT",
+                "available": "100",
+                "frozen": "4",
+                "margin": "6",
+                "transfer": "100",
+                "positionMode": "HEDGE",
+                "crossUnrealizedPNL": "0",
+                "isolationUnrealizedPNL": "0",
+            },
+        ]
+    )
+
+    before = await client.fetch_balance()
+    after = await client.fetch_balance()
+
+    assert before["total"]["USDT"] == 100.0
+    assert after["total"]["USDT"] == 110.0
+
+
+@pytest.mark.asyncio
+async def test_balance_restart_during_duplication_waits_for_consistent_recovery():
+    client = _prepared_client()
+
+    def account(available):
+        return {
+            "marginCoin": "USDT",
+            "available": str(available),
+            "frozen": "0.4",
+            "margin": "1.2",
+            "positionMode": "HEDGE",
+            "crossUnrealizedPNL": "-0.2",
+            "isolationUnrealizedPNL": "0",
+        }
+
+    def account_with_transfer(available, transfer):
+        result = account(available)
+        result["transfer"] = str(transfer)
+        return result
+
+    client._request = AsyncMock(
+        side_effect=[
+            account_with_transfer(86.9, 85.1),
+            account_with_transfer(86.9, 85.1),
+            account_with_transfer(85.3, 85.1),
+        ]
+    )
+
+    with pytest.raises(AuthoritativeSurfaceUnavailable):
+        await client.fetch_balance()
+    with pytest.raises(AuthoritativeSurfaceUnavailable):
+        await client.fetch_balance()
+    recovered = await client.fetch_balance()
+
+    assert recovered["free"]["USDT"] == pytest.approx(85.3)
+    assert recovered["used"]["USDT"] == pytest.approx(1.6)
+    assert recovered["total"]["USDT"] == pytest.approx(86.9)
+    assert client._accepted_balance_components == pytest.approx((85.3, 0.4, 1.2))
+    assert client._pending_balance_components is None
+
+
+@pytest.mark.asyncio
+async def test_balance_initial_locked_funds_require_transfer_reconciliation():
+    client = _prepared_client()
+    raw = {
+        "marginCoin": "USDT",
+        "available": "90",
+        "frozen": "4",
+        "margin": "6",
+        "transfer": "90",
+        "bonus": "0",
+        "positionMode": "HEDGE",
+        "crossUnrealizedPNL": "0",
+        "isolationUnrealizedPNL": "0",
+    }
+    client._request = AsyncMock(return_value=raw)
+
+    confirmed = await client.fetch_balance()
+
+    assert confirmed["total"]["USDT"] == 100.0
+    assert client._accepted_balance_components == (90.0, 4.0, 6.0)
+    assert client._pending_balance_components is None
+
+
+@pytest.mark.asyncio
+async def test_balance_ambiguous_state_never_ages_into_acceptance():
+    client = _prepared_client()
+    raw = {
+        "marginCoin": "USDT",
+        "available": "100",
+        "frozen": "4",
+        "margin": "6",
+        "transfer": "90",
+        "bonus": "0",
+        "positionMode": "HEDGE",
+        "crossUnrealizedPNL": "0",
+        "isolationUnrealizedPNL": "0",
+    }
+    client._request = AsyncMock(return_value=raw)
+
+    for _ in range(100):
+        with pytest.raises(AuthoritativeSurfaceUnavailable) as exc_info:
+            await client.fetch_balance()
+
+    assert exc_info.value.reason == "balance_consistency_check"
+    assert client._accepted_balance_components is None
+    assert client._pending_balance_components == (100.0, 4.0, 6.0)
+
+
+@pytest.mark.asyncio
+async def test_balance_changed_locks_remain_deferred_until_transfer_reconciles():
+    client = _prepared_client()
+    client._accepted_balance_components = (90.0, 4.0, 6.0)
+
+    def account(*, available, frozen, margin, transfer):
+        return {
+            "marginCoin": "USDT",
+            "available": str(available),
+            "frozen": str(frozen),
+            "margin": str(margin),
+            "transfer": str(transfer),
+            "bonus": "0",
+            "positionMode": "HEDGE",
+            "crossUnrealizedPNL": "0",
+            "isolationUnrealizedPNL": "0",
+        }
+
+    client._request = AsyncMock(
+        side_effect=[
+            account(available=100, frozen=4, margin=6, transfer=90),
+            account(available=101, frozen=3, margin=7, transfer=90),
+            account(available=91, frozen=3, margin=7, transfer=91),
+        ]
+    )
+
+    with pytest.raises(AuthoritativeSurfaceUnavailable):
+        await client.fetch_balance()
+    with pytest.raises(AuthoritativeSurfaceUnavailable):
+        await client.fetch_balance()
+    reconciled = await client.fetch_balance()
+
+    assert reconciled["total"]["USDT"] == 101.0
+    assert client._accepted_balance_components == (91.0, 3.0, 7.0)
+    assert client._pending_balance_components is None
+
+
+@pytest.mark.asyncio
+async def test_balance_new_locked_funds_require_transfer_reconciliation():
+    client = _prepared_client()
+    client._accepted_balance_components = (90.0, 0.0, 0.0)
+
+    def account(*, available, margin):
+        return {
+            "marginCoin": "USDT",
+            "available": str(available),
+            "frozen": "0",
+            "margin": str(margin),
+            "transfer": "90",
+            "bonus": "0",
+            "positionMode": "HEDGE",
+            "crossUnrealizedPNL": "0",
+            "isolationUnrealizedPNL": "0",
+        }
+
+    client._request = AsyncMock(
+        side_effect=[
+            account(available=100, margin=10),
+            account(available=90, margin=10),
+        ]
+    )
+
+    with pytest.raises(AuthoritativeSurfaceUnavailable):
+        await client.fetch_balance()
+    reconciled = await client.fetch_balance()
+
+    assert reconciled["total"]["USDT"] == 100.0
+    assert client._accepted_balance_components == (90.0, 0.0, 10.0)
+    assert client._pending_balance_components is None
+
+
+@pytest.mark.asyncio
+async def test_balance_matching_locked_funds_still_require_transfer_reconciliation():
+    client = _prepared_client()
+    client._accepted_balance_components = (90.0, 0.0, 10.0)
+
+    def account(*, available, transfer):
+        return {
+            "marginCoin": "USDT",
+            "available": str(available),
+            "frozen": "0",
+            "margin": "10",
+            "transfer": str(transfer),
+            "bonus": "0",
+            "positionMode": "HEDGE",
+            "crossUnrealizedPNL": "0",
+            "isolationUnrealizedPNL": "0",
+        }
+
+    client._request = AsyncMock(
+        side_effect=[
+            account(available=90, transfer=80),
+            account(available=80, transfer=80),
+        ]
+    )
+
+    with pytest.raises(AuthoritativeSurfaceUnavailable) as exc_info:
+        await client.fetch_balance()
+    reconciled = await client.fetch_balance()
+
+    assert exc_info.value.reason == "balance_consistency_check"
+    assert reconciled["free"]["USDT"] == 80.0
+    assert reconciled["used"]["USDT"] == 10.0
+    assert reconciled["total"]["USDT"] == 90.0
+    assert client._accepted_balance_components == (80.0, 0.0, 10.0)
+    assert client._pending_balance_components is None
+
+
+@pytest.mark.asyncio
+async def test_balance_initial_state_without_locked_funds_is_immediately_usable():
+    client = _prepared_client()
+    client._request = AsyncMock(
+        return_value={
+            "marginCoin": "USDT",
+            "available": "100",
+            "frozen": "0",
+            "margin": "0",
+            "positionMode": "HEDGE",
+            "crossUnrealizedPNL": "0",
+            "isolationUnrealizedPNL": "0",
+        }
+    )
+
+    balance = await client.fetch_balance()
+
+    assert balance["total"]["USDT"] == 100.0
+    assert client._accepted_balance_components == (100.0, 0.0, 0.0)
+
+
+@pytest.mark.asyncio
+async def test_bitunix_config_write_readiness_defers_unavailable_balance():
+    bot = BitunixBot.__new__(BitunixBot)
+    bot.balance_override = None
+    bot.cca = SimpleNamespace(
+        fetch_balance=AsyncMock(
+            side_effect=AuthoritativeSurfaceUnavailable(
+                "balance", "balance_consistency_check"
+            )
+        )
+    )
+
+    ready = await bot._exchange_config_write_ready()
+
+    assert ready is False
+    assert bot._last_authoritative_block_reason == "balance_consistency_check"
+    bot.cca.fetch_balance.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_bitunix_config_write_readiness_honors_balance_override():
+    bot = BitunixBot.__new__(BitunixBot)
+    bot.balance_override = 100.0
+    bot.cca = SimpleNamespace(
+        fetch_balance=AsyncMock(side_effect=AssertionError("must not fetch"))
+    )
+
+    ready = await bot._exchange_config_write_ready()
+
+    assert ready is True
+    bot.cca.fetch_balance.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "balance_override",
+    [
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        0.0,
+        -1.0,
+        True,
+        "not-a-number",
+    ],
+)
+async def test_bitunix_config_write_readiness_rejects_invalid_balance_override(
+    balance_override,
+):
+    bot = BitunixBot.__new__(BitunixBot)
+    bot.balance_override = balance_override
+    bot.cca = SimpleNamespace(
+        fetch_balance=AsyncMock(side_effect=AssertionError("must not fetch"))
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="balance_override must be a positive finite numeric value",
+    ):
+        await bot._exchange_config_write_ready()
+
+    bot.cca.fetch_balance.assert_not_awaited()
 
 
 def test_hedge_order_normalization_preserves_position_and_action_side():
@@ -301,6 +825,60 @@ def test_hedge_order_normalization_preserves_position_and_action_side():
 def test_order_status_accepts_live_trailing_enum_padding():
     client = _prepared_client()
     assert client._normalize_order(_order_row(status="NEW_"))["status"] == "open"
+
+
+def test_pending_endpoint_conservatively_retains_safe_unknown_status(caplog):
+    client = _prepared_client()
+
+    with caplog.at_level(logging.WARNING):
+        order = client._normalize_order(
+            _order_row(status="CANCELING"), pending_snapshot=True
+        )
+
+    assert order["status"] == "open"
+    assert "status=CANCELING" in caplog.text
+    assert "retain_as_open_until_authoritative_absence" in caplog.text
+    with pytest.raises(ValueError, match="Unknown Bitunix order status"):
+        client._normalize_order(_order_row(status="CANCELING"))
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        None,
+        "",
+        "bad status",
+        "A" * 33,
+        "CANCELING" + "_" * 24,
+        "NEW" + "_" * 30,
+    ],
+)
+def test_pending_endpoint_rejects_missing_or_malformed_status(status):
+    client = _prepared_client()
+
+    with pytest.raises(ValueError, match="Unknown Bitunix order status"):
+        client._normalize_order(_order_row(status=status), pending_snapshot=True)
+
+
+def test_detail_endpoint_rejects_oversized_padded_known_status():
+    client = _prepared_client()
+
+    with pytest.raises(ValueError, match="Unknown Bitunix order status"):
+        client._normalize_order(_order_row(status="NEW" + "_" * 30))
+
+
+def test_pending_unknown_status_warning_is_throttled(monkeypatch, caplog):
+    client = _prepared_client()
+    monotonic = iter((100.0, 101.0, 401.0))
+    monkeypatch.setattr("exchanges.bitunix.time.monotonic", lambda: next(monotonic))
+
+    with caplog.at_level(logging.WARNING):
+        for _ in range(3):
+            client._normalize_order(
+                _order_row(status="CANCELING"), pending_snapshot=True
+            )
+
+    assert caplog.text.count("status=CANCELING") == 2
 
 
 @pytest.mark.parametrize("price", [None, "", "0", "-1", "nan"])
@@ -760,6 +1338,543 @@ async def test_ohlcv_accepts_explicit_zero_base_volume():
     )
 
     assert candles[0][5] == 0.0
+
+
+def test_order_stream_advertises_native_ohlcv_and_normalizes_push_timestamp():
+    client = _prepared_client()
+    stream = BitunixOrderStream(client)
+
+    symbol, rows = stream._normalize_ohlcv_payload(_kline_payload())
+
+    assert stream.has["watchOHLCV"] is True
+    assert symbol == "BTC/USDT:USDT"
+    assert rows == [[1_700_000_040_000, 100.0, 103.0, 99.0, 102.0, 4.5]]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"b": None}, "base volume"),
+        ({"b": "-1"}, "invalid price or volume"),
+        ({"h": "101"}, "inconsistent OHLC"),
+        ({"l": "103"}, "inconsistent OHLC"),
+    ],
+)
+def test_order_stream_rejects_malformed_kline_payload(overrides, match):
+    client = _prepared_client()
+    stream = BitunixOrderStream(client)
+
+    with pytest.raises(ValueError, match=match):
+        stream._normalize_ohlcv_payload(_kline_payload(**overrides))
+
+
+@pytest.mark.asyncio
+async def test_order_stream_multiplexes_public_klines_and_uses_json_ping(
+    monkeypatch,
+    caplog,
+):
+    client = _prepared_client()
+    eth_symbol = "ETH/USDT:USDT"
+    eth_market = _market_for("ETHUSDT", eth_symbol)
+    client.markets[eth_symbol] = eth_market
+    client.markets_by_id["ETHUSDT"] = eth_market
+    client.symbols.append(eth_symbol)
+    socket = _PublicKlineSocket()
+    session = _PublicKlineSession(socket)
+    client._get_session = AsyncMock(return_value=session)
+    stream = BitunixOrderStream(client)
+    stream.PING_INTERVAL_SECONDS = 0.0
+    monkeypatch.setattr("exchanges.bitunix.time.time", lambda: 1_700_000_000.9)
+
+    btc_waiter = asyncio.create_task(stream.watch_ohlcv("BTC/USDT:USDT", "1m"))
+    eth_waiter = asyncio.create_task(stream.watch_ohlcv(eth_symbol, "1m"))
+    for _ in range(100):
+        subscribed = {
+            arg["symbol"]
+            for message in socket.sent
+            if message.get("op") == "subscribe"
+            for arg in message["args"]
+        }
+        if subscribed == {"BTCUSDT", "ETHUSDT"}:
+            break
+        await asyncio.sleep(0.01)
+    assert subscribed == {"BTCUSDT", "ETHUSDT"}
+    assert len(session.connect_calls) == 1
+    assert {"op": "ping", "ping": 1_700_000_000} in socket.sent
+
+    await socket.messages.put(
+        SimpleNamespace(
+            type=aiohttp.WSMsgType.TEXT,
+            data=json.dumps(
+                {"op": "ping", "pong": 1_700_000_000, "ping": 1_700_000_001}
+            ),
+        )
+    )
+    await socket.messages.put(
+        SimpleNamespace(
+            type=aiohttp.WSMsgType.TEXT,
+            data=json.dumps(_kline_payload("BTCUSDT", l="101")),
+        )
+    )
+    await socket.messages.put(
+        SimpleNamespace(
+            type=aiohttp.WSMsgType.TEXT,
+            data=json.dumps(_kline_payload("BTCUSDT")),
+        )
+    )
+    await socket.messages.put(
+        SimpleNamespace(
+            type=aiohttp.WSMsgType.TEXT,
+            data=json.dumps(_kline_payload("ETHUSDT", c="101")),
+        )
+    )
+
+    btc_rows, eth_rows = await asyncio.gather(btc_waiter, eth_waiter)
+    assert btc_rows[0][4] == 102.0
+    assert eth_rows[0][4] == 101.0
+    assert "malformed kline update dropped" in caplog.text
+
+    await stream.un_watch_ohlcv("BTC/USDT:USDT", "1m")
+    await stream.un_watch_ohlcv(eth_symbol, "1m")
+    assert socket.closed is True
+    await stream.close()
+
+
+@pytest.mark.asyncio
+async def test_order_stream_routes_persistent_malformed_klines_to_one_watcher():
+    client = _prepared_client()
+    socket = _PublicKlineSocket()
+    client._get_session = AsyncMock(
+        return_value=_PublicKlineSession(socket)
+    )
+    stream = BitunixOrderStream(client)
+    symbol = "BTC/USDT:USDT"
+    queue = asyncio.Queue(maxsize=stream.KLINE_QUEUE_SIZE)
+    stream._ohlcv_queues[symbol] = queue
+    stream._ensure_ohlcv_task()
+    for _ in range(100):
+        if stream._ohlcv_ws is socket:
+            break
+        await asyncio.sleep(0.01)
+    for _ in range(stream.MAX_CONSECUTIVE_MALFORMED_KLINES):
+        await socket.messages.put(
+            SimpleNamespace(
+                type=aiohttp.WSMsgType.TEXT,
+                data=json.dumps(_kline_payload("BTCUSDT", l="101")),
+            )
+        )
+    for _ in range(stream.KLINE_QUEUE_SIZE + 2):
+        await socket.messages.put(
+            SimpleNamespace(
+                type=aiohttp.WSMsgType.TEXT,
+                data=json.dumps(_kline_payload("BTCUSDT")),
+            )
+        )
+    for _ in range(100):
+        if socket.messages.empty():
+            break
+        await asyncio.sleep(0.01)
+
+    assert queue.qsize() == 1
+    assert symbol in stream._ohlcv_fallback_pending
+    with pytest.raises(NetworkError, match="consecutive malformed updates"):
+        await stream.watch_ohlcv(symbol, "1m")
+    assert symbol not in stream._ohlcv_fallback_pending
+    assert stream._ohlcv_task is not None
+    assert not stream._ohlcv_task.done()
+    await stream.close()
+
+
+@pytest.mark.asyncio
+async def test_order_stream_public_failure_wakes_all_watchers_for_rest_fallback():
+    client = _prepared_client()
+    eth_symbol = "ETH/USDT:USDT"
+    eth_market = _market_for("ETHUSDT", eth_symbol)
+    client.markets[eth_symbol] = eth_market
+    client.markets_by_id["ETHUSDT"] = eth_market
+    client.symbols.append(eth_symbol)
+    socket = _PublicKlineSocket()
+    client._get_session = AsyncMock(
+        return_value=_PublicKlineSession(socket)
+    )
+    stream = BitunixOrderStream(client)
+
+    waiters = [
+        asyncio.create_task(stream.watch_ohlcv(symbol, "1m"))
+        for symbol in ("BTC/USDT:USDT", eth_symbol)
+    ]
+    for _ in range(100):
+        if stream._ohlcv_ws is socket:
+            break
+        await asyncio.sleep(0.01)
+    await socket.messages.put(
+        SimpleNamespace(type=aiohttp.WSMsgType.ERROR, data="closed")
+    )
+
+    results = await asyncio.gather(*waiters, return_exceptions=True)
+    assert all(isinstance(result, NetworkError) for result in results)
+    assert all("NetworkError" in str(result) for result in results)
+    await stream.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("setup_surface", ["session", "socket"])
+async def test_order_stream_setup_failure_wakes_shard_watchers(setup_surface):
+    client = _prepared_client()
+    eth_symbol = "ETH/USDT:USDT"
+    eth_market = _market_for("ETHUSDT", eth_symbol)
+    client.markets[eth_symbol] = eth_market
+    client.markets_by_id["ETHUSDT"] = eth_market
+    client.symbols.append(eth_symbol)
+    if setup_surface == "session":
+        client._get_session = AsyncMock(
+            side_effect=NetworkError("session unavailable")
+        )
+    else:
+        session = MagicMock()
+        session.ws_connect.side_effect = NetworkError("socket unavailable")
+        client._get_session = AsyncMock(return_value=session)
+    stream = BitunixOrderStream(client)
+
+    results = await asyncio.gather(
+        stream.watch_ohlcv("BTC/USDT:USDT", "1m"),
+        stream.watch_ohlcv(eth_symbol, "1m"),
+        return_exceptions=True,
+    )
+
+    assert all(isinstance(result, NetworkError) for result in results)
+    assert all(
+        f"failed: {type(result).__name__}" in str(result)
+        for result in results
+    )
+    await stream.close()
+
+
+@pytest.mark.asyncio
+async def test_order_stream_transport_failure_preserves_every_fallback_signal():
+    client = _prepared_client()
+    eth_symbol = "ETH/USDT:USDT"
+    eth_market = _market_for("ETHUSDT", eth_symbol)
+    client.markets[eth_symbol] = eth_market
+    client.markets_by_id["ETHUSDT"] = eth_market
+    client.symbols.append(eth_symbol)
+    socket = _PublicKlineSocket()
+    client._get_session = AsyncMock(
+        return_value=_PublicKlineSession(socket)
+    )
+    stream = BitunixOrderStream(client)
+    symbols = {"BTC/USDT:USDT", eth_symbol}
+    for symbol in symbols:
+        stream._ohlcv_queues[symbol] = asyncio.Queue(
+            maxsize=stream.KLINE_QUEUE_SIZE
+        )
+    stream._ensure_ohlcv_task()
+    for _ in range(100):
+        if stream._ohlcv_ws is socket:
+            break
+        await asyncio.sleep(0.01)
+
+    await socket.messages.put(
+        SimpleNamespace(type=aiohttp.WSMsgType.ERROR, data="closed")
+    )
+    for _ in range(100):
+        if stream._ohlcv_task is None:
+            break
+        await asyncio.sleep(0.01)
+
+    assert stream._ohlcv_fallback_pending == symbols
+    for symbol in symbols:
+        queue = stream._ohlcv_queues[symbol]
+        assert queue.qsize() == 1
+        assert isinstance(queue.get_nowait(), NetworkError)
+    await stream.close()
+
+
+@pytest.mark.asyncio
+async def test_order_stream_silence_timeout_wakes_waiter_for_rest_fallback():
+    client = _prepared_client()
+    socket = _PublicKlineSocket()
+    session = _PublicKlineSession(socket)
+    client._get_session = AsyncMock(return_value=session)
+    stream = BitunixOrderStream(client)
+    stream.KLINE_SILENCE_TIMEOUT_SECONDS = 0.02
+
+    waiter = asyncio.create_task(
+        stream.watch_ohlcv("BTC/USDT:USDT", "1m")
+    )
+
+    with pytest.raises(NetworkError, match="failed: NetworkError"):
+        await asyncio.wait_for(waiter, timeout=1.0)
+    assert session.connect_calls[0][1]["receive_timeout"] == 45.0
+    await stream.close()
+
+
+@pytest.mark.asyncio
+async def test_order_stream_tracks_kline_silence_per_subscription():
+    client = _prepared_client()
+    eth_symbol = "ETH/USDT:USDT"
+    eth_market = _market_for("ETHUSDT", eth_symbol)
+    client.markets[eth_symbol] = eth_market
+    client.markets_by_id["ETHUSDT"] = eth_market
+    client.symbols.append(eth_symbol)
+    socket = _PublicKlineSocket()
+    client._get_session = AsyncMock(
+        return_value=_PublicKlineSession(socket)
+    )
+    stream = BitunixOrderStream(client)
+    stream.KLINE_SILENCE_TIMEOUT_SECONDS = 0.05
+
+    btc_waiter = asyncio.create_task(
+        stream.watch_ohlcv("BTC/USDT:USDT", "1m")
+    )
+    eth_waiter = asyncio.create_task(stream.watch_ohlcv(eth_symbol, "1m"))
+    for _ in range(100):
+        subscribed = {
+            arg["symbol"]
+            for message in socket.sent
+            if message.get("op") == "subscribe"
+            for arg in message["args"]
+        }
+        if subscribed == {"BTCUSDT", "ETHUSDT"}:
+            break
+        await asyncio.sleep(0.01)
+    assert subscribed == {"BTCUSDT", "ETHUSDT"}
+
+    eth_rows = None
+    for _ in range(8):
+        await socket.messages.put(
+            SimpleNamespace(
+                type=aiohttp.WSMsgType.TEXT,
+                data=json.dumps({"op": "pong"}),
+            )
+        )
+        await socket.messages.put(
+            SimpleNamespace(
+                type=aiohttp.WSMsgType.TEXT,
+                data=json.dumps(_kline_payload("ETHUSDT")),
+            )
+        )
+        if eth_rows is None and eth_waiter.done():
+            eth_rows = eth_waiter.result()
+        await asyncio.sleep(0.01)
+
+    with pytest.raises(NetworkError, match="subscription became silent"):
+        await asyncio.wait_for(btc_waiter, timeout=1.0)
+    if eth_rows is None:
+        eth_rows = await asyncio.wait_for(eth_waiter, timeout=1.0)
+    assert eth_rows[0][4] == 102.0
+    assert eth_symbol not in stream._ohlcv_fallback_pending
+    assert stream._ohlcv_task is not None
+    assert not stream._ohlcv_task.done()
+    await stream.close()
+
+
+@pytest.mark.asyncio
+async def test_order_stream_shards_kline_subscriptions_at_connection_limit():
+    client = _prepared_client()
+    symbols_by_id = {
+        "ETHUSDT": "ETH/USDT:USDT",
+        "SOLUSDT": "SOL/USDT:USDT",
+    }
+    for market_id, symbol in symbols_by_id.items():
+        market = _market_for(market_id, symbol)
+        client.markets[symbol] = market
+        client.markets_by_id[market_id] = market
+        client.symbols.append(symbol)
+    sockets = [_PublicKlineSocket(), _PublicKlineSocket()]
+    session = _PublicKlineSessionPool(sockets)
+    client._get_session = AsyncMock(return_value=session)
+    stream = BitunixOrderStream(client)
+    stream.MAX_KLINE_SUBSCRIPTIONS = 2
+
+    market_symbols = {
+        "BTCUSDT": "BTC/USDT:USDT",
+        **symbols_by_id,
+    }
+    waiters = {
+        market_id: asyncio.create_task(stream.watch_ohlcv(symbol, "1m"))
+        for market_id, symbol in market_symbols.items()
+    }
+    for _ in range(100):
+        subscribed = {
+            arg["symbol"]
+            for socket in sockets
+            for message in socket.sent
+            if message.get("op") == "subscribe"
+            for arg in message["args"]
+        }
+        if subscribed == set(market_symbols):
+            break
+        await asyncio.sleep(0.01)
+
+    assert subscribed == set(market_symbols)
+    assert len(session.connect_calls) == 2
+    assert len(stream._ohlcv_tasks) == 2
+    subscription_counts = {market_id: 0 for market_id in market_symbols}
+    for socket in sockets:
+        socket_subscriptions = {
+            arg["symbol"]
+            for message in socket.sent
+            if message.get("op") == "subscribe"
+            for arg in message["args"]
+        }
+        assert len(socket_subscriptions) <= stream.MAX_KLINE_SUBSCRIPTIONS
+        for market_id in socket_subscriptions:
+            subscription_counts[market_id] += 1
+            await socket.messages.put(
+                SimpleNamespace(
+                    type=aiohttp.WSMsgType.TEXT,
+                    data=json.dumps(_kline_payload(market_id)),
+                )
+            )
+
+    results = await asyncio.gather(*waiters.values())
+    assert all(rows[0][4] == 102.0 for rows in results)
+    assert set(subscription_counts.values()) == {1}
+
+    await stream.un_watch_ohlcv("SOL/USDT:USDT", "1m")
+    assert len(stream._ohlcv_tasks) == 1
+    assert sum(socket.closed for socket in sockets) == 1
+    await stream.un_watch_ohlcv("BTC/USDT:USDT", "1m")
+    await stream.un_watch_ohlcv("ETH/USDT:USDT", "1m")
+    assert not stream._ohlcv_tasks
+    assert all(socket.closed for socket in sockets)
+    await stream.close()
+
+
+@pytest.mark.parametrize(
+    "rejection_fields",
+    [{"code": 10001}, {"success": False}],
+)
+@pytest.mark.asyncio
+async def test_order_stream_scopes_rejected_subscription_to_affected_watcher(
+    rejection_fields,
+    caplog,
+):
+    client = _prepared_client()
+    eth_symbol = "ETH/USDT:USDT"
+    eth_market = _market_for("ETHUSDT", eth_symbol)
+    client.markets[eth_symbol] = eth_market
+    client.markets_by_id["ETHUSDT"] = eth_market
+    client.symbols.append(eth_symbol)
+    socket = _PublicKlineSocket()
+    client._get_session = AsyncMock(
+        return_value=_PublicKlineSession(socket)
+    )
+    stream = BitunixOrderStream(client)
+
+    btc_waiter = asyncio.create_task(
+        stream.watch_ohlcv("BTC/USDT:USDT", "1m")
+    )
+    eth_waiter = asyncio.create_task(stream.watch_ohlcv(eth_symbol, "1m"))
+    for _ in range(100):
+        subscribed = {
+            arg["symbol"]
+            for message in socket.sent
+            if message.get("op") == "subscribe"
+            for arg in message["args"]
+        }
+        if subscribed == {"BTCUSDT", "ETHUSDT"}:
+            break
+        await asyncio.sleep(0.01)
+
+    await socket.messages.put(
+        SimpleNamespace(
+            type=aiohttp.WSMsgType.TEXT,
+            data=json.dumps(
+                {
+                    "op": "subscribe",
+                    "args": [
+                        {
+                            "symbol": "BTCUSDT",
+                            "ch": "market_kline_1min",
+                        }
+                    ],
+                    "msg": "must not reach logs",
+                    **rejection_fields,
+                }
+            ),
+        )
+    )
+    await socket.messages.put(
+        SimpleNamespace(
+            type=aiohttp.WSMsgType.TEXT,
+            data=json.dumps(_kline_payload("ETHUSDT")),
+        )
+    )
+
+    with pytest.raises(NetworkError, match="subscription was rejected"):
+        await asyncio.wait_for(btc_waiter, timeout=1.0)
+    assert (await asyncio.wait_for(eth_waiter, timeout=1.0))[0][4] == 102.0
+    assert "symbol=BTC/USDT:USDT action=rest_fallback" in caplog.text
+    assert "must not reach logs" not in caplog.text
+    assert stream._ohlcv_task is not None
+    assert not stream._ohlcv_task.done()
+
+    btc_recovery = asyncio.create_task(
+        stream.watch_ohlcv("BTC/USDT:USDT", "1m")
+    )
+    # Subscription reconciliation polls at one-second intervals. Allow one
+    # complete poll plus scheduler slack before declaring recovery absent.
+    for _ in range(200):
+        btc_subscriptions = sum(
+            1
+            for message in socket.sent
+            if message.get("op") == "subscribe"
+            for arg in message["args"]
+            if arg["symbol"] == "BTCUSDT"
+        )
+        if btc_subscriptions >= 2:
+            break
+        await asyncio.sleep(0.01)
+    assert btc_subscriptions >= 2
+    await socket.messages.put(
+        SimpleNamespace(
+            type=aiohttp.WSMsgType.TEXT,
+            data=json.dumps(_kline_payload("BTCUSDT")),
+        )
+    )
+    assert (await asyncio.wait_for(btc_recovery, timeout=1.0))[0][4] == 102.0
+    await stream.close()
+
+
+@pytest.mark.asyncio
+async def test_order_stream_can_resubscribe_immediately_after_last_unwatch():
+    client = _prepared_client()
+    first_socket = _PublicKlineSocket()
+    second_socket = _PublicKlineSocket()
+    sessions = iter(
+        (_PublicKlineSession(first_socket), _PublicKlineSession(second_socket))
+    )
+    client._get_session = AsyncMock(side_effect=lambda: next(sessions))
+    stream = BitunixOrderStream(client)
+
+    first_waiter = asyncio.create_task(
+        stream.watch_ohlcv("BTC/USDT:USDT", "1m")
+    )
+    for _ in range(100):
+        if stream._ohlcv_ws is first_socket:
+            break
+        await asyncio.sleep(0.01)
+    await stream.un_watch_ohlcv("BTC/USDT:USDT", "1m")
+    with pytest.raises(NetworkError, match="subscription was removed"):
+        await first_waiter
+
+    second_waiter = asyncio.create_task(
+        stream.watch_ohlcv("BTC/USDT:USDT", "1m")
+    )
+    for _ in range(100):
+        if stream._ohlcv_ws is second_socket:
+            break
+        await asyncio.sleep(0.01)
+    await second_socket.messages.put(
+        SimpleNamespace(
+            type=aiohttp.WSMsgType.TEXT,
+            data=json.dumps(_kline_payload()),
+        )
+    )
+    assert (await second_waiter)[0][4] == 102.0
+    await stream.close()
 
 
 @pytest.mark.asyncio

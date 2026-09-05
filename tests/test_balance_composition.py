@@ -10,6 +10,7 @@ from live.balance_composition import (
     balance_composition_signature,
     format_balance_composition_sample,
     malformed_balance_composition,
+    normalize_bitunix_balance_composition,
     normalize_ccxt_balance_composition,
     normalize_gateio_balance_composition,
     normalize_hyperliquid_unified_balance_composition,
@@ -25,6 +26,10 @@ from live.event_bus import (
     format_console_event,
 )
 from live import state_refresh
+from live.state_refresh import (
+    AuthoritativeSurfaceUnavailable,
+    DeferredAuthoritativeSurface,
+)
 
 
 def _okx_payload(details):
@@ -33,6 +38,50 @@ def _okx_payload(details):
 
 def _hyperliquid_unified_payload(balances):
     return {"info": {"balances": balances}}
+
+
+def test_bitunix_balance_composition_keeps_wallet_and_upnl_separate():
+    snapshot = normalize_bitunix_balance_composition(
+        {
+            "info": {
+                "marginCoin": "USDT",
+                "available": "90",
+                "frozen": "4",
+                "margin": "6",
+                "crossUnrealizedPNL": "-3",
+                "isolationUnrealizedPNL": "1",
+            }
+        }
+    )
+
+    assert snapshot["status"] == "available"
+    assert snapshot["asset_balances"] == [
+        {
+            "asset": "USDT",
+            "amount": 100.0,
+            "free_amount": 90.0,
+            "used_amount": 10.0,
+            "unrealized_pnl": -2.0,
+            "field_provenance": {
+                "asset": "marginCoin",
+                "amount": "account_components",
+                "free_amount": "available",
+                "used_amount": "frozen_margin",
+                "unrealized_pnl": "account_unrealized_pnl",
+            },
+        }
+    ]
+    assert public_balance_composition(snapshot)["asset_balances"] == snapshot[
+        "asset_balances"
+    ]
+
+
+def test_bitunix_balance_composition_rejects_missing_account_fields():
+    assert normalize_bitunix_balance_composition(
+        {"info": {"marginCoin": "USDT", "available": "1"}}
+    ) == malformed_balance_composition(
+        source="bitunix.info.account", reason="missing_account_fields"
+    )
 
 
 def test_okx_balance_composition_keeps_only_proven_detail_fields():
@@ -599,6 +648,51 @@ async def test_diagnostic_normalizer_failure_is_explicit_without_losing_scalar_b
         source="normalizer", reason="normalizer_error"
     )
     assert "secret" not in str(composition)
+
+
+@pytest.mark.asyncio
+async def test_staged_balance_unavailability_is_explicit_and_bounded():
+    class Bot:
+        async def capture_balance_snapshot(self):
+            raise AuthoritativeSurfaceUnavailable(
+                "balance", "balance_consistency_check"
+            )
+
+    raw, composition, balance = await state_refresh.capture_balance_staged_snapshot(Bot())
+
+    assert raw is None
+    assert composition == unavailable_balance_composition(
+        reason="balance_consistency_check"
+    )
+    assert balance == DeferredAuthoritativeSurface(
+        surface="balance", reason="balance_consistency_check"
+    )
+
+
+@pytest.mark.asyncio
+async def test_staged_refresh_does_not_prepare_or_commit_deferred_balance():
+    class Bot:
+        def _authoritative_staged_refresh_plan(self):
+            return {"balance"}
+
+        async def _fetch_authoritative_state_staged_snapshot(self, _plan):
+            return {
+                "balance": DeferredAuthoritativeSurface(
+                    surface="balance",
+                    reason="balance_consistency_check",
+                )
+            }
+
+        def _prepare_balance_snapshot(self, _balance):
+            raise AssertionError("deferred balance must not be prepared")
+
+    bot = Bot()
+
+    assert await state_refresh.refresh_authoritative_state_staged(bot) is False
+    assert (
+        bot._last_authoritative_block_reason
+        == "balance_consistency_check"
+    )
 
 
 def test_composition_only_balance_event_remains_durable_but_is_not_console_visible():

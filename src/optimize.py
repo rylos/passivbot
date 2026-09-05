@@ -117,6 +117,7 @@ from utils import date_to_ts, ts_to_date, utc_ms, make_get_filepath, format_appr
 from logging_setup import configure_logging, resolve_log_level
 from materialized_cache import release_materialized_payload
 from copy import deepcopy
+from dataclasses import replace
 import gc
 import numpy as np
 from uuid import uuid4
@@ -154,7 +155,13 @@ except ImportError:  # pragma: no cover - allow import in minimal test envs
 import math
 import fcntl
 from optimizer_overrides import optimizer_overrides, validate_optimizer_overrides
-from opt_utils import make_json_serializable, generate_incremental_diff, round_floats, quantize_floats
+from opt_utils import (
+    deep_updated,
+    generate_incremental_diff,
+    make_json_serializable,
+    quantize_floats,
+    round_floats,
+)
 from limit_utils import expand_limit_checks, compute_limit_violation
 from pareto_store import ParetoStore
 import msgpack
@@ -182,6 +189,7 @@ from optimization.bounds import (
     round_to_sig_digits,
 )
 from optimization.fine_tune_anchors import ANCHOR_GENE_KEY, ANCHOR_PLAN_KEY, get_anchor_plan
+from optimization.interrupts import OptimizerInterruptLatch
 from optimization.backend_shared import cancel_pending_async_results, stream_async_results
 from optimization.backends import get_backend_runner
 from optimization.random_seed import seed_rngs
@@ -197,6 +205,7 @@ from optimization.warmup import (
     build_optimizer_vector_config,
     compute_optimizer_per_coin_warmup_minutes,
     stamp_warmup_metadata,
+    validate_optimizer_effective_configs,
 )
 from optimization.shape import OptimizationShape, build_optimization_shape
 from config.strategy import normalize_strategy_kind, sync_canonical_strategy_config
@@ -266,13 +275,25 @@ def _normalize_optional_bool_flag(argv: list[str], flag: str) -> list[str]:
     return result
 
 
-def _maybe_aggregate_backtest_data(hlcvs, timestamps, btc_usd_prices, mss, config):
+def _maybe_aggregate_backtest_data(
+    hlcvs,
+    timestamps,
+    btc_usd_prices,
+    mss,
+    config,
+    *,
+    preserve_internal_nan_gaps: bool = False,
+):
     candle_interval = int(config.get("backtest", {}).get("candle_interval_minutes", 1) or 1)
     if candle_interval <= 1:
         return hlcvs, timestamps, btc_usd_prices
     n_before = hlcvs.shape[0]
     hlcvs, timestamps, btc_usd_prices, offset_bars = align_and_aggregate_hlcvs(
-        hlcvs, timestamps, btc_usd_prices, candle_interval
+        hlcvs,
+        timestamps,
+        btc_usd_prices,
+        candle_interval,
+        preserve_internal_nan_gaps=preserve_internal_nan_gaps,
     )
     logging.debug(
         "[optimize] aggregated %dm candles: %d bars -> %d bars (trimmed %d for alignment)",
@@ -378,6 +399,7 @@ def _register_exchange_data(
     btc_usd_specs: dict,
     timestamps_dict: dict,
     array_manager: SharedArrayManager,
+    preserve_internal_nan_gaps: bool = False,
 ) -> tuple[list[str], dict]:
     """
     Register one exchange's prepared data into the optimizer's shared-memory
@@ -387,7 +409,12 @@ def _register_exchange_data(
     _propagate_optimizer_dataset_override(config, exchange, coins, cache_dir, mss)
     prepared_hlcvs = hlcvs
     hlcvs, timestamps, btc_usd_prices = _maybe_aggregate_backtest_data(
-        hlcvs, timestamps, btc_usd_prices, mss, config
+        hlcvs,
+        timestamps,
+        btc_usd_prices,
+        mss,
+        config,
+        preserve_internal_nan_gaps=preserve_internal_nan_gaps,
     )
     _stamp_optimizer_warmup(config, mss, coins)
     timestamps_dict[exchange] = (
@@ -421,6 +448,7 @@ class ResultRecorder:
         pareto_max_size: int = 1000,
         bounds: Optional[Sequence[Bound]] = None,
         starting_iters: int = 0,
+        previous_data: dict | None = None,
     ):
         self.scoring_specs = extract_objective_specs(scoring_keys)
         self.scoring_keys = [spec.metric for spec in self.scoring_specs]
@@ -442,18 +470,21 @@ class ResultRecorder:
             filename = os.path.join(results_dir, "all_results.bin")
             self.results_file = open(filename, "ab")
             self.packer = msgpack.Packer(use_bin_type=True)
-        self.prev_data = None
-        self.counter = 0
+        self.prev_data = previous_data
 
     def record(self, data: dict) -> None:
         if self.write_all and self.results_file:
             if self.compress:
-                if self.prev_data is None or self.counter % 100 == 0:
+                # The on-disk format is an overlay stream: readers apply every
+                # object to the preceding result.  A plain "full" object at a
+                # periodic boundary therefore cannot clear keys that existed
+                # only in the previous result.  Emit a diff after the first
+                # record so deletion markers remain explicit at every boundary.
+                if self.prev_data is None:
                     output_data = make_json_serializable(data)
                 else:
                     diff = generate_incremental_diff(self.prev_data, data)
                     output_data = make_json_serializable(diff)
-                self.counter += 1
                 self.prev_data = data
             else:
                 output_data = data
@@ -777,6 +808,7 @@ def _resume_config_mismatches(entry: dict, config: dict) -> list[str]:
             "offspring_multiplier",
             "objective_scenario",
             "population_size",
+            "gpu",
             "pymoo",
             "round_to_n_significant_digits",
             "scoring",
@@ -847,14 +879,101 @@ def _require_resume_checkpoint(results_dir: str) -> str:
     return checkpoint_path
 
 
-def _validate_resume_results(results_dir: str, config: dict) -> int:
+def _restore_gpu_resume_anchor_plan(config: dict, checkpoint_path: str) -> bool:
+    """Restore checkpoint-owned fine-tune anchors before building optimizer shape."""
+
+    if config.get("optimize", {}).get("backend") != "gpu":
+        return False
+    try:
+        import pickle
+
+        with open(checkpoint_path, "rb") as file:
+            checkpoint = pickle.load(file)
+    except Exception as exc:
+        raise ValueError(
+            f"Cannot resume: failed to read checkpoint: {checkpoint_path}"
+        ) from exc
+    anchor_plan = checkpoint.get("anchor_plan")
+    if anchor_plan is None:
+        return False
+    if not isinstance(anchor_plan, dict) or not anchor_plan.get("anchors"):
+        raise ValueError("Cannot resume: GPU checkpoint has an invalid anchor plan")
+    checkpoint_strategy = normalize_strategy_kind(anchor_plan.get("strategy_kind"))
+    config_strategy = normalize_strategy_kind(
+        config.get("live", {}).get("strategy_kind")
+    )
+    if checkpoint_strategy != config_strategy:
+        raise ValueError(
+            "Cannot resume: GPU checkpoint anchor strategy does not match config"
+        )
+    config[ANCHOR_PLAN_KEY] = deepcopy(anchor_plan)
+    logging.info(
+        "Restored %d checkpoint-owned fine-tune anchors",
+        len(anchor_plan["anchors"]),
+    )
+    return True
+
+
+def _should_apply_fine_tune_bounds(
+    *, restored_resume_anchor_plan: bool, installing_anchor_plan: bool
+) -> bool:
+    """Keep a checkpoint-owned optimizer shape stable across GPU resume."""
+
+    return not restored_resume_anchor_plan and not installing_anchor_plan
+
+
+def _gpu_checkpoint_allows_empty_results(
+    checkpoint_path: str | None,
+    config: dict,
+) -> bool:
+    """Permit the durable pre-result checkpoint of a GPU seed bootstrap."""
+
+    if (
+        config.get("optimize", {}).get("backend") != "gpu"
+        or checkpoint_path is None
+    ):
+        return False
+    try:
+        import pickle
+
+        with open(checkpoint_path, "rb") as file:
+            checkpoint = pickle.load(file)
+    except Exception:
+        return False
+    plan = checkpoint.get("seed_bootstrap_plan")
+    return bool(
+        not checkpoint.get("seed_bootstrap_complete", True)
+        and int(checkpoint.get("seed_exact_done", -1)) == 0
+        and int(checkpoint.get("exact_done", -1)) == 0
+        and isinstance(checkpoint.get("seed_bootstrap_contract"), dict)
+        and isinstance(plan, dict)
+        and plan.get("starting_vectors")
+        and plan.get("effective_mode") in {"exact", "screened"}
+    )
+
+
+def _validate_resume_results(
+    results_dir: str,
+    config: dict,
+    *,
+    checkpoint_path: str | None = None,
+    resume_state: dict | None = None,
+) -> int:
     results_filename = os.path.join(results_dir, "all_results.bin")
     if not os.path.isfile(results_filename):
         raise ValueError(f"Cannot resume: all_results.bin not found: {results_filename}")
     if os.path.getsize(results_filename) <= 0:
+        if _gpu_checkpoint_allows_empty_results(checkpoint_path, config):
+            if resume_state is not None:
+                resume_state["previous_data"] = None
+            logging.info(
+                "Resuming GPU seed bootstrap before its first durable exact result"
+            )
+            return 0
         raise ValueError(f"Cannot resume: all_results.bin is empty: {results_filename}")
 
     previous_evals = 0
+    previous_data = {}
     try:
         with open(results_filename, "rb") as f:
             for entry in _iter_strict_msgpack_objects(
@@ -871,6 +990,7 @@ def _validate_resume_results(results_dir: str, config: dict) -> int:
                         f"Cannot resume: all_results.bin entry {previous_evals} is not a result object: "
                         f"{results_filename}"
                     )
+                previous_data = deep_updated(previous_data, entry)
                 if previous_evals == 1:
                     mismatches = _resume_config_mismatches(entry, config)
                     if mismatches:
@@ -890,6 +1010,8 @@ def _validate_resume_results(results_dir: str, config: dict) -> int:
 
     if previous_evals <= 0:
         raise ValueError(f"Cannot resume: all_results.bin contains no entries: {results_filename}")
+    if resume_state is not None:
+        resume_state["previous_data"] = previous_data
     logging.info("Resuming with %d previous evaluations from all_results.bin", previous_evals)
     return previous_evals
 
@@ -1292,11 +1414,13 @@ def config_to_individual(
 def _optimizer_anchor_id(config: dict) -> int | None:
     anchor_meta = config.get("_optimizer_anchor")
     if not isinstance(anchor_meta, dict):
+        anchor_meta = config.get("optimizer_anchor")
+    if not isinstance(anchor_meta, dict):
         return None
-    try:
-        return int(anchor_meta["id"])
-    except (KeyError, TypeError, ValueError):
+    anchor_id = anchor_meta.get("id")
+    if isinstance(anchor_id, bool) or not isinstance(anchor_id, int):
         return None
+    return anchor_id
 
 
 def _canonicalize_optimizer_individual(
@@ -1889,7 +2013,21 @@ class SuiteEvaluator:
                 ctx.attachments["btc"][exchange] = attachment
                 ctx.shared_btc_np[exchange] = attachment.array
 
-    def _build_scenario_candidate_config(self, config: Dict[str, Any], ctx: ScenarioEvalContext):
+    def get_prepared_context_data(
+        self, ctx: ScenarioEvalContext, exchange: str
+    ) -> tuple[np.ndarray, np.ndarray | None, list[int] | None]:
+        """Return the exact prepared arrays and active coin indices for a scenario."""
+
+        if self._uses_lazy_slicing(ctx, exchange):
+            return self._get_lazy_slice_data(ctx, exchange)
+        self._ensure_context_attachment(ctx, exchange)
+        return (
+            ctx.shared_hlcvs_np[exchange],
+            ctx.shared_btc_np.get(exchange),
+            ctx.coin_indices.get(exchange),
+        )
+
+    def build_scenario_candidate_config(self, config: Dict[str, Any], ctx: ScenarioEvalContext):
         scenario_config = dict(config)
         scenario_backtest = ctx.config.get("backtest", {})
         backtest_cfg = dict(config.get("backtest", {}))
@@ -1910,6 +2048,83 @@ class SuiteEvaluator:
             scenario_config = deepcopy(scenario_config)
             _apply_config_overrides(scenario_config, ctx.overrides)
         return scenario_config
+
+    def _build_scenario_candidate_config(
+        self, config: Dict[str, Any], ctx: ScenarioEvalContext
+    ):
+        """Compatibility wrapper for callers predating the public suite helper."""
+
+        return self.build_scenario_candidate_config(config, ctx)
+
+    def score_scenario_results(self, scenario_results: List[ScenarioResult]) -> Dict[str, Any]:
+        """Apply the canonical suite reducers, objectives, and limits to scenario stats."""
+
+        reduce_started = time.perf_counter()
+        reduced_summary = reduce_metrics(scenario_results, self.reducer_cfg)
+        reduce_metrics_ms = (time.perf_counter() - reduce_started) * 1000.0
+        fitness_started = time.perf_counter()
+        suite_payload = build_suite_metrics_payload(scenario_results, reduced_summary)
+        reduced_stats = reduced_summary.get("stats", {})
+
+        reduced_stats_flat = flatten_metric_stats(reduced_stats)
+        flat_stats = dict(reduced_stats_flat)
+        # Override _mean with correctly aggregated values so calc_fitness
+        # and limit defaults respect the reducer config (e.g. "max" instead of "mean").
+        aggregated_values = reduced_summary.get("aggregated", {})
+        for metric, agg_value in aggregated_values.items():
+            flat_stats[f"{metric}_mean"] = agg_value
+        required_scenario_labels = {
+            basis.scenario for basis in self.objective_bases if basis.scenario is not None
+        }
+        required_scenario_labels.update(
+            check["scenario"]
+            for check in self.base.limit_checks
+            if check.get("scenario") is not None
+        )
+        scenario_stats_by_label = {
+            result.scenario.label: flatten_metric_stats(result.metrics.get("stats", {}))
+            for result in scenario_results
+            if result.scenario.label in required_scenario_labels
+        }
+        objective_values: List[float] = []
+        for spec, basis in zip(self.base.scoring_specs, self.objective_bases):
+            if basis.scenario is not None:
+                source_stats = scenario_stats_by_label[basis.scenario]
+                reducer = "mean"
+            else:
+                source_stats = reduced_stats_flat
+                reducer = basis.reducer or "mean"
+            value = resolve_metric_value(source_stats, f"{spec.metric}_{reducer}")
+            if value is None and spec.metric.endswith(("_usd", "_btc")):
+                value = resolve_metric_value(
+                    source_stats,
+                    f"{spec.metric.rsplit('_', 1)[0]}_{reducer}",
+                )
+            if value is None:
+                basis_label = (
+                    f"scenario {basis.scenario!r}"
+                    if basis.scenario is not None
+                    else f"reducer {reducer!r}"
+                )
+                raise ValueError(
+                    "missing optimizer scoring metric "
+                    f"{spec.metric!r} for {basis_label}; "
+                    f"available metrics: {_format_available_metric_keys(source_stats)}"
+                )
+            objective_values.append(float(value))
+        objectives, total_penalty = self.base.calc_fitness(
+            flat_stats,
+            limit_metrics=flat_stats,
+            scenario_limit_metrics=scenario_stats_by_label,
+            objective_values=objective_values,
+        )
+        return {
+            "objectives": tuple(objectives),
+            "constraint_violation": float(total_penalty),
+            "suite_metrics": suite_payload,
+            "reduce_metrics_ms": reduce_metrics_ms,
+            "fitness_payload_ms": (time.perf_counter() - fitness_started) * 1000.0,
+        }
 
     def evaluate(self, individual, overrides_list):
         profile_enabled = _optimize_profile_enabled()
@@ -1981,7 +2196,7 @@ class SuiteEvaluator:
 
         for ctx in self.contexts:
             phase_start = _profile_start(profile_enabled)
-            scenario_config = self._build_scenario_candidate_config(config, ctx)
+            scenario_config = self.build_scenario_candidate_config(config, ctx)
             skip_btc_analysis = _optimizer_can_skip_btc_analysis(
                 scenario_config,
                 self.base.scoring_specs,
@@ -2009,16 +2224,9 @@ class SuiteEvaluator:
 
             analyses = {}
             for exchange in ctx.exchanges:
-                # Get data arrays - either from lazy slicing or cached SharedMemory
-                if self._uses_lazy_slicing(ctx, exchange):
-                    # Get time-sliced VIEW (O(1) memory) + coin indices
-                    # Coin subsetting is passed to Rust as active indices.
-                    hlcvs_data, btc_data, coin_indices = self._get_lazy_slice_data(ctx, exchange)
-                else:
-                    self._ensure_context_attachment(ctx, exchange)
-                    hlcvs_data = ctx.shared_hlcvs_np[exchange]
-                    btc_data = ctx.shared_btc_np.get(exchange)
-                    coin_indices = ctx.coin_indices.get(exchange)
+                hlcvs_data, btc_data, coin_indices = self.get_prepared_context_data(
+                    ctx, exchange
+                )
 
                 phase_start = _profile_start(profile_enabled)
                 payload = build_backtest_payload(
@@ -2142,67 +2350,14 @@ class SuiteEvaluator:
                 )
             )
 
-        phase_start = _profile_start(profile_enabled)
-        reduced_summary = reduce_metrics(scenario_results, self.reducer_cfg)
-        _profile_add(timings, "reduce_metrics_ms", phase_start)
-        phase_start = _profile_start(profile_enabled)
-        suite_payload = build_suite_metrics_payload(scenario_results, reduced_summary)
-        reduced_stats = reduced_summary.get("stats", {})
-
-        reduced_stats_flat = flatten_metric_stats(reduced_stats)
-        flat_stats = dict(reduced_stats_flat)
-        # Override _mean with correctly aggregated values so calc_fitness
-        # and limit defaults respect the reducer config (e.g. "max" instead of "mean").
-        aggregated_values = reduced_summary.get("aggregated", {})
-        for metric, agg_value in aggregated_values.items():
-            flat_stats[f"{metric}_mean"] = agg_value
-        required_scenario_labels = {
-            basis.scenario for basis in self.objective_bases if basis.scenario is not None
-        }
-        required_scenario_labels.update(
-            check["scenario"]
-            for check in self.base.limit_checks
-            if check.get("scenario") is not None
-        )
-        scenario_stats_by_label = {
-            result.scenario.label: flatten_metric_stats(result.metrics.get("stats", {}))
-            for result in scenario_results
-            if result.scenario.label in required_scenario_labels
-        }
-        objective_values: List[float] = []
-        for spec, basis in zip(self.base.scoring_specs, self.objective_bases):
-            if basis.scenario is not None:
-                source_stats = scenario_stats_by_label[basis.scenario]
-                reducer = "mean"
-            else:
-                source_stats = reduced_stats_flat
-                reducer = basis.reducer or "mean"
-            value = resolve_metric_value(source_stats, f"{spec.metric}_{reducer}")
-            if value is None and spec.metric.endswith(("_usd", "_btc")):
-                value = resolve_metric_value(
-                    source_stats,
-                    f"{spec.metric.rsplit('_', 1)[0]}_{reducer}",
-                )
-            if value is None:
-                basis_label = (
-                    f"scenario {basis.scenario!r}"
-                    if basis.scenario is not None
-                    else f"reducer {reducer!r}"
-                )
-                raise ValueError(
-                    "missing optimizer scoring metric "
-                    f"{spec.metric!r} for {basis_label}; "
-                    f"available metrics: {_format_available_metric_keys(source_stats)}"
-                )
-            objective_values.append(float(value))
-        objectives, total_penalty = self.base.calc_fitness(
-            flat_stats,
-            limit_metrics=flat_stats,
-            scenario_limit_metrics=scenario_stats_by_label,
-            objective_values=objective_values,
-        )
+        suite_fitness = self.score_scenario_results(scenario_results)
+        objectives = suite_fitness["objectives"]
+        total_penalty = suite_fitness["constraint_violation"]
+        suite_payload = suite_fitness["suite_metrics"]
+        if timings is not None:
+            timings["reduce_metrics_ms"] = suite_fitness["reduce_metrics_ms"]
+            timings["fitness_payload_ms"] = suite_fitness["fitness_payload_ms"]
         objectives_map = {f"w_{i}": val for i, val in enumerate(objectives)}
-        _profile_add(timings, "fitness_payload_ms", phase_start)
 
         metrics_payload = {
             "objectives": objectives_map,
@@ -2246,6 +2401,26 @@ class SuiteEvaluator:
         if self.base.use_duplicate_guard:
             self.base.seen_hashes[actual_hash] = (tuple(objectives), total_penalty)
         return build_evaluation_payload(objectives, total_penalty, metrics_payload, individual)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["contexts"] = [
+            replace(
+                ctx,
+                shared_hlcvs_np={},
+                shared_btc_np={},
+                attachments={"hlcvs": {}, "btc": {}},
+            )
+            for ctx in self.contexts
+        ]
+        state["_master_attachments"] = {"hlcvs": {}, "btc": {}}
+        state["_master_arrays"] = {"hlcvs": {}, "btc": {}}
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._master_attachments = {"hlcvs": {}, "btc": {}}
+        self._master_arrays = {"hlcvs": {}, "btc": {}}
 
     def __del__(self):
         self.close()
@@ -2897,6 +3072,91 @@ def _active_suite_scenario_labels(suite_cfg: Mapping[str, Any]) -> list[str] | N
     return [scenario.label for scenario in scenarios]
 
 
+def _materialize_gpu_suite_run_contract(
+    config: Dict[str, Any], suite_cfg: Mapping[str, Any]
+) -> None:
+    """Persist the effective external/filterable suite in the GPU run config."""
+
+    if config.get("optimize", {}).get("backend") != "gpu" or not suite_cfg.get(
+        "enabled"
+    ):
+        return
+    backtest = config.setdefault("backtest", {})
+    backtest["suite_enabled"] = True
+    for key in ("scenarios", "reducer", "exchanges", "volume_normalization"):
+        if key in suite_cfg:
+            backtest[key] = deepcopy(suite_cfg[key])
+
+
+def _run_gpu_preparation_preflight(
+    config: Dict[str, Any], suite_cfg: Mapping[str, Any]
+) -> None:
+    """Validate immutable Apple MPS requirements before loading historical data."""
+
+    if str(config.get("optimize", {}).get("backend", "")).strip().lower() != "gpu":
+        return
+    from optimization.backends.gpu_backend import (
+        materialize_gpu_preparation_config,
+        validate_gpu_preparation_scope,
+    )
+
+    effective_config = materialize_gpu_preparation_config(config)
+    normalized_suite_cfg = dict(suite_cfg)
+    if bool(normalized_suite_cfg.get("enabled")):
+        scenarios, _reducer_cfg = build_scenarios(
+            normalized_suite_cfg,
+            base_exchanges=effective_config.get("backtest", {}).get("exchanges"),
+        )
+        normalized_suite_cfg["scenarios"] = [
+            {
+                "label": scenario.label,
+                "overrides": dict(scenario.overrides or {}),
+            }
+            for scenario in scenarios
+        ]
+    validate_gpu_preparation_scope(effective_config, normalized_suite_cfg)
+
+
+def _materialize_resolved_gpu_suite_dates(
+    config: Dict[str, Any], scenario_contexts: Sequence[ScenarioEvalContext]
+) -> None:
+    """Replace dynamic suite date tokens with the prepared concrete dates."""
+
+    if config.get("optimize", {}).get("backend") != "gpu" or not config.get(
+        "backtest", {}
+    ).get("suite_enabled"):
+        return
+    scenarios = config["backtest"].get("scenarios") or []
+    if len(scenarios) != len(scenario_contexts):
+        raise RuntimeError(
+            "GPU suite run contract does not match prepared scenario count: "
+            f"{len(scenarios)} != {len(scenario_contexts)}"
+        )
+    resolved_scenarios = []
+    for scenario, ctx in zip(scenarios, scenario_contexts):
+        resolved = deepcopy(scenario)
+        resolved["label"] = ctx.label
+        for key in ("start_date", "end_date"):
+            meta_key = f"requested_{key}"
+            prepared_values = {
+                str(mss.get("__meta__", {}).get(meta_key))
+                for mss in ctx.msss.values()
+                if mss.get("__meta__", {}).get(meta_key) is not None
+            }
+            if not prepared_values:
+                raise RuntimeError(
+                    f"GPU suite scenario {ctx.label!r} has no prepared {meta_key}"
+                )
+            if len(prepared_values) != 1:
+                raise RuntimeError(
+                    f"GPU suite scenario {ctx.label!r} has inconsistent prepared "
+                    f"{meta_key} values: {sorted(prepared_values)}"
+                )
+            resolved[key] = prepared_values.pop()
+        resolved_scenarios.append(resolved)
+    config["backtest"]["scenarios"] = resolved_scenarios
+
+
 def _validate_optimizer_limit_suite_mode(
     config: Mapping[str, Any],
     *,
@@ -2981,13 +3241,29 @@ def configs_to_individuals_streaming(
         raw_count += 1
         try:
             fcfg = _build_starting_seed_config(cfg)
+            resolved_anchor_id = None
+            if anchored_shape:
+                has_persisted_anchor = isinstance(cfg, dict) and any(
+                    key in cfg for key in ("_optimizer_anchor", "optimizer_anchor")
+                )
+                resolved_anchor_id = (
+                    _optimizer_anchor_id(cfg) if has_persisted_anchor else anchor_idx
+                )
+                if resolved_anchor_id is None:
+                    raise ValueError("invalid persisted optimizer anchor id")
+                anchor_high = int(bounds[0].high)
+                if not 0 <= resolved_anchor_id <= anchor_high:
+                    raise ValueError(
+                        "persisted optimizer anchor id is outside the optimization "
+                        f"shape: id={resolved_anchor_id}, allowed=0..{anchor_high}"
+                    )
             individual = config_to_individual(
                 fcfg,
                 bounds,
                 sig_digits,
                 key_paths=key_paths,
                 optimization_shape=optimization_shape,
-                anchor_id=anchor_idx if anchored_shape else None,
+                anchor_id=resolved_anchor_id,
                 clamp_context="starting config",
                 source=cfg.get("_starting_config_source", "<memory>")
                 if isinstance(cfg, dict)
@@ -3177,12 +3453,26 @@ async def main():
         )
         suite_cfg["enabled"] = bool(args.suite)
 
+    _materialize_gpu_suite_run_contract(config, suite_cfg)
     active_suite_scenario_labels = _active_suite_scenario_labels(suite_cfg)
     _validate_optimizer_limit_suite_mode(
         config,
         suite_enabled=bool(suite_cfg.get("enabled")),
         scenario_labels=active_suite_scenario_labels,
     )
+
+    resume_results_dir = None
+    resume_checkpoint_path = None
+    restored_resume_anchor_plan = False
+    if args.resume:
+        resume_results_dir = _resolve_resume_results_dir(args.resume)
+        resume_checkpoint_path = _require_resume_checkpoint(resume_results_dir)
+        if get_anchor_plan(config) is None:
+            restored_resume_anchor_plan = _restore_gpu_resume_anchor_plan(
+                config, resume_checkpoint_path
+            )
+        else:
+            restored_resume_anchor_plan = True
 
     preselected_starting_configs = None
     if args.filter_starting_configs or args.starting_configs_max is not None:
@@ -3208,26 +3498,36 @@ async def main():
     }
     if polish_bounds_pct is not None:
         apply_polish_bounds(config, polish_bounds_pct, bounds_mode=polish_bounds_mode)
-    if fine_tune_params and args.starting_configs:
+    installing_anchor_plan = bool(fine_tune_params and args.starting_configs)
+    if installing_anchor_plan:
         install_anchored_fine_tune_plan(
             config,
             fine_tune_params,
             args.starting_configs,
             starting_configs_override=preselected_starting_configs,
         )
-    else:
+    elif _should_apply_fine_tune_bounds(
+        restored_resume_anchor_plan=restored_resume_anchor_plan,
+        installing_anchor_plan=installing_anchor_plan,
+    ):
         apply_fine_tune_bounds(config, fine_tune_params, cli_bounds_overrides)
+    validate_optimizer_effective_configs(config)
     backtest_exchanges = require_config_value(config, "backtest.exchanges")
     await format_approved_ignored_coins(
         config, backtest_exchanges, prefer_backtest_coin_source_keys=True
     )
     data_config = build_optimizer_data_config(config)
+    allow_internal_nan_gaps = (
+        str(config.get("optimize", {}).get("backend", "")).strip().lower()
+        == "gpu"
+    )
     interrupted = False
     failed = False
     pool = None
     manager = None
     pool_terminated = False
     try:
+        _run_gpu_preparation_preflight(config, suite_cfg)
         array_manager = SharedArrayManager()
         hlcvs_specs = {}
         btc_usd_specs = {}
@@ -3243,9 +3543,11 @@ async def main():
                 data_config,
                 suite_cfg,
                 shared_array_manager=array_manager,
+                allow_internal_nan_gaps=allow_internal_nan_gaps,
             )
             if not scenario_contexts:
                 raise ValueError("Suite configuration produced no scenarios.")
+            _materialize_resolved_gpu_suite_dates(config, scenario_contexts)
             logging.info("Optimizer suite enabled with %d scenario(s)", len(scenario_contexts))
             first_ctx = scenario_contexts[0]
             hlcvs_specs = first_ctx.hlcvs_specs
@@ -3315,13 +3617,18 @@ async def main():
                 exchange = "combined"
                 coins, mss = _register_exchange_data(
                     exchange,
-                    await prepare_hlcvs_mss(data_config, exchange),
+                    await prepare_hlcvs_mss(
+                        data_config,
+                        exchange,
+                        allow_internal_nan_gaps=allow_internal_nan_gaps,
+                    ),
                     config,
                     msss=msss,
                     hlcvs_specs=hlcvs_specs,
                     btc_usd_specs=btc_usd_specs,
                     timestamps_dict=timestamps_dict,
                     array_manager=array_manager,
+                    preserve_internal_nan_gaps=allow_internal_nan_gaps,
                 )
                 exchange_preference = defaultdict(list)
                 for coin in coins:
@@ -3330,7 +3637,13 @@ async def main():
                     logging.info(f"chose {ex} for {','.join(exchange_preference[ex])}")
             else:
                 tasks = {
-                    exchange: asyncio.create_task(prepare_hlcvs_mss(data_config, exchange))
+                    exchange: asyncio.create_task(
+                        prepare_hlcvs_mss(
+                            data_config,
+                            exchange,
+                            allow_internal_nan_gaps=allow_internal_nan_gaps,
+                        )
+                    )
                     for exchange in backtest_exchanges
                 }
                 for exchange, task in tasks.items():
@@ -3343,6 +3656,7 @@ async def main():
                         btc_usd_specs=btc_usd_specs,
                         timestamps_dict=timestamps_dict,
                         array_manager=array_manager,
+                        preserve_internal_nan_gaps=allow_internal_nan_gaps,
                     )
         exchanges = backtest_exchanges
         exchanges_fname = "combined" if len(backtest_exchanges) > 1 else "_".join(exchanges)
@@ -3364,13 +3678,19 @@ async def main():
             )
         )
         previous_evals = 0
+        resume_recorder_state = {}
         checkpoint_path = None
         if args.resume:
             if not config["optimize"].get("write_all_results", True):
                 raise ValueError("Cannot resume with optimize.write_all_results=false")
-            results_dir = _resolve_resume_results_dir(args.resume)
-            checkpoint_path = _require_resume_checkpoint(results_dir)
-            previous_evals = _validate_resume_results(results_dir, config)
+            results_dir = resume_results_dir
+            checkpoint_path = resume_checkpoint_path
+            previous_evals = _validate_resume_results(
+                results_dir,
+                config,
+                checkpoint_path=checkpoint_path,
+                resume_state=resume_recorder_state,
+            )
         else:
             results_dir = make_get_filepath(
                 f"optimize_results/{date_fname}_{exchanges_fname}_{n_days}days_{coins_fname}_{hash_snippet}/"
@@ -3424,6 +3744,7 @@ async def main():
             pareto_max_size=pareto_max,
             bounds=evaluator.bounds,
             starting_iters=previous_evals,
+            previous_data=resume_recorder_state.get("previous_data"),
         )
         backend_name = config["optimize"]["backend"]
         logging.info("Selected optimizer backend: %s", backend_name)
@@ -3433,7 +3754,7 @@ async def main():
             starting_config_iter = lambda _path: iter(preselected_starting_configs)
         if get_anchor_plan(config) is not None:
             starting_config_iter = lambda _path: iter_anchored_fine_tune_seed_configs(config)
-        backend_result = backend_runner(
+        backend_kwargs = dict(
             config=config,
             evaluator=evaluator,
             evaluator_for_pool=evaluator_for_pool,
@@ -3455,12 +3776,23 @@ async def main():
             build_config_fn=individual_to_config,
             overrides_fn=optimizer_overrides,
         )
+        if backend_name == "gpu":
+            interrupt_latch = OptimizerInterruptLatch()
+            backend_kwargs["interrupt_check"] = interrupt_latch.raise_if_requested
+            with interrupt_latch:
+                backend_result = backend_runner(**backend_kwargs)
+        else:
+            backend_result = backend_runner(**backend_kwargs)
         pool = backend_result.get("pool")
         pool_terminated = backend_result.get("pool_terminated", False)
 
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as exc:
         interrupted = True
         logging.info("SIGINT received; starting graceful shutdown")
+        pool = getattr(exc, "pool", pool)
+        pool_terminated = bool(
+            getattr(exc, "pool_terminated", pool_terminated)
+        )
         pool_terminated = _terminate_optimizer_pool(pool, pool_terminated)
     except Exception as e:
         failed = True

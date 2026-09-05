@@ -700,6 +700,7 @@ pub struct Backtest<'a> {
     hard_stop_plot_events_pside: [Vec<HardStopPlotEvent>; 2],
     strategy_equity_series: Vec<f64>,
     strategy_equity_series_pside: [Vec<f64>; 2],
+    strategy_equity_timestamps_ms_pside: [Vec<u64>; 2],
     peak_strategy_equity_series: Vec<f64>,
     peak_strategy_equity_series_pside: [Vec<f64>; 2],
     hard_stop_no_restart_peak_strategy_equity: f64,
@@ -1288,13 +1289,15 @@ impl<'a> Backtest<'a> {
         writer.write_record(&record);
     }
 
-    fn forced_normal_mode(&self, idx: usize, pside: usize) -> Option<orchestrator::TradingMode> {
+    fn configured_mode(&self, idx: usize, pside: usize) -> Option<orchestrator::TradingMode> {
         let side = match pside {
             LONG => &self.bot_params[idx].long,
             SHORT => &self.bot_params[idx].short,
             _ => return None,
         };
-        if side.is_forced_active {
+        if !side.entry_eligible {
+            Some(orchestrator::TradingMode::GracefulStop)
+        } else if side.is_forced_active {
             Some(orchestrator::TradingMode::Normal)
         } else {
             None
@@ -1375,15 +1378,15 @@ impl<'a> Backtest<'a> {
                 } else {
                     None
                 };
-                let valid_now = self.coin_is_valid_at(idx, k);
+                let within_valid_range_now = self.coin_is_within_valid_range_at(idx, k);
 
                 let pos_long = self.positions.long[idx];
                 let pos_short = self.positions.short[idx];
 
                 let mut mode_long: Option<orchestrator::TradingMode> =
-                    self.forced_normal_mode(idx, LONG);
+                    self.configured_mode(idx, LONG);
                 let mut mode_short: Option<orchestrator::TradingMode> =
-                    self.forced_normal_mode(idx, SHORT);
+                    self.configured_mode(idx, SHORT);
 
                 if let Some(delist_timestamp) = self.last_valid_timestamps[idx] {
                     if k >= delist_timestamp {
@@ -1395,10 +1398,10 @@ impl<'a> Backtest<'a> {
                         }
                     }
                 } else {
-                    if !valid_now && pos_long.size != 0.0 {
+                    if !within_valid_range_now && pos_long.size != 0.0 {
                         mode_long = Some(orchestrator::TradingMode::Panic);
                     }
-                    if !valid_now && pos_short.size != 0.0 {
+                    if !within_valid_range_now && pos_short.size != 0.0 {
                         mode_short = Some(orchestrator::TradingMode::Panic);
                     }
                 }
@@ -1679,11 +1682,10 @@ impl<'a> Backtest<'a> {
 
             sym.long.rylos_signal = self.rylos_signal_at(k, idx);
 
-            let valid_now = self.coin_is_valid_at(idx, k);
-            let mut mode_long: Option<orchestrator::TradingMode> =
-                self.forced_normal_mode(idx, LONG);
+            let within_valid_range_now = self.coin_is_within_valid_range_at(idx, k);
+            let mut mode_long: Option<orchestrator::TradingMode> = self.configured_mode(idx, LONG);
             let mut mode_short: Option<orchestrator::TradingMode> =
-                self.forced_normal_mode(idx, SHORT);
+                self.configured_mode(idx, SHORT);
 
             if let Some(delist_timestamp) = self.last_valid_timestamps[idx] {
                 if k >= delist_timestamp {
@@ -1695,10 +1697,10 @@ impl<'a> Backtest<'a> {
                     }
                 }
             } else {
-                if !valid_now && pos_long.size != 0.0 {
+                if !within_valid_range_now && pos_long.size != 0.0 {
                     mode_long = Some(orchestrator::TradingMode::Panic);
                 }
-                if !valid_now && pos_short.size != 0.0 {
+                if !within_valid_range_now && pos_short.size != 0.0 {
                     mode_short = Some(orchestrator::TradingMode::Panic);
                 }
             }
@@ -2192,11 +2194,11 @@ impl<'a> Backtest<'a> {
             trading_enabled: TradingEnabled {
                 long: bot_params
                     .iter()
-                    .any(|bp| bp.long.wallet_exposure_limit != 0.0)
+                    .any(|bp| bp.long.entry_eligible && bp.long.wallet_exposure_limit != 0.0)
                     && bot_params_master.long.n_positions > 0,
                 short: bot_params
                     .iter()
-                    .any(|bp| bp.short.wallet_exposure_limit != 0.0)
+                    .any(|bp| bp.short.entry_eligible && bp.short.wallet_exposure_limit != 0.0)
                     && bot_params_master.short.n_positions > 0,
             },
             trailing_enabled,
@@ -2287,6 +2289,7 @@ impl<'a> Backtest<'a> {
             hard_stop_plot_events_pside: [Vec::new(), Vec::new()],
             strategy_equity_series: Vec::new(),
             strategy_equity_series_pside: [Vec::new(), Vec::new()],
+            strategy_equity_timestamps_ms_pside: [Vec::new(), Vec::new()],
             peak_strategy_equity_series: Vec::new(),
             peak_strategy_equity_series_pside: [Vec::new(), Vec::new()],
             hard_stop_no_restart_peak_strategy_equity: 0.0,
@@ -2458,12 +2461,18 @@ impl<'a> Backtest<'a> {
         let eligible_long: Vec<usize> = eligible
             .iter()
             .copied()
-            .filter(|&idx| self.bot_params_original[idx].long.wallet_exposure_limit != 0.0)
+            .filter(|&idx| {
+                self.bot_params_original[idx].long.entry_eligible
+                    && self.bot_params_original[idx].long.wallet_exposure_limit != 0.0
+            })
             .collect();
         let eligible_short: Vec<usize> = eligible
             .iter()
             .copied()
-            .filter(|&idx| self.bot_params_original[idx].short.wallet_exposure_limit != 0.0)
+            .filter(|&idx| {
+                self.bot_params_original[idx].short.entry_eligible
+                    && self.bot_params_original[idx].short.wallet_exposure_limit != 0.0
+            })
             .collect();
 
         let tradable_long_now = eligible_long.len();
@@ -2611,10 +2620,21 @@ impl<'a> Backtest<'a> {
     }
 
     #[inline(always)]
-    fn coin_is_valid_at(&self, idx: usize, k: usize) -> bool {
+    fn coin_is_within_valid_range_at(&self, idx: usize, k: usize) -> bool {
         self.coin_valid_range(idx)
             .map(|(start, end)| k >= start && k <= end)
             .unwrap_or(false)
+    }
+
+    #[inline(always)]
+    fn coin_is_valid_at(&self, idx: usize, k: usize) -> bool {
+        if !self.coin_is_within_valid_range_at(idx, k) {
+            return false;
+        }
+        let high = self.hlcvs_value(k, idx, HIGH);
+        let low = self.hlcvs_value(k, idx, LOW);
+        let close = self.hlcvs_value(k, idx, CLOSE);
+        !(high.is_nan() && low.is_nan() && close.is_nan())
     }
 
     #[inline(always)]
@@ -2674,6 +2694,15 @@ impl<'a> Backtest<'a> {
     }
 
     #[inline(always)]
+    fn hard_stop_scope_has_open_position(&self, pside: usize) -> bool {
+        if self.hard_stop_signal_mode() == "unified" {
+            self.has_open_position_pside(LONG) || self.has_open_position_pside(SHORT)
+        } else {
+            self.has_open_position_pside(pside)
+        }
+    }
+
+    #[inline(always)]
     fn has_open_position_coin_pside(&self, idx: usize, pside: usize) -> bool {
         match pside {
             LONG => self.positions.long[idx].size != 0.0,
@@ -2696,6 +2725,15 @@ impl<'a> Backtest<'a> {
                 .iter()
                 .any(Self::bundle_has_blocking_open_orders),
             _ => unreachable!("invalid pside"),
+        }
+    }
+
+    #[inline(always)]
+    fn hard_stop_scope_has_blocking_open_orders(&self, pside: usize) -> bool {
+        if self.hard_stop_signal_mode() == "unified" {
+            self.has_blocking_open_orders_pside(LONG) || self.has_blocking_open_orders_pside(SHORT)
+        } else {
+            self.has_blocking_open_orders_pside(pside)
         }
     }
 
@@ -3502,6 +3540,7 @@ impl<'a> Backtest<'a> {
         let strategy_equity = baseline_balance + strategy_pnl;
         let peak_strategy_equity = (baseline_balance + peak_strategy_pnl).max(strategy_equity);
         self.strategy_equity_series_pside[pside].push(strategy_equity);
+        self.strategy_equity_timestamps_ms_pside[pside].push(timestamp_ms);
         self.peak_strategy_equity_series_pside[pside].push(peak_strategy_equity);
         Ok(())
     }
@@ -3620,14 +3659,15 @@ impl<'a> Backtest<'a> {
                 k, timestamp_ms, strategy_equity, peak_strategy_equity, pside, e
             )
         })?;
-        let has_open_position = self.has_open_position_pside(pside);
-        let has_blocking_open_orders = self.has_blocking_open_orders_pside(pside);
+        let has_open_position = self.hard_stop_scope_has_open_position(pside);
+        let has_blocking_open_orders = self.hard_stop_scope_has_blocking_open_orders(pside);
         let drawdown_ema = self.hard_stop_pside[pside]
             .state
             .as_ref()
             .map(|state| state.drawdown_ema)
             .unwrap_or(step.drawdown_raw);
         self.strategy_equity_series_pside[pside].push(strategy_equity);
+        self.strategy_equity_timestamps_ms_pside[pside].push(timestamp_ms);
         self.peak_strategy_equity_series_pside[pside].push(peak_strategy_equity);
         self.hard_stop_drawdown_timestamps_ms_pside[pside].push(timestamp_ms);
         self.hard_stop_drawdown_samples_pside[pside].push(step.drawdown_raw);
@@ -5576,6 +5616,7 @@ impl<'a> Backtest<'a> {
         &self,
         strategy_equity_series: &[f64],
         drawdown_ema_samples: Option<&[f64]>,
+        strategy_equity_timestamps_ms: Option<&[u64]>,
     ) -> StrategyEquityMetrics {
         let sample_count = strategy_equity_series
             .len()
@@ -5586,6 +5627,16 @@ impl<'a> Backtest<'a> {
         let timestamps_offset = self.equities.timestamps_ms.len() - sample_count;
         let series = &strategy_equity_series[strategy_equity_series.len() - sample_count..];
         let timestamps = &self.equities.timestamps_ms[timestamps_offset..];
+        let daily_metric_timestamps = strategy_equity_timestamps_ms
+            .map(|values| {
+                assert_eq!(
+                    values.len(),
+                    strategy_equity_series.len(),
+                    "per-side strategy-equity timestamps must align with samples"
+                );
+                &values[values.len() - sample_count..]
+            })
+            .unwrap_or(timestamps);
         let drawdowns = calc_strategy_equity_drawdowns(series);
         let drawdown_emas = drawdown_ema_samples.map(|samples| {
             let ema_sample_count = sample_count.min(samples.len());
@@ -5594,6 +5645,7 @@ impl<'a> Backtest<'a> {
 
         let compute_metrics = |series: &[f64],
                                timestamps_ms: &[u64],
+                               daily_metric_timestamps_ms: &[u64],
                                drawdowns: &[f64],
                                drawdown_emas: Option<&[f64]>| {
             let equity_metrics = analyze_equity_series(series, timestamps_ms);
@@ -5601,7 +5653,7 @@ impl<'a> Backtest<'a> {
                 .iter()
                 .fold(0.0_f64, |max_dd, &x| max_dd.max(x.abs()));
             let daily_worst_drawdowns =
-                daily_worst_positive_drawdowns(drawdowns, timestamps_ms, series.len());
+                daily_worst_positive_drawdowns(drawdowns, daily_metric_timestamps_ms, series.len());
             let drawdown_worst_mean_1pct = mean_worst_1pct_abs(&daily_worst_drawdowns);
             let strategy_eq_underwater_pct_mean = mean_abs(&daily_worst_drawdowns);
             let strategy_eq_underwater_pct_median = median_abs(&daily_worst_drawdowns);
@@ -5635,7 +5687,13 @@ impl<'a> Backtest<'a> {
             }
         };
 
-        let full = compute_metrics(series, timestamps, &drawdowns, drawdown_emas);
+        let full = compute_metrics(
+            series,
+            timestamps,
+            daily_metric_timestamps,
+            &drawdowns,
+            drawdown_emas,
+        );
         let recovery = calc_strategy_eq_recovery_days(series, timestamps);
         let peak_recovery_days_strategy_eq = recovery.max;
         let peak_recovery_hours_strategy_eq = peak_recovery_days_strategy_eq * 24.0;
@@ -5661,11 +5719,13 @@ impl<'a> Backtest<'a> {
                 break;
             }
             let subset_timestamps = &timestamps[start_idx..];
+            let subset_daily_metric_timestamps = &daily_metric_timestamps[start_idx..];
             let subset_drawdowns = &drawdowns[start_idx..];
             let subset_drawdown_emas = drawdown_emas.map(|values| &values[start_idx..]);
             let mut subset_metric = compute_metrics(
                 subset_series,
                 subset_timestamps,
+                subset_daily_metric_timestamps,
                 subset_drawdowns,
                 subset_drawdown_emas,
             );
@@ -5728,7 +5788,7 @@ impl<'a> Backtest<'a> {
     }
 
     fn strategy_equity_metrics(&self) -> StrategyEquityMetrics {
-        self.strategy_equity_metrics_from_series(&self.strategy_equity_series, None)
+        self.strategy_equity_metrics_from_series(&self.strategy_equity_series, None, None)
     }
 
     pub fn strategy_equity_metrics_for_analysis(&self) -> StrategyEquityMetricsBundle {
@@ -5745,6 +5805,7 @@ impl<'a> Backtest<'a> {
                 self.strategy_equity_metrics_from_series(
                     &self.strategy_equity_series_pside[LONG],
                     Some(&self.hard_stop_drawdown_ema_samples_pside[LONG]),
+                    Some(&self.strategy_equity_timestamps_ms_pside[LONG]),
                 )
             } else {
                 StrategyEquityMetrics::default()
@@ -5753,6 +5814,7 @@ impl<'a> Backtest<'a> {
                 self.strategy_equity_metrics_from_series(
                     &self.strategy_equity_series_pside[SHORT],
                     Some(&self.hard_stop_drawdown_ema_samples_pside[SHORT]),
+                    Some(&self.strategy_equity_timestamps_ms_pside[SHORT]),
                 )
             } else {
                 StrategyEquityMetrics::default()
@@ -6380,6 +6442,77 @@ mod tests {
             Some(orchestrator::TradingMode::Normal)
         );
         assert_eq!(input.symbols[0].short.mode, None);
+    }
+
+    #[test]
+    fn all_nan_hlc_gap_is_not_valid_or_tradeable() {
+        let mut values = vec![1.0; 3 * 4];
+        values[4] = f64::NAN;
+        values[5] = f64::NAN;
+        values[6] = f64::NAN;
+        values[7] = f64::NAN;
+        let hlcvs = Array3::from_shape_vec((3, 1, 4), values).unwrap();
+        let btc_usd_prices = Array1::from_vec(vec![20_000.0; 3]);
+        let mut bp_pair = BotParamsPair::default();
+        bp_pair.long.n_positions = 1;
+        bp_pair.long.total_wallet_exposure_limit = 1.0;
+        bp_pair.long.wallet_exposure_limit = 1.0;
+        bp_pair.long.ema_span_0 = 10.0;
+        bp_pair.long.ema_span_1 = 20.0;
+        let backtest_params = BacktestParams {
+            starting_balance: 1000.0,
+            maker_fee: 0.0,
+            taker_fee: 0.00055,
+            coins: vec!["TEST".to_string()],
+            active_coin_indices: None,
+            first_timestamp_ms: 0,
+            requested_start_timestamp_ms: 0,
+            first_valid_indices: vec![0],
+            last_valid_indices: vec![2],
+            warmup_minutes: vec![0],
+            trade_start_indices: vec![0],
+            global_warmup_bars: 0,
+            btc_collateral_cap: 0.0,
+            btc_collateral_ltv_cap: None,
+            metrics_only: true,
+            skip_btc_analysis: false,
+            filter_by_min_effective_cost: false,
+            dynamic_wel_by_tradability: true,
+            hedge_mode: true,
+            forager_score_hysteresis_pct: 0.0,
+            max_realized_loss_pct: 1.0,
+            pnls_max_lookback_days: 30.0,
+            liquidation_threshold: 0.05,
+            equity_hard_stop_loss: EquityHardStopLossConfig::default(),
+            market_orders_allowed: false,
+            market_order_near_touch_threshold: 0.001,
+            market_order_slippage_pct: 0.0005,
+            candle_interval_minutes: 1,
+        };
+        let mut bt = Backtest::new(
+            hlcvs.view(),
+            btc_usd_prices.view(),
+            vec![bp_pair],
+            vec![ExchangeParams::default()],
+            &backtest_params,
+        );
+
+        assert!(bt.coin_is_valid_at(0, 0));
+        assert!(!bt.coin_is_valid_at(0, 1));
+        assert!(!bt.coin_is_tradeable_at(0, 1));
+        assert!(bt.coin_is_valid_at(0, 2));
+
+        bt.positions.long[0] = Position {
+            size: 1.0,
+            price: 1.0,
+        };
+        let input = bt.build_orchestrator_input_iter(1, None, None, 0..1);
+        assert!(!input.symbols[0].tradable);
+        assert_ne!(
+            input.symbols[0].long.mode,
+            Some(orchestrator::TradingMode::Panic),
+            "an internal data gap must not be mistaken for a delist"
+        );
     }
 
     #[test]
@@ -8564,6 +8697,10 @@ mod tests {
         bt.update_hard_stop_state(1).unwrap();
 
         assert_eq!(bt.strategy_equity_series_pside[LONG].len(), 2);
+        assert_eq!(
+            bt.strategy_equity_timestamps_ms_pside[LONG],
+            vec![0, 60_000]
+        );
         assert_eq!(bt.peak_strategy_equity_series_pside[LONG].len(), 2);
         assert_eq!(
             bt.hard_stop_drawdown_timestamps_ms_pside[LONG],
@@ -8862,7 +8999,7 @@ mod tests {
     }
 
     #[test]
-    fn hard_stop_flat_confirmation_ignores_open_panic_close_orders() {
+    fn hard_stop_flat_confirmation_ignores_panic_orders_but_requires_unified_scope_flat() {
         let hlcvs = Array3::from_shape_vec((2, 1, 4), vec![1.0; 2 * 1 * 4]).unwrap();
         let btc_usd_prices = Array1::from_vec(vec![20_000.0, 20_000.0]);
 
@@ -8947,6 +9084,21 @@ mod tests {
 
         assert_eq!(bt.hard_stop_flat_confirmations, 1);
         assert!(bt.hard_stop_pending_stop.is_some());
+
+        // Unified scope is the whole account. A position on the opposite side
+        // invalidates the pending flat confirmation even though this side has
+        // no position and its panic-only close order is non-blocking.
+        bt.positions.short[0] = Position {
+            size: -1.0,
+            price: 100.0,
+        };
+        bt.equities.timestamps_ms.push(120_000);
+        bt.equities.usd_total_equity.push(90.0);
+        bt.update_hard_stop_state(1).unwrap();
+
+        assert_eq!(bt.hard_stop_flat_confirmations, 0);
+        assert!(bt.hard_stop_pending_stop.is_none());
+        assert!(!bt.hard_stop_halted);
     }
 
     #[test]
@@ -9352,7 +9504,7 @@ mod tests {
     }
 
     #[test]
-    fn hard_stop_ema_metrics_use_runtime_side_series_and_shared_max() {
+    fn hard_stop_side_metrics_use_runtime_series_shared_max_and_sample_timestamps() {
         let hlcvs = Array3::from_shape_vec((4, 1, 4), vec![1.0; 4 * 1 * 4]).unwrap();
         let btc_usd_prices = Array1::from_vec(vec![20_000.0; 4]);
 
@@ -9419,10 +9571,12 @@ mod tests {
 
         bt.equities.timestamps_ms = vec![0, 60_000, 120_000, 180_000];
         bt.strategy_equity_series_pside[LONG] = vec![100.0, 90.0, 90.0, 90.0];
+        bt.strategy_equity_timestamps_ms_pside[LONG] = vec![0, 60_000, 120_000, 180_000];
         bt.peak_strategy_equity_series_pside[LONG] = vec![100.0, 100.0, 100.0, 100.0];
         bt.hard_stop_drawdown_samples_pside[LONG] = vec![0.0, 0.10, 0.10, 0.10];
         bt.hard_stop_drawdown_ema_samples_pside[LONG] = vec![0.0, 0.10, 0.10, 0.10];
         bt.strategy_equity_series_pside[SHORT] = vec![100.0, 90.0, 100.0, 90.0];
+        bt.strategy_equity_timestamps_ms_pside[SHORT] = vec![0, 60_000, 120_000, 180_000];
         bt.peak_strategy_equity_series_pside[SHORT] = vec![100.0, 100.0, 100.0, 100.0];
         bt.hard_stop_drawdown_samples_pside[SHORT] = vec![0.0, 0.10, 0.0, 0.10];
         bt.hard_stop_drawdown_ema_samples_pside[SHORT] = vec![0.0, 0.01, 0.005, 0.02];
@@ -9452,6 +9606,35 @@ mod tests {
                 .abs()
                 < 1e-12
         );
+
+        // Reproduce a halted-controller tail-alignment edge over 200 days.
+        // The raw stresses of 90% late on day 0 and 80% early on day 1 are
+        // separate daily worst samples with their true controller timestamps.
+        // Tail-aligning the shortened series to account timestamps merges both
+        // into one day and changes the worst-1% mean from 85% to 50%.
+        let day_ms = 86_400_000_u64;
+        let mut actual_timestamps = Vec::with_capacity(600);
+        let mut series = Vec::with_capacity(600);
+        for day in 0..200_u64 {
+            actual_timestamps.extend([day * day_ms, day * day_ms + 60_000, day * day_ms + 120_000]);
+            let peak = 100.0 + day as f64;
+            let first_drawdown = if day == 1 { 0.8 } else { 0.1 };
+            let second_drawdown = if day == 0 { 0.9 } else { 0.1 };
+            series.extend([
+                peak,
+                peak * (1.0 - first_drawdown),
+                peak * (1.0 - second_drawdown),
+            ]);
+        }
+        bt.equities.timestamps_ms = actual_timestamps.clone();
+        bt.equities.timestamps_ms.push(200 * day_ms);
+
+        let actual =
+            bt.strategy_equity_metrics_from_series(&series, None, Some(&actual_timestamps));
+        let legacy_tail_aligned = bt.strategy_equity_metrics_from_series(&series, None, None);
+
+        assert!((actual.drawdown_worst_mean_1pct_strategy_eq - 0.85).abs() < 1e-9);
+        assert!((legacy_tail_aligned.drawdown_worst_mean_1pct_strategy_eq - 0.50).abs() < 1e-9);
     }
 
     #[test]
@@ -10763,6 +10946,7 @@ mod tests {
         bp_pair.short.ema_span_1 = 20.0;
 
         let mut short_only = bp_pair.clone();
+        short_only.long.entry_eligible = false;
         short_only.long.n_positions = 0;
         short_only.long.total_wallet_exposure_limit = 0.0;
         short_only.long.wallet_exposure_limit = 0.0;
@@ -10825,6 +11009,12 @@ mod tests {
             bt.runtime_budget[3].long.effective_wallet_exposure_limit,
             0.0
         );
+        let input = bt.build_orchestrator_input_iter(0, None, None, 0..4);
+        assert_eq!(
+            input.symbols[3].long.mode,
+            Some(orchestrator::TradingMode::GracefulStop)
+        );
+        assert_eq!(input.symbols[3].short.mode, None);
     }
 
     #[test]

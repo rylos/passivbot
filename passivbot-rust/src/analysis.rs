@@ -86,6 +86,7 @@ pub struct FillActivityMetrics {
     pub fills_gap_median_hours: f64,
     pub fills_gap_p95_hours: f64,
     pub fills_gap_p99_hours: f64,
+    pub fills_gap_time_weighted_mean_hours: f64,
     pub fills_per_day: f64,
     pub fills_per_day_close: f64,
     pub fills_per_day_entry: f64,
@@ -311,6 +312,24 @@ pub fn calc_fill_activity_metrics(
             .map(|window| window[1].saturating_sub(window[0]) as f64 / MS_PER_HOUR as f64)
             .collect()
     };
+    let fills_gap_time_weighted_mean_hours = {
+        let mut unique_fill_ts = fill_ts.clone();
+        unique_fill_ts.dedup();
+        let mut boundaries = Vec::with_capacity(unique_fill_ts.len() + 2);
+        boundaries.push(start_ts);
+        boundaries.extend(unique_fill_ts);
+        boundaries.push(end_ts);
+        let unique_gap_hours: Vec<f64> = boundaries
+            .windows(2)
+            .map(|window| window[1].saturating_sub(window[0]) as f64 / MS_PER_HOUR as f64)
+            .collect();
+        let total_gap_hours = unique_gap_hours.iter().sum::<f64>();
+        if total_gap_hours > 0.0 {
+            unique_gap_hours.iter().map(|gap| gap * gap).sum::<f64>() / total_gap_hours
+        } else {
+            0.0
+        }
+    };
     let active_day_buckets = if fill_ts.is_empty() {
         0
     } else {
@@ -332,6 +351,7 @@ pub fn calc_fill_activity_metrics(
     metrics.fills_gap_median_hours = percentile(&gap_hours, 50.0);
     metrics.fills_gap_p95_hours = percentile(&gap_hours, 95.0);
     metrics.fills_gap_p99_hours = percentile(&gap_hours, 99.0);
+    metrics.fills_gap_time_weighted_mean_hours = fills_gap_time_weighted_mean_hours;
     metrics
 }
 
@@ -674,7 +694,12 @@ fn analyze_backtest_basic(
 
     for (i, &equity) in equities.iter().enumerate() {
         while let Some(fill) = fill_iter.peek() {
-            if fill.index <= i {
+            let fill_precedes_sample = if use_timestamps && fill.timestamp_ms > 0 {
+                fill.timestamp_ms <= timestamps_ms[i]
+            } else {
+                fill.index <= i
+            };
+            if fill_precedes_sample {
                 last_balance = fill.usd_total_balance;
                 fill_iter.next();
             } else {
@@ -1969,6 +1994,7 @@ mod tests {
         assert!((metrics.fills_gap_median_hours - 1.0).abs() < 1e-12);
         assert!((metrics.fills_gap_p95_hours - 1.9).abs() < 1e-12);
         assert!((metrics.fills_gap_p99_hours - 1.98).abs() < 1e-12);
+        assert!((metrics.fills_gap_time_weighted_mean_hours - 1.5).abs() < 1e-12);
     }
 
     #[test]
@@ -1989,6 +2015,33 @@ mod tests {
         assert!((metrics.fills_gap_median_hours - 2.0).abs() < 1e-12);
         assert!((metrics.fills_gap_p95_hours - 2.0).abs() < 1e-12);
         assert!((metrics.fills_gap_p99_hours - 2.0).abs() < 1e-12);
+        assert!((metrics.fills_gap_time_weighted_mean_hours - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn fill_gap_time_weighted_mean_coalesces_same_timestamp_fills() {
+        let start = 1_740_000_000_000_u64;
+        let one_hour = MS_PER_HOUR;
+        let timestamps = vec![start, start + 4 * one_hour];
+        let fills = vec![
+            make_trade_fill(1, start + one_hour, "BTC", 1.0, 0.1, 0.1, 1000.0, true),
+            make_trade_fill(1, start + one_hour, "ETH", 1.0, 0.1, 0.1, 1000.0, true),
+            make_trade_fill(
+                3,
+                start + 3 * one_hour,
+                "BTC",
+                -1.0,
+                -0.1,
+                0.0,
+                1005.0,
+                true,
+            ),
+        ];
+
+        let metrics = calc_fill_activity_metrics(&fills, &timestamps, 2, 0);
+
+        // Unique no-fill gaps are [1h, 2h, 1h], so sum(gap^2) / sum(gap) = 1.5h.
+        assert!((metrics.fills_gap_time_weighted_mean_hours - 1.5).abs() < 1e-12);
     }
 
     #[test]
@@ -2175,6 +2228,51 @@ mod tests {
         assert!((analysis.exposure_mean_ratio - expected_adg / 0.45).abs() < 1e-12);
         assert!((analysis.total_wallet_exposure_mean - 0.45).abs() < 1e-12);
         assert!((analysis.total_wallet_exposure_median - 0.4).abs() < 1e-12);
+    }
+
+    #[test]
+    fn equity_balance_differences_align_fills_by_timestamp_after_warmup() {
+        let start = 1_740_000_000_000_u64;
+        let fills = vec![
+            make_trade_fill(100, start, "BTC", 0.0, 0.1, 0.1, 100.0, true),
+            make_trade_fill(
+                102,
+                start + 2 * 60_000,
+                "BTC",
+                -10.0,
+                -0.1,
+                0.0,
+                90.0,
+                true,
+            ),
+        ];
+        let equities = vec![100.0, 90.0, 95.0];
+        let timestamps = vec![start, start + 60_000, start + 2 * 60_000];
+
+        let analysis = analyze_backtest_basic(&fills, &equities, &timestamps, &[]);
+
+        assert!((analysis.equity_balance_diff_neg_max - 0.1).abs() < 1e-12);
+        assert!((analysis.equity_balance_diff_neg_mean - 0.1).abs() < 1e-12);
+        let expected_positive = (95.0 - 90.0) / 90.0;
+        assert!((analysis.equity_balance_diff_pos_max - expected_positive).abs() < 1e-12);
+        assert!((analysis.equity_balance_diff_pos_mean - expected_positive).abs() < 1e-12);
+    }
+
+    #[test]
+    fn equity_balance_differences_keep_index_fallback_for_timestamp_less_fills() {
+        let start = 1_740_000_000_000_u64;
+        let fills = vec![
+            make_trade_fill(0, 0, "BTC", 0.0, 0.1, 0.1, 100.0, true),
+            make_trade_fill(2, 0, "BTC", -10.0, -0.1, 0.0, 90.0, true),
+        ];
+        let equities = vec![100.0, 90.0, 95.0];
+        let timestamps = vec![start, start + 60_000, start + 2 * 60_000];
+
+        let analysis = analyze_backtest_basic(&fills, &equities, &timestamps, &[]);
+
+        assert!((analysis.equity_balance_diff_neg_mean - 0.1).abs() < 1e-12);
+        let expected_positive = (95.0 - 90.0) / 90.0;
+        assert!((analysis.equity_balance_diff_pos_mean - expected_positive).abs() < 1e-12);
     }
 
     #[test]

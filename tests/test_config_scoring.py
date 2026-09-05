@@ -38,6 +38,7 @@ def test_default_objective_goal_recognizes_fill_activity_metrics():
     assert default_objective_goal("fills_gap_p95_hours") == "min"
     assert default_objective_goal("fills_gap_p99_hours") == "min"
     assert default_objective_goal("fills_gap_longest_days") == "min"
+    assert default_objective_goal("fills_gap_time_weighted_mean_hours") == "min"
     assert default_objective_goal("fills_per_day") == "max"
     assert default_objective_goal("fills_per_day_entry") == "max"
     assert default_objective_goal("fills_active_days_ratio") == "max"
@@ -46,6 +47,13 @@ def test_default_objective_goal_recognizes_fill_activity_metrics():
 
 
 def test_default_objective_goal_recognizes_strategy_eq_recovery_metrics():
+    assert default_objective_goal("drawdown_worst_strategy_eq_long") == "min"
+    assert default_objective_goal("drawdown_worst_strategy_eq_short") == "min"
+    assert default_objective_goal("drawdown_worst_ema_strategy_eq") == "min"
+    assert default_objective_goal("drawdown_worst_ema_strategy_eq_long") == "min"
+    assert default_objective_goal("drawdown_worst_ema_strategy_eq_short") == "min"
+    assert default_objective_goal("drawdown_worst_mean_1pct_strategy_eq_long") == "min"
+    assert default_objective_goal("drawdown_worst_mean_1pct_strategy_eq_short") == "min"
     assert default_objective_goal("strategy_eq_recovery_days_mean") == "min"
     assert default_objective_goal("strategy_eq_recovery_days_median") == "min"
     assert default_objective_goal("strategy_eq_recovery_days_p95") == "min"
@@ -56,6 +64,10 @@ def test_default_objective_goal_recognizes_strategy_eq_recovery_metrics():
     assert default_objective_goal("strategy_eq_underwater_pct_mean") == "min"
     assert default_objective_goal("strategy_eq_underwater_pct_median") == "min"
     assert default_objective_goal("peak_recovery_days_strategy_eq") == "min"
+    assert default_objective_goal("peak_recovery_hours_strategy_eq_long") == "min"
+    assert default_objective_goal("peak_recovery_hours_strategy_eq_short") == "min"
+    assert default_objective_goal("peak_recovery_days_strategy_eq_long") == "min"
+    assert default_objective_goal("peak_recovery_days_strategy_eq_short") == "min"
 
 
 def test_strategy_eq_underwater_metrics_are_shared_despite_stat_like_suffixes():

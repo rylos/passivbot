@@ -121,26 +121,49 @@ These are the main parity surfaces that should be reviewed together:
    - Backtest simulates that intent with slippage and taker fees for market execution
 7. Terminal no-restart policy
    - Live and backtest both evaluate `hsl_no_restart_drawdown_threshold` from persistent cross-restart HSL drawdown
+8. Rust-owned HSL primitives
+   - Live orchestration and exact backtests share the Rust drawdown-step, coin-signal, and RED-episode-finalization contracts
+   - Apple MPS screening remains approximate and is always revalidated by exact Rust
+9. Apple MPS controller
+   - One shared Rust-owned Metal HSL controller is composed into both EMA Anchor and Trailing Martingale directional kernels
+   - Unified, pside, and coin signal modes use explicit encoded identities instead of a coin/non-coin boolean
+   - Deterministic M3 conformance coverage compares Metal drawdown, EMA, tier, active-RED, latch, and RED-finalization traces against the exact Rust runtime for all three signal modes and restart policies
+   - One-sided and dual-side single-coin runs support unified, pside, and coin signals; unified controllers share account PnL and require both sides to be flat, while pside and coin retain directional realized-PnL and flatness state
+   - One-sided multi-coin runs support unified and pside signals through one shared-balance portfolio controller that tracks all positions and blocking orders on the enabled side
+   - One-sided multi-coin coin signals use one independent controller per coin, each with coin-local realized net PnL, drawdown EMA, warning/RED episode, panic close, halt, and restart state; the coin drawdown budget uses the dynamic effective position-slot count
+   - Coin-mode lifecycle and panic-loss metrics aggregate across coin episodes, while warning-tier time samples the worst active coin tier once per minute, matching exact Rust reporting
+   - Multi-coin limit and market panic closes flatten every open coin on the enabled side and export the same lifecycle and panic-loss metric surface as single-coin HSL; market execution uses each coin's taker fee and directionally quantized configured slippage
+   - One-sided multi-coin coin mode resolves all ten canonical per-coin HSL settings independently, including enablement, thresholds, restart/tier behavior, and limit/market panic execution; compatible suites may supply scenario-local overrides
+   - Dual-side multi-coin EMA Anchor uses a fused shared-account strategy kernel for unified, pside, and coin signals, including shared lifecycle/panic-loss metrics and per-coin HSL overrides in coin mode
+   - Dual-side multi-coin Trailing Martingale uses a fused shared-account strategy kernel for unified, pside, and coin signals, including shared lifecycle/panic-loss metrics and per-coin HSL overrides in coin mode
+   - Apple MPS exports the worst EMA-smoothed strategy-equity drawdown for long and short HSL controllers; the account metric is the same `max(long, short)` reduction as exact Rust
+   - Apple MPS exports the raw worst strategy-equity drawdown for each long and short HSL controller through opt-in bounded peak-and-maximum state; exact Rust validation remains authoritative for proxy-fill drift
+   - Apple MPS exports the raw mean-worst-1% daily strategy-equity drawdown for each long and short HSL controller through opt-in daily-worst state and a bounded logarithmic tail histogram; exact Rust validation and rolling drift gates remain authoritative
+   - Apple MPS exports each HSL controller's longest strict strategy-equity time-to-exceed interval as `peak_recovery_{hours,days}_strategy_eq_{long,short}`, including an unrecovered tail through the backtest end
 
 ### Confirmed Gaps / Risks
 
 1. All-positions-closed confirmation parity
-   - Live RED supervisor finalization still depends on live exchange state and open-order cleanup details
-   - Backtest finalization remains an approximation of that process
-2. Stateless restart coverage is still incomplete
-   - Startup reconstruction from exchange-derived history is implemented in live
-   - But the edge-case matrix still needs broader regression coverage
-3. Global strategy-equity metrics are aggregate diagnostics, not a runtime controller
+   - Live RED supervision necessarily depends on exchange position state, fill evidence, and open-order cleanup
+   - Exact backtests model deterministic fills and therefore cannot prove connector-specific exchange races
+2. Global strategy-equity metrics are aggregate diagnostics, not a runtime controller
    - Runtime decisions are made per `pside`
    - Global `*_strategy_eq` metrics are canonical for risk inspection and optimizer use
    - Deprecated `*_hsl` metric names remain accepted as aliases for older configs/results
+3. Remaining GPU HSL metric gaps
+   - The per-side HSL controllers expose their longest strict strategy-equity recovery interval,
+     but not a full per-side recovery distribution
+   - Global strategy-equity recovery distributions are available for single-coin EMA Anchor and
+     Trailing Martingale through opt-in hourly proxy samples; multi-coin portfolio kernels do not
+     yet emit equivalent samples and fail closed for those metrics
 
 ### Missing or Weak Test Coverage
 
-1. Direct live/backtest sample-parity regression for per-`pside` strategy drawdown reconstruction
-2. Restart during active RED before all positions on one `pside` are fully closed
-3. Restart while panic-close orders are still open
-4. Manual trading during downtime
+1. End-to-end replay of one identical fill/candle history through live reconstruction and exact backtest orchestration; shared Rust primitive tests cover the calculations but not the complete orchestration trace
+2. Connector-level restart races while protective panic-close orders are live on an exchange
+3. Manual or external trading during downtime across the full exchange-adapter matrix
+4. Apple MPS parity for per-side HSL-controller recovery distributions and global multi-coin
+   strategy-equity recovery distributions
 
 ## Optimizer Work
 
@@ -177,10 +200,11 @@ These are candidate regions to test, not final shipped defaults:
 
 ## Remaining Cleanup / Hardening
 
-1. Add stronger direct live/backtest sample-parity regression coverage
+1. Add an end-to-end live-replay/exact-backtest orchestration parity fixture
 2. Enrich user docs with:
    - execution-intent table
    - HSL lifecycle table
    - optimizer recipe
 3. Decide final shipped example/default HSL profile
-4. Add live/manual validation on a tiny account before merge
+4. Add explicitly authorized live/manual validation on a tiny account before declaring exchange-level operational proof
+5. Extend the shared Metal controller only through fail-closed, exact-Rust-validated topology slices

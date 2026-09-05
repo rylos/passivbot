@@ -9,8 +9,10 @@ import logging
 import math
 import os
 import argparse
+import builtins
 import json
 import logging
+import pickle
 from multiprocessing.reduction import ForkingPickler
 import tempfile
 from collections import defaultdict
@@ -22,6 +24,7 @@ import numpy as np
 import pytest
 
 import optimize
+from opt_utils import load_results
 from optimize import (
     _apply_config_overrides,
     _analysis_indicates_liquidation,
@@ -795,6 +798,258 @@ def test_active_suite_scenario_labels_use_canonical_fallbacks():
     assert optimize._active_suite_scenario_labels(
         {"enabled": False, "scenarios": [{}]}
     ) is None
+
+
+def test_materialize_gpu_suite_run_contract_persists_external_and_filtered_suite():
+    config = optimize.get_template_config()
+    config["optimize"]["backend"] = "gpu"
+    config["backtest"]["suite_enabled"] = False
+    suite_cfg = {
+        "enabled": True,
+        "scenarios": [{"label": "stress", "coins": ["ETH"]}],
+        "reducer": {"default": "max"},
+        "exchanges": ["bybit"],
+        "volume_normalization": False,
+    }
+
+    optimize._materialize_gpu_suite_run_contract(config, suite_cfg)
+
+    assert config["backtest"]["suite_enabled"] is True
+    assert config["backtest"]["scenarios"] == suite_cfg["scenarios"]
+    assert config["backtest"]["reducer"] == suite_cfg["reducer"]
+    assert config["backtest"]["exchanges"] == ["bybit"]
+    assert config["backtest"]["volume_normalization"] is False
+    suite_cfg["scenarios"][0]["coins"] = ["BTC"]
+    assert config["backtest"]["scenarios"][0]["coins"] == ["ETH"]
+
+
+def test_materialize_gpu_suite_run_contract_does_not_change_cpu_config():
+    config = optimize.get_template_config()
+    config["optimize"]["backend"] = "pymoo"
+    before = deepcopy(config["backtest"])
+
+    optimize._materialize_gpu_suite_run_contract(
+        config,
+        {
+            "enabled": True,
+            "scenarios": [{"label": "stress", "coins": ["ETH"]}],
+            "reducer": {"default": "max"},
+            "exchanges": ["bybit"],
+            "volume_normalization": False,
+        },
+    )
+
+    assert config["backtest"] == before
+
+
+def test_gpu_preparation_preflight_is_additive_to_cpu_backends(monkeypatch):
+    config = optimize.get_template_config()
+    config["optimize"]["backend"] = "pymoo"
+    config["live"]["strategy_kind"] = "trailing_grid_v7"
+    config["backtest"]["btc_collateral_cap"] = 1.0
+
+    original_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "optimization.backends.gpu_backend":
+            raise AssertionError("CPU optimizer must not import or probe the GPU backend")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(
+        builtins,
+        "__import__",
+        guarded_import,
+    )
+
+    optimize._run_gpu_preparation_preflight(config, {"enabled": False})
+
+
+def test_gpu_preparation_preflight_delegates_effective_suite(monkeypatch):
+    config = optimize.get_template_config()
+    config["optimize"]["backend"] = "gpu"
+    config["optimize"]["fixed_runtime_overrides"] = {
+        "backtest.btc_collateral_cap": 0.5,
+    }
+    suite_cfg = {
+        "enabled": True,
+        "scenarios": [
+            {
+                "label": "stress",
+                "overrides": {
+                    "backtest": {"starting_balance": 2_000.0},
+                    "bot": {"long": {"risk": {"n_positions": 1}}},
+                },
+            }
+        ],
+    }
+    calls = []
+
+    monkeypatch.setattr(
+        "optimization.backends.gpu_backend.validate_gpu_preparation_scope",
+        lambda actual_config, actual_suite: calls.append(
+            (actual_config, actual_suite)
+        ),
+    )
+
+    optimize._run_gpu_preparation_preflight(config, suite_cfg)
+
+    assert len(calls) == 1
+    effective_config, effective_suite = calls[0]
+    assert effective_config is not config
+    assert effective_config["backtest"]["btc_collateral_cap"] == 0.5
+    assert config["backtest"]["btc_collateral_cap"] == 0.0
+    assert effective_suite is not suite_cfg
+    assert effective_suite["scenarios"] == [
+        {
+            "label": "stress",
+            "overrides": {
+                "backtest.starting_balance": 2_000.0,
+                "bot.long.risk.n_positions": 1,
+            },
+        }
+    ]
+
+
+def test_gpu_preparation_preflight_rejects_effective_fixed_runtime_limitation():
+    config = optimize.get_template_config()
+    config["optimize"]["backend"] = "gpu"
+    config["optimize"]["fixed_runtime_overrides"] = {
+        "backtest.btc_collateral_cap": 0.5,
+    }
+
+    with pytest.raises(
+        ValueError,
+        match=r"btc_collateral_cap=0\.0.*got 0\.5.*pymoo",
+    ):
+        optimize._run_gpu_preparation_preflight(config, {"enabled": False})
+
+
+def test_gpu_preparation_preflight_rejects_fixed_strategy_switch():
+    config = optimize.get_template_config()
+    config["optimize"]["backend"] = "gpu"
+    source_strategy = config["live"]["strategy_kind"]
+    target_strategy = (
+        "trailing_martingale"
+        if source_strategy == "ema_anchor"
+        else "ema_anchor"
+    )
+    config["optimize"]["fixed_runtime_overrides"] = {
+        "live.strategy_kind": target_strategy,
+    }
+
+    with pytest.raises(
+        ValueError,
+        match=r"fixed_runtime_overrides may not change live\.strategy_kind",
+    ):
+        optimize._run_gpu_preparation_preflight(config, {"enabled": False})
+
+
+def test_materialize_resolved_gpu_suite_dates_replaces_dynamic_tokens():
+    config = optimize.get_template_config()
+    config["optimize"]["backend"] = "gpu"
+    config["backtest"]["suite_enabled"] = True
+    config["backtest"]["scenarios"] = [
+        {"label": "rolling", "start_date": "2026-01-01", "end_date": "now"}
+    ]
+    context = Mock(
+        label="rolling",
+        config={
+            "backtest": {
+                "start_date": "now",
+                "end_date": "today",
+            }
+        },
+        msss={
+            "bybit": {
+                "__meta__": {
+                    "requested_start_date": "2026-08-17T00:00:00",
+                    "requested_end_date": "2026-08-18T00:00:00",
+                }
+            }
+        },
+    )
+
+    optimize._materialize_resolved_gpu_suite_dates(config, [context])
+
+    assert config["backtest"]["scenarios"] == [
+        {
+            "label": "rolling",
+            "start_date": "2026-08-17T00:00:00",
+            "end_date": "2026-08-18T00:00:00",
+        }
+    ]
+
+
+def test_materialize_resolved_gpu_suite_dates_rejects_inconsistent_prepared_dates():
+    config = optimize.get_template_config()
+    config["optimize"]["backend"] = "gpu"
+    config["backtest"]["suite_enabled"] = True
+    config["backtest"]["scenarios"] = [{"label": "rolling"}]
+    context = Mock(
+        label="rolling",
+        msss={
+            "bybit": {
+                "__meta__": {
+                    "requested_start_date": "2026-08-16T00:00:00",
+                    "requested_end_date": "2026-08-18T00:00:00",
+                }
+            },
+            "binance": {
+                "__meta__": {
+                    "requested_start_date": "2026-08-17T00:00:00",
+                    "requested_end_date": "2026-08-18T00:00:00",
+                }
+            },
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="inconsistent prepared requested_start_date"):
+        optimize._materialize_resolved_gpu_suite_dates(config, [context])
+
+
+def test_materialized_gpu_suite_dates_make_rollover_resume_incompatible():
+    previous = optimize.get_template_config()
+    previous["optimize"]["backend"] = "gpu"
+    previous["backtest"]["suite_enabled"] = True
+    previous["backtest"]["scenarios"] = [
+        {"label": "rolling", "start_date": "now", "end_date": "2026-08-20"}
+    ]
+    current = deepcopy(previous)
+
+    def prepared_context(requested_start_date):
+        return Mock(
+            label="rolling",
+            msss={
+                "bybit": {
+                    "__meta__": {
+                        "requested_start_date": requested_start_date,
+                        "requested_end_date": "2026-08-20T00:00:00",
+                    }
+                }
+            },
+        )
+
+    optimize._materialize_resolved_gpu_suite_dates(
+        previous, [prepared_context("2026-08-17T00:00:00")]
+    )
+    optimize._materialize_resolved_gpu_suite_dates(
+        current, [prepared_context("2026-08-18T00:00:00")]
+    )
+    previous["suite_metrics"] = {"scenario_labels": ["rolling"]}
+
+    mismatches = optimize._resume_config_mismatches(previous, current)
+
+    assert any("backtest.scenarios" in mismatch for mismatch in mismatches)
+
+
+def test_materialize_resolved_gpu_suite_dates_rejects_context_count_mismatch():
+    config = optimize.get_template_config()
+    config["optimize"]["backend"] = "gpu"
+    config["backtest"]["suite_enabled"] = True
+    config["backtest"]["scenarios"] = [{"label": "base"}]
+
+    with pytest.raises(RuntimeError, match="prepared scenario count"):
+        optimize._materialize_resolved_gpu_suite_dates(config, [])
 
 
 def test_validate_optimizer_limit_suite_mode_rejects_named_scenario_early():
@@ -2036,6 +2291,46 @@ class TestValidateArray:
         assert manager.arrays[0] is hlcvs
         assert manager.arrays[1] is btc_usd_prices
 
+    def test_register_exchange_data_preserves_gpu_nan_gaps_through_aggregation(self):
+        class RecordingArrayManager:
+            def __init__(self):
+                self.arrays = []
+
+            def create_from(self, array):
+                self.arrays.append(array)
+                return object(), array
+
+        hlcvs = np.tile(
+            np.array([10.0, 8.0, 9.0, 1.0], dtype=np.float64),
+            (6, 1, 1),
+        )
+        hlcvs[0, 0] = np.nan
+        hlcvs[2:4, 0] = np.nan
+        btc_usd_prices = np.ones(6, dtype=np.float64)
+        timestamps = np.arange(6, dtype=np.int64) * 60_000
+        mss = {"BTC": {"first_valid_index": 0, "last_valid_index": 5}}
+        config = {"backtest": {"coins": {}, "candle_interval_minutes": 2}}
+        manager = RecordingArrayManager()
+
+        with patch("optimize._stamp_optimizer_warmup"):
+            _register_exchange_data(
+                "binance",
+                (["BTC"], hlcvs, mss, None, None, btc_usd_prices, timestamps),
+                config,
+                msss={},
+                hlcvs_specs={},
+                btc_usd_specs={},
+                timestamps_dict={},
+                array_manager=manager,
+                preserve_internal_nan_gaps=True,
+            )
+
+        aggregated = manager.arrays[0]
+        np.testing.assert_allclose(aggregated[0, 0], [10.0, 8.0, 9.0, 1.0])
+        assert np.isnan(aggregated[1, 0, :3]).all()
+        assert aggregated[1, 0, 3] == 0.0
+        np.testing.assert_allclose(aggregated[2, 0], [10.0, 8.0, 9.0, 2.0])
+
     def test_register_exchange_data_propagates_dataset_replay_policy_without_bot_gates(self):
         class RecordingArrayManager:
             def create_from(self, array):
@@ -3093,6 +3388,105 @@ class TestApplyFineTuneBounds:
         assert raw_count == 3
         assert sorted(individual[0] for individual in streamed) == [1, 2]
         assert "failed to use starting config as optimizer seed" in caplog.text
+
+    def test_anchored_seed_stream_preserves_persisted_result_anchor_id(self):
+        config = {
+            "live": {"strategy_kind": "trailing_martingale"},
+            "optimize": {
+                "bounds": {
+                    "long_n_positions": [1.0, 1.0],
+                    "long_param1": [0.0, 1.0],
+                    "long_total_wallet_exposure_limit": [1.0, 1.0],
+                    "short_n_positions": [0.0, 0.0],
+                    "short_total_wallet_exposure_limit": [0.0, 0.0],
+                },
+            },
+            "bot": {
+                "long": {
+                    "n_positions": 1.0,
+                    "param1": 0.1,
+                    "total_wallet_exposure_limit": 1.0,
+                },
+                "short": {"n_positions": 0.0, "total_wallet_exposure_limit": 0.0},
+            },
+            ANCHOR_PLAN_KEY: {
+                "anchors": [
+                    {"source": "anchor_0.json", "fixed_values": []},
+                    {"source": "anchor_1.json", "fixed_values": []},
+                ],
+                "fixed_keys": [],
+                "key_paths": [["bot", "long", "param1"]],
+                "tunable_keys": ["long_param1"],
+            },
+        }
+        shape = build_optimization_shape(config)
+        durable_result = deepcopy(config)
+        durable_result.pop(ANCHOR_PLAN_KEY)
+        durable_result["optimizer_anchor"] = {
+            "id": 1,
+            "source": "anchor_1.json",
+        }
+
+        streamed, raw_count = configs_to_individuals_streaming(
+            [durable_result],
+            shape.bounds,
+            6,
+            optimization_shape=shape,
+        )
+
+        assert raw_count == 1
+        assert len(streamed) == 1
+        assert streamed[0][0] == 1
+
+    @pytest.mark.parametrize("anchor_id", [2, 1.9, True, "1"])
+    def test_anchored_seed_stream_rejects_invalid_persisted_anchor_id(
+        self, caplog, anchor_id
+    ):
+        config = {
+            "live": {"strategy_kind": "trailing_martingale"},
+            "optimize": {
+                "bounds": {
+                    "long_n_positions": [1.0, 1.0],
+                    "long_param1": [0.0, 1.0],
+                    "long_total_wallet_exposure_limit": [1.0, 1.0],
+                    "short_n_positions": [0.0, 0.0],
+                    "short_total_wallet_exposure_limit": [0.0, 0.0],
+                },
+            },
+            "bot": {
+                "long": {
+                    "n_positions": 1.0,
+                    "param1": 0.1,
+                    "total_wallet_exposure_limit": 1.0,
+                },
+                "short": {"n_positions": 0.0, "total_wallet_exposure_limit": 0.0},
+            },
+            ANCHOR_PLAN_KEY: {
+                "anchors": [
+                    {"source": "anchor_0.json", "fixed_values": []},
+                    {"source": "anchor_1.json", "fixed_values": []},
+                ],
+                "fixed_keys": [],
+                "key_paths": [["bot", "long", "param1"]],
+                "tunable_keys": ["long_param1"],
+            },
+        }
+        shape = build_optimization_shape(config)
+        durable_result = deepcopy(config)
+        durable_result.pop(ANCHOR_PLAN_KEY)
+        durable_result["optimizer_anchor"] = {"id": anchor_id}
+
+        caplog.set_level(logging.WARNING)
+        streamed, raw_count = configs_to_individuals_streaming(
+            [durable_result],
+            shape.bounds,
+            6,
+            optimization_shape=shape,
+        )
+
+        assert raw_count == 1
+        assert streamed == []
+        assert "optimizer anchor id" in caplog.text
 
     def test_starting_seed_values_are_clamped_to_base_bounds_with_logging(self, caplog):
         config = {
@@ -4845,6 +5239,62 @@ def test_validate_resume_results_rejects_empty_all_results(tmp_path: Path):
         optimize._validate_resume_results(str(tmp_path), config)
 
 
+def test_validate_resume_results_allows_empty_gpu_seed_bootstrap_checkpoint(
+    tmp_path: Path,
+):
+    config = _resume_validation_entry()
+    config["optimize"]["backend"] = "gpu"
+    results_path = tmp_path / "all_results.bin"
+    results_path.write_bytes(b"")
+    checkpoint_path = tmp_path / "checkpoint.pkl"
+    checkpoint = {
+        "seed_bootstrap_complete": False,
+        "seed_exact_done": 0,
+        "exact_done": 0,
+        "seed_bootstrap_contract": {"version": 1},
+        "seed_bootstrap_plan": {
+            "effective_mode": "screened",
+            "starting_vectors": [[0.1]],
+        },
+    }
+    with open(checkpoint_path, "wb") as file:
+        pickle.dump(checkpoint, file)
+
+    assert (
+        optimize._validate_resume_results(
+            str(tmp_path),
+            config,
+            checkpoint_path=str(checkpoint_path),
+        )
+        == 0
+    )
+
+
+def test_validate_resume_results_rejects_empty_completed_gpu_checkpoint(
+    tmp_path: Path,
+):
+    config = _resume_validation_entry()
+    config["optimize"]["backend"] = "gpu"
+    (tmp_path / "all_results.bin").write_bytes(b"")
+    checkpoint_path = tmp_path / "checkpoint.pkl"
+    with open(checkpoint_path, "wb") as file:
+        pickle.dump(
+            {
+                "seed_bootstrap_complete": True,
+                "seed_exact_done": 0,
+                "exact_done": 0,
+            },
+            file,
+        )
+
+    with pytest.raises(ValueError, match="all_results.bin is empty"):
+        optimize._validate_resume_results(
+            str(tmp_path),
+            config,
+            checkpoint_path=str(checkpoint_path),
+        )
+
+
 def test_validate_resume_results_rejects_corrupt_all_results(tmp_path: Path):
     config = _resume_validation_entry()
     (tmp_path / "all_results.bin").write_bytes(b"\xc1")
@@ -4895,6 +5345,113 @@ def test_validate_resume_results_counts_entries(tmp_path: Path):
     _write_msgpack_entries(tmp_path / "all_results.bin", [entry, deepcopy(entry)])
 
     assert optimize._validate_resume_results(str(tmp_path), deepcopy(entry)) == 2
+
+
+def test_compressed_result_resume_clears_seed_bootstrap_metadata(tmp_path: Path):
+    seed_entry = _resume_validation_entry()
+    seed_entry["metrics"] = {
+        "objectives": {"adg_strategy_eq": 0.1},
+        "constraint_violation": 0.0,
+        "gpu_seed_bootstrap": {"mode": "exact", "source_index": 0},
+    }
+    _write_msgpack_entries(tmp_path / "all_results.bin", [seed_entry])
+    resume_state = {}
+    assert (
+        optimize._validate_resume_results(
+            str(tmp_path),
+            deepcopy(seed_entry),
+            resume_state=resume_state,
+        )
+        == 1
+    )
+    recorder = ResultRecorder(
+        results_dir=str(tmp_path),
+        sig_digits=6,
+        flush_interval=60,
+        scoring_keys=["adg_strategy_eq"],
+        compress=True,
+        write_all_results=True,
+        starting_iters=1,
+        previous_data=resume_state["previous_data"],
+    )
+    recorder.store.add_entry = Mock(return_value=False)
+    evolution_entry = deepcopy(seed_entry)
+    evolution_entry["metrics"].pop("gpu_seed_bootstrap")
+    evolution_entry["metrics"]["objectives"]["adg_strategy_eq"] = 0.2
+    recorder.record(evolution_entry)
+    recorder.close()
+
+    results = list(load_results(tmp_path / "all_results.bin"))
+    assert results[0]["metrics"]["gpu_seed_bootstrap"]["source_index"] == 0
+    assert "gpu_seed_bootstrap" not in results[1]["metrics"]
+
+
+def test_compressed_result_boundary_clears_seed_bootstrap_metadata(tmp_path: Path):
+    seed_entry = _resume_validation_entry()
+    seed_entry["metrics"] = {
+        "objectives": {"adg_strategy_eq": 0.1},
+        "constraint_violation": 0.0,
+        "gpu_seed_bootstrap": {"mode": "exact", "source_index": 99},
+    }
+    _write_msgpack_entries(tmp_path / "all_results.bin", [seed_entry])
+    recorder = ResultRecorder(
+        results_dir=str(tmp_path),
+        sig_digits=6,
+        flush_interval=60,
+        scoring_keys=["adg_strategy_eq"],
+        compress=True,
+        write_all_results=True,
+        starting_iters=100,
+        previous_data=seed_entry,
+    )
+    recorder.store.add_entry = Mock(return_value=False)
+    evolution_entry = deepcopy(seed_entry)
+    evolution_entry["metrics"].pop("gpu_seed_bootstrap")
+    evolution_entry["metrics"]["objectives"]["adg_strategy_eq"] = 0.2
+    recorder.record(evolution_entry)
+    recorder.close()
+
+    results = list(load_results(tmp_path / "all_results.bin"))
+    assert results[0]["metrics"]["gpu_seed_bootstrap"]["source_index"] == 99
+    assert "gpu_seed_bootstrap" not in results[1]["metrics"]
+
+
+def test_restore_gpu_resume_anchor_plan_before_shape_build(tmp_path: Path):
+    checkpoint_path = tmp_path / "checkpoint.pkl"
+    anchor_plan = {
+        "anchors": [{"seed_bot": {}, "fixed_values": [], "source": "checkpoint"}],
+        "fixed_keys": ["long_base_qty_pct"],
+        "key_paths": [["bot", "long", "base_qty_pct"]],
+        "strategy_kind": "trailing_martingale",
+        "tunable_keys": ["long_base_qty_pct"],
+    }
+    with open(checkpoint_path, "wb") as file:
+        pickle.dump({"anchor_plan": anchor_plan}, file)
+    config = {
+        "live": {"strategy_kind": "trailing_martingale"},
+        "optimize": {"backend": "gpu"},
+    }
+
+    assert optimize._restore_gpu_resume_anchor_plan(
+        config, str(checkpoint_path)
+    )
+    assert config[optimize.ANCHOR_PLAN_KEY] == anchor_plan
+    assert config[optimize.ANCHOR_PLAN_KEY] is not anchor_plan
+
+
+def test_restored_gpu_anchor_plan_skips_ordinary_fine_tune_bounds():
+    assert not optimize._should_apply_fine_tune_bounds(
+        restored_resume_anchor_plan=True,
+        installing_anchor_plan=False,
+    )
+    assert not optimize._should_apply_fine_tune_bounds(
+        restored_resume_anchor_plan=False,
+        installing_anchor_plan=True,
+    )
+    assert optimize._should_apply_fine_tune_bounds(
+        restored_resume_anchor_plan=False,
+        installing_anchor_plan=False,
+    )
 
 
 def test_optimizer_exit_code_is_nonzero_for_fatal_errors():

@@ -1,3 +1,4 @@
+import pickle
 from types import SimpleNamespace
 
 import numpy as np
@@ -99,7 +100,10 @@ async def test_prepare_suite_contexts_keeps_directional_scenarios_with_default_s
     ):
         return None
 
-    async def fake_prepare_master_datasets(*_args, **_kwargs):
+    captured = {}
+
+    async def fake_prepare_master_datasets(*_args, **kwargs):
+        captured["allow_internal_nan_gaps"] = kwargs["allow_internal_nan_gaps"]
         return {
             "combined": _make_lazy_dataset(
                 coins=("HYPE",),
@@ -121,9 +125,11 @@ async def test_prepare_suite_contexts_keeps_directional_scenarios_with_default_s
         config,
         suite_cfg,
         shared_array_manager=_NoSharedArrayManager(),
+        allow_internal_nan_gaps=True,
     )
 
     assert [ctx.label for ctx in contexts] == ["base", "long_only", "short_only"]
+    assert captured["allow_internal_nan_gaps"] is True
 
 
 def test_suite_evaluator_close_releases_context_and_master_attachments():
@@ -162,6 +168,46 @@ def test_suite_evaluator_close_releases_context_and_master_attachments():
     assert evaluator.contexts[0].attachments == {"hlcvs": {}, "btc": {}}
     assert evaluator._master_attachments == {"hlcvs": {}, "btc": {}}
     assert evaluator._master_arrays == {"hlcvs": {}, "btc": {}}
+
+
+def test_suite_evaluator_pickle_strips_attached_and_cached_arrays():
+    from optimize import SuiteEvaluator
+
+    large = np.ones((1024, 1024), dtype=np.float64)
+    context = optimize_suite.ScenarioEvalContext(
+        label="base",
+        config={},
+        exchanges=["bybit"],
+        hlcvs_specs={},
+        btc_usd_specs={},
+        msss={"bybit": {}},
+        timestamps={"bybit": None},
+        shared_hlcvs_np={"bybit": large},
+        shared_btc_np={"bybit": large[:, 0]},
+        attachments={"hlcvs": {"bybit": _FakeAttachment()}, "btc": {}},
+        coin_indices={"bybit": [0]},
+        overrides={},
+    )
+    evaluator = object.__new__(SuiteEvaluator)
+    evaluator.base = None
+    evaluator.contexts = [context]
+    evaluator.reducer_cfg = {"default": "mean"}
+    evaluator._master_attachments = {
+        "hlcvs": {"master": _FakeAttachment()},
+        "btc": {},
+    }
+    evaluator._master_arrays = {"hlcvs": {"master": large}, "btc": {}}
+
+    payload = pickle.dumps(evaluator)
+    restored = pickle.loads(payload)
+
+    assert len(payload) < 100_000
+    assert context.shared_hlcvs_np["bybit"] is large
+    assert restored.contexts[0].shared_hlcvs_np == {}
+    assert restored.contexts[0].shared_btc_np == {}
+    assert restored.contexts[0].attachments == {"hlcvs": {}, "btc": {}}
+    assert restored._master_arrays == {"hlcvs": {}, "btc": {}}
+    assert restored._master_attachments == {"hlcvs": {}, "btc": {}}
 
 
 @pytest.mark.asyncio
@@ -269,6 +315,66 @@ async def test_prepare_suite_contexts_expands_scenario_required_exchanges(monkey
     assert captured["dataset_exchanges"] == ["binance", "bybit"]
     assert captured["needed"] == ["bybit"]
     assert contexts[0].exchanges == ["bybit"]
+
+
+@pytest.mark.asyncio
+async def test_prepare_suite_contexts_keeps_explicit_exchange_out_of_combined_dataset(
+    monkeypatch,
+):
+    _stub_market_identity_validation(monkeypatch)
+    config = get_template_config()
+    config["backtest"]["start_date"] = "2024-01-01"
+    config["backtest"]["end_date"] = "2024-01-02"
+    config["backtest"]["exchanges"] = ["binance", "bybit"]
+    config["backtest"]["suite_enabled"] = True
+    config["backtest"]["scenarios"] = [
+        {"label": "bybit_only", "exchanges": ["bybit"], "coins": ["HYPE"]},
+    ]
+    config["live"]["approved_coins"] = {"long": ["HYPE"], "short": ["HYPE"]}
+    config["live"]["ignored_coins"] = {"long": [], "short": []}
+
+    async def fake_load_markets(_exchange, verbose=False):
+        return {}
+
+    async def fake_format_approved_ignored_coins(
+        _config, _exchanges, verbose=False, **_kwargs
+    ):
+        return None
+
+    async def fake_prepare_master_datasets(*_args, **_kwargs):
+        return {
+            "combined": _make_lazy_dataset(
+                coins=("HYPE",),
+                coin_exchange={"HYPE": "binance"},
+                available_exchanges=["binance", "bybit"],
+            ),
+            "bybit": _make_lazy_dataset(
+                exchange="bybit",
+                coins=("HYPE",),
+                coin_exchange={"HYPE": "bybit"},
+                available_exchanges=["bybit"],
+            ),
+        }
+
+    monkeypatch.setattr(optimize_suite, "load_markets", fake_load_markets)
+    monkeypatch.setattr(
+        optimize_suite,
+        "format_approved_ignored_coins",
+        fake_format_approved_ignored_coins,
+    )
+    monkeypatch.setattr(
+        optimize_suite, "prepare_master_datasets", fake_prepare_master_datasets
+    )
+
+    suite_cfg = optimize_suite.extract_suite_config(config, suite_override=None)
+    contexts, _reducer_cfg = await optimize_suite.prepare_suite_contexts(
+        config,
+        suite_cfg,
+        shared_array_manager=_NoSharedArrayManager(),
+    )
+
+    assert contexts[0].exchanges == ["bybit"]
+    assert contexts[0].msss["bybit"]["HYPE"]["exchange"] == "bybit"
 
 
 @pytest.mark.asyncio

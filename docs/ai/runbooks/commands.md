@@ -68,6 +68,12 @@ fine-tune anchors: non-tuned optimizer-bound bot params are fixed from the selec
 only the fine-tune selectors are optimized. Runtime policy from the base config still wins, and
 seed/anchor values outside `optimize.bounds` are clamped with aggregated source/key logging.
 
+CPU optimizers exact-evaluate every deduplicated `--start` config. The GPU backend defaults to
+`optimize.gpu.seed_bootstrap.mode=auto`: it exact-evaluates pools of at most 128 seeds and
+proxy-screens larger pools before capped exact validation. Use `mode=exact` only when the startup
+cost of exact-evaluating the complete pool is intentional. GPU bootstrap exact work is additional
+to `optimize.iters`.
+
 ## Rust
 
 ```bash
@@ -80,11 +86,14 @@ cd passivbot-rust && cargo check --tests && cd ..
 
 ```bash
 passivbot tool pareto optimize_results/.../pareto
+passivbot tool pareto optimize_results/.../pareto -s configs/promoted_candidate.local.json
+passivbot tool pareto optimize_results/.../pareto -l 'adg_strategy_eq>0.0' -f optimize_results/filtered_pareto
 passivbot tool pareto-compress optimize_results/.../pareto 8 --output-dir selected_pareto_8
 passivbot tool pareto-dash --data-root optimize_results
 passivbot tool verify-hlcvs-data
 passivbot tool ohlcvs-doctor --repair-catalog
 passivbot tool streamline-json configs/examples/default_trailing_martingale_long.json
+passivbot tool compose-coin-overrides path/to/single_coins path/to/composed.json
 passivbot tool migrate-config-v7 config_v7.json config_v8.json
 passivbot tool compare-backtests path/to/v7/result path/to/v8/result
 ```

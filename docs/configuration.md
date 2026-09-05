@@ -110,7 +110,7 @@ Example per-metric aggregation:
   - Accepted values: `0` (warnings), `1` (info), `2` (debug), `3` (trace).
   - The CLI flag `--log-level` on `passivbot live` and `passivbot backtest` overrides the configured value for a single run. It accepts `warning`, `info`, `debug`, `trace`, or `0-3`.
   - Components such as the CandlestickManager inherit this level, so EMA warm-up and candle maintenance logs follow the same verbosity.
-- **persist_to_file**: When `true`, `passivbot live` also writes the console log stream to a timestamped file on disk and refreshes `logs/{user}.log` as a stable alias to the current run. The canonical default is `true`, so live runs write to `logs/` unless you disable it explicitly. In this first integrated version, backtest/optimize still use console logging unless you wrap them externally.
+- **persist_to_file**: When `true`, `passivbot live` also writes the console log stream to a timestamped file on disk and refreshes `logs/{user}.log` as a stable alias to the current run. On Windows without symlink privileges, this alias is a text pointer containing the absolute path to the current run log; Passivbot's monitor tooling follows it automatically. The canonical default is `true`, so live runs write to `logs/` unless you disable it explicitly. In this first integrated version, backtest/optimize still use console logging unless you wrap them externally.
 - **dir**: Directory used for persisted live log files and the stable current-run alias when `persist_to_file` is enabled. Default `logs`.
 - **rotation**: Enables rotating live log files instead of appending to one file per process. Default `false`.
 - **max_bytes_mb**: Maximum size in megabytes for each live log file before rotation. Used only when `rotation = true`. Default `10`.
@@ -660,7 +660,15 @@ Risk should be constrained through canonical `*_strategy_eq` metrics instead. De
 - **offspring_multiplier**: Multiplier applied to `population_size` to determine how many offspring (`λ`) are produced each generation in the μ+λ evolution strategy. Values >1.0 increase exploration by sampling more children per generation. Default is `1.0`.
 - **pareto_max_size**: Maximum number of Pareto-optimal configs kept on disk under `optimize_results/.../pareto/`. Members are pruned by crowding (least diverse removed first, while per-objective extremes are preserved), not by age. Default is `1000`.
 - **population_size**: Size of population for genetic optimization algorithm. With the default `pymoo` backend, `null` means auto: NSGA-II resolves to `250`, while NSGA-III resolves to a default population budget of `500` and chooses the finest auto reference-direction grid that fits inside that budget. Set an explicit integer to change the NSGA-III per-generation evaluation budget and auto reference-direction coarseness.
-- **backend**: Optimizer backend. Default is `pymoo`. With the default `optimize.pymoo.algorithm: "auto"`, Passivbot uses `nsga2` for `3` or fewer objectives and `nsga3` for `4+`.
+- **backend**: Optimizer backend. Default is `pymoo`. Supported values are `deap`, `pymoo`, and
+  experimental `gpu`. The GPU backend currently supports Apple MPS, single-coin EMA-anchor and
+  trailing-martingale runs in long-only, short-only, and long+short modes; single-side and
+  dual-side hedge-mode multi-coin runs for both strategies; anchored fine-tuning with `--start` plus
+  `--fine-tune-params`; and the V8
+  `mirror_short_from_long` and `lossless_close_trailing` optimizer overrides. See
+  `docs/optimizing.md` for its fail-closed scope and `optimize.gpu` settings.
+  With the default `optimize.pymoo.algorithm: "auto"`, Passivbot uses `nsga2` for `3` or fewer
+  objectives and `nsga3` for `4+`.
 - **round_to_n_significant_digits**: Quantization precision used when hashing configs, deduplicating candidates, and writing optimizer artifacts. Lower values collapse near-identical candidates more aggressively; higher values preserve more distinct variants.
 - **scoring**:
   - The optimizer minimizes the configured objective list and keeps the Pareto front.

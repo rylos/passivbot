@@ -516,6 +516,30 @@ def get_template_config():
                     "pareto_max_size": 1000,
                     "population_size": None,
                     "seed": None,
+                    "gpu": {
+                        "auto_lean_parallelism": True,
+                        "batch_size": None,
+                        "max_dispatch_candidate_bars": None,
+                        "checkpoint_interval_seconds": 5.0,
+                        "drift_halt": 0.6,
+                        "drift_min_samples": 32,
+                        "drift_probes": 4,
+                        "drift_window": 128,
+                        "exact_workers": 0,
+                        "max_pending_exact": 0,
+                        "population_size": None,
+                        "seed_bootstrap": {
+                            "max_exact": 128,
+                            "mode": "auto",
+                        },
+                        "successive_halving": {
+                            "enabled": False,
+                            "history_fractions": [0.25, 0.5, 1.0],
+                            "min_survivors": 64,
+                            "survival_fraction": 0.5,
+                        },
+                        "validate_per_generation": 8
+                    },
                     "pymoo": {
                         "algorithm": "auto",
                         "algorithms": {

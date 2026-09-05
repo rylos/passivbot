@@ -62,6 +62,10 @@ TOOL_COMMANDS: dict[str, CommandSpec] = {
         "compare completed backtest artifacts (requires full install)",
         requires_full=True,
     ),
+    "compose-coin-overrides": CommandSpec(
+        "tools.compose_coin_overrides",
+        "compose single-coin configs with minimal inline overrides",
+    ),
     "fetch-balance": CommandSpec("tools.fetch_balance", "fetch exchange balances"),
     "hyperliquid-balance-probe": CommandSpec(
         "tools.probe_hyperliquid_balance",
@@ -139,6 +143,10 @@ TOOL_COMMANDS: dict[str, CommandSpec] = {
     "hsl-replay-benchmark": CommandSpec(
         "tools.hsl_replay_benchmark",
         "benchmark the offline coin-HSL replay hot path",
+    ),
+    "gpu-proxy-benchmark": CommandSpec(
+        "tools.gpu_proxy_benchmark",
+        "benchmark deterministic Apple MPS proxy workloads",
     ),
     "live-smoke-report": CommandSpec(
         "tools.live_smoke_report",

@@ -33,7 +33,12 @@ passivbot tool pareto optimize_results/.../pareto -m reference \
   --target drawdown_worst_strategy_eq=0.25
 passivbot tool pareto optimize_results/.../pareto \
   -l 'drawdown_worst_strategy_eq<=0.35' \
-  -l 'adg_strategy_eq>0.0'
+  -l 'adg_strategy_eq>0.0' \
+  --save-selected configs/promoted_candidate.local.json
+passivbot tool pareto optimize_results/.../pareto \
+  -l 'drawdown_worst_strategy_eq<=0.35' \
+  -l 'adg_strategy_eq>0.0' \
+  --save-filtered optimize_results/filtered_pareto
 passivbot tool pareto -o sharpe_ratio_strategy_eq,adg_strategy_eq,strategy_eq_recovery_days_max \
   -m ideal
 passivbot tool pareto optimize_results/... -m utility \
@@ -70,6 +75,16 @@ recovered, so it is not the complete scenario Pareto front across all evaluated 
 
 The output also shows the retained front's ideal point: the best observed value for each active
 objective after any `--limit` filters are applied.
+
+Use `-s FILE` / `--save-selected FILE` to copy the selected member without reserializing it. Use
+`-f DIR` / `--save-filtered DIR` to copy every member retained immediately after limits and write
+a `selection.json` manifest. Without limits, the filtered export contains every loaded member.
+Scenario limits use the selected scenario's metrics; the export still represents the post-limit
+set before the scenario-specific nondominated front is rebuilt. The two save options are mutually
+exclusive.
+
+Destinations must not overlap the source Pareto directory and must not already exist. Writes are
+staged before installation. Concurrent destination mutation is outside the tool's contract.
 
 `-o` / `--objectives` is not limited to the original `optimize.scoring` list. You can also name
 other stored metrics such as `sharpe_ratio_strategy_eq` as long as the Pareto JSON
@@ -151,24 +166,41 @@ passivbot tool iterative-history-plot backtests/.../fills.csv
 ## Trailing parameter inspector
 
 `passivbot tool trailing-inspect` explains the effective `trailing_martingale` entry and close
-thresholds for a hypothetical position. It is offline and read-only. It shows each wallet-exposure
-and volatility contribution, the threshold boundary, the retracement distance from the running
-extreme, the nominal confirmation price if the reversal starts exactly at the threshold, and the
-order-reference price used after both conditions pass.
+behavior. It is offline and read-only. Passing only a config path produces an overview for both
+sides across quiet, normal, and high example volatility plus 0%, 50%, and 90% usage of the
+effective exposure limit. Each row shows the threshold and retracement percentages, threshold
+price, nominal reversal-confirmation price, and Rust order-reference price from a readable 100.0
+average-position-price anchor. Use `--price-anchor` to change it.
 
-Without `--config`, the command uses the Rust-owned strategy defaults. With `--config`, it loads the
-selected side's canonical `bot.<side>.strategy.trailing_martingale` parameters. Individual flags
-override either source. Percent values use config ratios, so `0.01` means 1%.
+With a config, the overview labels each side as active or dormant and explains entry cooldown,
+simultaneous versus staged entry ladders, EMA gating, volatility/exposure sensitivity, recursive
+close sizing, and relevant portfolio/PnL risk paths. Without a config, only strategy defaults are
+loaded, so runtime paths are explicitly labeled as unknown. The descriptions are heuristics for
+intuition, not assessments of strategy quality.
+
+Without either a positional config path or `--config`, the command uses the Rust-owned strategy
+defaults. A positional config path or the legacy `--config` form loads canonical
+`bot.<side>.strategy.trailing_martingale` parameters. Individual flags override either source.
+Percent values use config ratios, so `0.01` means 1%.
 
 ```shell
+passivbot tool trailing-inspect configs/examples/default_trailing_martingale_long.json
+passivbot tool trailing-inspect configs/examples/default_trailing_martingale_long.json \
+  --side long --price-anchor 250
+
+# Customize the overview grid (values are config ratios, not percentage numbers).
+passivbot tool trailing-inspect configs/examples/default_trailing_martingale_long.json \
+  --exposure-ratios 0,0.25,0.5,0.75,0.95 \
+  --volatility-scenarios quiet:0.001:0.0005,normal:0.005:0.0025,high:0.015:0.0075
+
+# Detailed single-scenario mode remains available.
 passivbot tool trailing-inspect \
   --symbol COIN --side long \
   --position-size 150 --position-price 20 \
   --wallet-exposure 0.6 --effective-wallet-exposure-limit 0.9 \
   --volatility-ema-1m 0.007 --volatility-ema-1h 0.0033
 
-passivbot tool trailing-inspect \
-  --config configs/examples/default_trailing_martingale_long.json \
+passivbot tool trailing-inspect configs/examples/default_trailing_martingale_long.json \
   --side long --position-price 20 \
   --wallet-exposure 0.6 --effective-wallet-exposure-limit 0.9 \
   --volatility-ema-1m 0.007 --volatility-ema-1h 0.0033 \
