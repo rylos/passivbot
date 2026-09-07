@@ -56,3 +56,10 @@ Vedi anche `mem:live_deployment`, `mem:optimize_workflow`.
 
 ## Dal 2026-09-03: watchdog e report a profili (hl / bybit)
 `~/watchdog/watchdog.py` e `~/watchdog/hl_report.py` su amazon scelgono l'istanza dal primo argomento (`bybit`), default `hl` → il cron storico di ry-hl è invariato. Per istanza: stato (`state.json`/`state_bybit.json`, `trades_state.json`/`trades_state_bybit.json`), flag di manutenzione (`hl_maintenance`/`bybit_maintenance`), tmux, log alias (`hyperliquid_vault.log`/`bybit_02.log` = `<user>.log` creato da passivbot), check healthchecks (`HC_PASSIVBOT`/`HC_PASSIVBOT_BYBIT`; il secondo è l'ex check freqtrade rinominato "passivbot (bybit)" via API il 2026-09-03, stesso uuid). Cron ry-bybit: `3-59/10` watchdog, `*/5` report. Il watchdog freqtrade e `ft_report.py` sono commentati nel crontab (freqtrade fermo). Copie versionate: `ops/watchdog_ry_hl.py`, `ops/hl_report.py`, `ops/README.md`.
+
+
+## hl_report.py: fix del 2026-09-07 (commit 95b78b358)
+- Orari nei messaggi convertiti in Europe/Rome (`rome(day, hhmm)`, il log e' in UTC: il messaggio diceva 23:15 per un fill delle 01:15).
+- Valuta per istanza: `PROFILES[...]["ccy"]` → USDC su ry-hl, USDT su ry-bybit (prima "USDT" fisso).
+- Wallet alla chiusura: prima riga `[health]`/`[balance]` con timestamp ≥ fill; se manca, saldo precedente + pnl con "≈" (prima prendeva l'ultima riga del log, spesso un health di pochi secondi PRIMA del fill: 12700.81 mostrato contro 12713.84 reale).
+- Backup `~/watchdog/hl_report.py.bak-20260907`; copia repo `ops/hl_report.py` allineata.
