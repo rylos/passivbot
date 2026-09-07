@@ -27,12 +27,22 @@ from pathlib import Path
 # Istanza dal primo argomento (`hl_report.py bybit`); default "hl" per non
 # toccare il cron storico. Stato separato per istanza.
 PROFILES = {
-    "hl": dict(name="ry-hl", logdir="/opt/passivbot-hl/logs", config="config_hl_4rsi.json", state="trades_state.json"),
-    "bybit": dict(name="ry-bybit", logdir="/opt/passivbot-bybit/logs", config="config_bybit_4rsi.json", state="trades_state_bybit.json"),
+    "hl": dict(name="ry-hl", logdir="/opt/passivbot-hl/logs", config="config_hl_4rsi.json", state="trades_state.json", ccy="USDC"),
+    "bybit": dict(name="ry-bybit", logdir="/opt/passivbot-bybit/logs", config="config_bybit_4rsi.json", state="trades_state_bybit.json", ccy="USDT"),
 }
 INSTANCE = sys.argv[1] if len(sys.argv) > 1 else "hl"
 P = PROFILES[INSTANCE]
 NAME = P["name"]
+CCY = P["ccy"]
+
+
+def rome(day: str, hhmm: str) -> str:
+    """Il log e' in UTC; Marco legge in Europe/Rome (07/09: il messaggio
+    diceva 23:15 per un fill delle 01:15)."""
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+    dt = datetime.strptime(f"{day}T{hhmm}", "%Y-%m-%dT%H:%M").replace(tzinfo=timezone.utc)
+    return dt.astimezone(ZoneInfo("Europe/Rome")).strftime("%H:%M")
 
 BASE = Path.home() / "watchdog"
 CREDS = BASE / "telegram.json"
@@ -140,12 +150,14 @@ def main() -> None:
         return
 
     steps = state.get("steps", 0)
-    balance = None
-    for line in reversed(lines):
+    # (stamp, saldo) di ogni riga [health]/[balance]: alla chiusura serve la
+    # prima riga DOPO il fill, non l'ultima del log (07/09: wallet 12700.81
+    # da un [health] di 16 secondi prima del fill, reale 12713.84).
+    bal_lines = []
+    for line in lines:
         b = BAL_RE.search(line)
         if b:
-            balance = f"{float(b.group(1) or b.group(2)):.2f}"
-            break
+            bal_lines.append((line[:16], float(b.group(1) or b.group(2))))
 
     opened_at = state.get("opened_at")
 
@@ -155,7 +167,7 @@ def main() -> None:
             opened_at = f"{ev['day']}T{ev['time']}"
             send(
                 f"📈 <b>{NAME} aperta</b> · {ev['size']:.2f} HYPE @ {ev['price']:.3f}"
-                f" · {ev['time']}"
+                f" · {rome(ev['day'], ev['time'])}"
             )
         elif ev["kind"] in ("added", "reduced"):
             steps += 1  # niente messaggio: si riassume alla chiusura
@@ -188,10 +200,17 @@ def main() -> None:
                     pnl += float(m.group(4))
             opened_at = None
             grad = f" · {steps} gradini" if steps > 1 else ""
-            bal = f" · wallet {balance}" if balance else ""
+            after = [v for st, v in bal_lines if st >= end]
+            before = [v for st, v in bal_lines if st < end]
+            if after:
+                bal = f" · wallet {after[0]:.2f}"
+            elif before:
+                bal = f" · wallet ≈{before[-1] + pnl:.2f}"
+            else:
+                bal = ""
             send(
-                f"✅ <b>{NAME} chiusa</b> · <b>{pnl:+.2f}</b> USDT{grad}{bal}"
-                f" · {ev['time']}"
+                f"✅ <b>{NAME} chiusa</b> · <b>{pnl:+.2f}</b> {CCY}{grad}{bal}"
+                f" · {rome(ev['day'], ev['time'])}"
             )
             steps = 0
 
