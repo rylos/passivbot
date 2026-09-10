@@ -172,15 +172,23 @@ def main() -> None:
 
     opened_at = state.get("opened_at")
 
+    pending_step = None
     for ev in fresh:
         if ev["kind"] == "new":
+            pending_step = None
             steps = 1
             opened_at = f"{ev['day']}T{ev['time']}"
             send(
                 f"📈 <b>{NAME} aperta</b> · {ev['size']:.2f} HYPE @ {ev['price']:.3f}"
                 f" · {rome(ev['day'], ev['time'])}"
             )
-        elif ev["kind"] in ("added", "reduced"):
+        elif ev["kind"] == "added":
+            steps += 1
+            # Richiesto da Marco il 10/09: un avviso a ogni gradino in piu',
+            # con la posizione aggregata. Se in un giro (5 min) arrivano piu'
+            # gradini, vale solo l'ultimo: si manda dopo il ciclo.
+            pending_step = ev
+        elif ev["kind"] == "reduced":
             steps += 1  # niente messaggio: si riassume alla chiusura
         elif ev["kind"] == "closed":
             # Il PnL della posizione e' la somma dei fill di chiusura da
@@ -224,6 +232,14 @@ def main() -> None:
                 f" · {rome(ev['day'], ev['time'])}"
             )
             steps = 0
+            pending_step = None
+
+    if pending_step is not None:
+        ev = pending_step
+        send(
+            f"➕ <b>{NAME} gradino {steps}</b> · pos {ev['size']:.2f} HYPE @ {ev['price']:.3f}"
+            f" · {ev['size'] * ev['price']:,.0f} {CCY} · {rome(ev['day'], ev['time'])}"
+        )
 
     if fresh:
         state["last_key"] = fresh[-1]["key"]
