@@ -27,8 +27,8 @@ from pathlib import Path
 # Istanza dal primo argomento (`hl_report.py bybit`); default "hl" per non
 # toccare il cron storico. Stato separato per istanza.
 PROFILES = {
-    "hl": dict(name="ry-hl", logdir="/opt/passivbot-hl/logs", config="config_hl_4rsi.json", state="trades_state.json", ccy="USDC"),
-    "bybit": dict(name="ry-bybit", logdir="/opt/passivbot-bybit/logs", config="config_bybit_4rsi.json", state="trades_state_bybit.json", ccy="USDT"),
+    "hl": dict(name="ry-hl", logdir="/opt/passivbot-hl/logs", config="config_hl_4rsi.json", state="trades_state.json", ccy="USDC", extra_creds=["telegram_rylos_group.json"]),
+    "bybit": dict(name="ry-bybit", logdir="/opt/passivbot-bybit/logs", config="config_bybit_4rsi.json", state="trades_state_bybit.json", ccy="USDT", extra_creds=[]),
 }
 INSTANCE = sys.argv[1] if len(sys.argv) > 1 else "hl"
 P = PROFILES[INSTANCE]
@@ -63,14 +63,25 @@ FILL_RE = re.compile(r"\[fill\].*HYPE long (\S+) ([+\-\d.]+) @ ([\d.]+)(?:, pnl=
 BAL_RE = re.compile(r"\[health\].*bal=([\d.]+)|\[balance\].*equity=([\d.]+)")
 
 
-def send(text: str) -> None:
-    creds = json.loads(CREDS.read_text())
+def _send_one(creds: dict, text: str) -> None:
     data = urllib.parse.urlencode(
         {"chat_id": creds["chat_id"], "text": text, "parse_mode": "HTML"}
     ).encode()
     url = "https://api.telegram.org/bot" + creds["token"] + "/sendMessage"
     with urllib.request.urlopen(url, data=data, timeout=30) as r:
         r.read()
+
+
+def send(text: str) -> None:
+    # Destinatario principale (Claude RyLoS Bot -> Marco) + eventuali extra del
+    # profilo (per hl: @freqtradehl_bot -> gruppo RyLoS-Trading, richiesto da
+    # Marco il 2026-09-10). Un errore su un destinatario non blocca gli altri.
+    targets = [CREDS] + [BASE / f for f in P.get("extra_creds", [])]
+    for path in targets:
+        try:
+            _send_one(json.loads(path.read_text()), text)
+        except Exception as e:  # noqa: BLE001
+            print(f"send fallito su {path.name}: {e}", file=sys.stderr)
 
 
 def bot_alive() -> bool:
