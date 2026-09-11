@@ -189,7 +189,7 @@ def main() -> None:
             # gradini, vale solo l'ultimo: si manda dopo il ciclo.
             pending_step = ev
         elif ev["kind"] == "reduced":
-            steps += 1  # niente messaggio: si riassume alla chiusura
+            pass  # uscita parziale: non e' un gradino, si riassume alla chiusura
         elif ev["kind"] == "closed":
             # Il PnL della posizione e' la somma dei fill di chiusura da
             # quando e' stata aperta a quando si e' chiusa. Due errori gia'
