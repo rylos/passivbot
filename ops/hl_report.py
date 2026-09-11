@@ -178,8 +178,13 @@ def main() -> None:
             pending_step = None
             steps = 1
             opened_at = f"{ev['day']}T{ev['time']}"
+            # All'apertura il saldo realizzato non cambia: vale l'ultima riga
+            # [health]/[balance] prima del fill.
+            before = [v for st, v in bal_lines if st <= opened_at]
+            bal = f" · wallet {before[-1]:.2f}" if before else ""
             send(
                 f"📈 <b>{NAME} aperta</b> · {ev['size']:.2f} HYPE @ {ev['price']:.3f}"
+                f" · {ev['size'] * ev['price']:,.0f} {CCY}{bal}"
                 f" · {rome(ev['day'], ev['time'])}"
             )
         elif ev["kind"] == "added":
