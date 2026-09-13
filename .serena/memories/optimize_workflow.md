@@ -108,3 +108,6 @@ Config `configs/opt_suite31_r6.json` su debian, run `optimize_results/2026-09-07
 
 ## ⚠️ Download candele dopo il merge upstream 2026-09-05 (visto il 2026-09-07)
 Due difetti: (1) il retry dei gap persistenti fetcha prima il gap iniziale del 2024-12-05, che fallisce (`leading_unavailable`), e `_fetch_invalid_windows_into_v2_store_results` fa `break` al primo risultato falso, quindi la coda non viene mai scaricata; (2) chiedere `-ed` nel futuro (o oggi) produce `terminal_empty_page` e il fetch viene scartato. Rimedio: scaricare la coda con finestra recente e fine ≤ ieri (`-sd 2026-08-20 -ed 2026-09-07`), poi rilanciare il download con la finestra completa per materializzare. Verificare `symbols.last_ts` nel catalogo (sqlite3 non è installato su debian, usare python).
+
+## ⚠️ Backtest: mai due `backtest.py` in parallelo (visto il 2026-09-13)
+La cartella di output è `backtests/<exchange>/<YYYY-MM-DDTHH_MM_SS>`: due run avviate nello stesso secondo scrivono nella stessa cartella e si sovrascrivono a vicenda (analysis.json di una, `balance_and_equity.csv.gz` corrotto/non-gzip). Lanciarli sempre in sequenza (`run1; run2`), oppure distanziarli di almeno 2 s, e verificare subito dopo quale config c'è in `<dir>/config.json`.
