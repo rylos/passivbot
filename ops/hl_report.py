@@ -262,8 +262,9 @@ def main() -> None:
                 bal = f" · wallet ≈{before[-1] + pnl:.2f}"
             else:
                 bal = ""
+            icon = "✅" if pnl >= 0 else "❌"
             send(
-                f"✅ <b>{NAME} chiusa</b> · <b>{pnl:+.2f}</b> {CCY}{grad}{bal}"
+                f"{icon} <b>{NAME} chiusa</b> · <b>{pnl:+.2f}</b> {CCY}{grad}{bal}"
                 f" · {rome(ev['day'], ev['time'])}"
             )
             steps = 0
