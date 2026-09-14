@@ -72,3 +72,7 @@ Su richiesta di Marco, le notifiche del profilo **hl** (ry-hl) vanno anche al su
 
 ## Rinomina hl_report.py -> trade_report.py (2026-09-15)
 Stesso file, serve entrambe le istanze (`trade_report.py` = hl, `trade_report.py bybit`). Copia repo `ops/trade_report.py`, su amazon `~/watchdog/trade_report.py`, cron aggiornato, log `~/watchdog/trade_report_hl.log` e `trade_report_bybit.log` (i vecchi `hl_report.log`/`bybit_report.log` restano come storico). Stato invariato (`trades_state*.json`). Stesso giorno: icona ❌ sul messaggio di chiusura se pnl netto < 0 (8d32f7526). Le sezioni sopra che citano `hl_report.py` si riferiscono allo stesso file.
+
+## Icone di chiusura e fix riavvio (2026-09-15)
+- Icona chiusura: ❌ pnl netto < 0; 🚀 pnl ≥ `ROCKET_PCT` × wallet (0.005, scelto da Marco sui cicli reali: ~1 ciclo su 8, oggi ≈65 USDC hl / ≈44 USDT bybit; "poi vedremo", soglia rivedibile); ✅ altrimenti (97fc17d4d).
+- Bug: dopo un riavvio del bot nasce un file di log nuovo, `last_key` resta nel vecchio e lo script si risincronizzava in silenzio, perdendo il primo trade (15/09: aperture delle 00:35 non notificate su entrambi i bot). Fix (8b94ebf7b): se tutti gli eventi del log nuovo sono successivi a `last_key` e sono ≤ `MAX_REPLAY` (10), si mandano; oltre, resta la risincronizzazione silenziosa. Messaggi persi recuperati riportando `last_key` a un orario precedente (backup stato `trades_state*.json.bak-20260915b`).
