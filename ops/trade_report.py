@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Notifica Telegram sui trade di ry-hl (Claude RyLoS Bot).
+"""Notifica Telegram sui trade di ry-hl e ry-bybit (Claude RyLoS Bot).
+
+Nato come hl_report.py per il solo ry-hl; rinominato trade_report.py il
+2026-09-15 quando ormai serviva entrambe le istanze.
 
 Nato come report a orari fissi per le ferie (15-27 agosto 2026); dal 27/08 e'
 event-driven, perche' due messaggi al giorno che dicono sempre la stessa cosa
@@ -25,7 +28,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-# Istanza dal primo argomento (`hl_report.py bybit`); default "hl" per non
+# Istanza dal primo argomento (`trade_report.py bybit`); default "hl" per non
 # toccare il cron storico. Stato separato per istanza.
 PROFILES = {
     "hl": dict(name="ry-hl", logdir="/opt/passivbot-hl/logs", config="config_hl_4rsi.json", state="trades_state.json", ccy="USDC", extra_creds=["telegram_rylos_group.json"]),

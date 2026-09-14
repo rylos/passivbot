@@ -65,4 +65,4 @@ Sostituisce il bot freqtrade RyLoS T4G sullo stesso account (`bybit_02`, unified
 - Scelta della leva: 10x cross come su HL, coerente col backtest (liquidazione ≈ −30% dal medio); 4x isolato avrebbe richiesto un TWEL più basso e un candidato diverso.
 - Al primo avvio il bot ha letto 123 fill storici (+1.210 USDT, sono i trade di freqtrade) e `[candle] HYPE 1h missing=314`: l'EMA di volatilità a 1825 h parte non convergente, come su HL a ogni riavvio.
 - Rischio noto del candidato (suite a 19): dd max 38% in giugno 2026 su tutte e tre le partizioni, 7,1 giorni; adg 0,79% contro 0,985% del live HL. Test della quarta partizione (+75 g) ancora da fare a fine r4e.
-- Monitoraggio: `watchdog.py bybit` (cron `3-59/10`), `hl_report.py bybit` (cron `*/5`), flag `~/watchdog/bybit_maintenance`, healthchecks = check ex-freqtrade (`HC_FREQTRADE`). Notifiche Telegram con prefisso `ry-bybit`.
+- Monitoraggio: `watchdog.py bybit` (cron `3-59/10`), `trade_report.py bybit` (cron `*/5`), flag `~/watchdog/bybit_maintenance`, healthchecks = check ex-freqtrade (`HC_FREQTRADE`). Notifiche Telegram con prefisso `ry-bybit`.

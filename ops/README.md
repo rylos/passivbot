@@ -6,7 +6,7 @@ sopravvivere a una ricostruzione del server e a versionare le modifiche.
 | file | dove gira | cron |
 |---|---|---|
 | `watchdog_ry_hl.py` | amazon, `~/watchdog/watchdog.py` | `*/10 * * * *` (ry-hl) e `3-59/10 * * * *` con argomento `bybit` (ry-bybit) |
-| `hl_report.py` | amazon, `~/watchdog/hl_report.py` | `*/5 * * * *` (ry-hl) e `*/5 * * * *` con argomento `bybit` (ry-bybit) |
+| `trade_report.py` | amazon, `~/watchdog/trade_report.py` | `*/5 * * * *` (ry-hl) e `*/5 * * * *` con argomento `bybit` (ry-bybit) |
 
 Dopo ogni modifica qui, ricopiare sul server e verificare che l'md5 combaci:
 
@@ -44,9 +44,9 @@ due notifiche dello stesso evento da due bot diversi.
 ⚠️ L'URL di ping **è una credenziale**: sta solo in `~/watchdog/healthchecks.env`
 (chmod 600) sul server, mai nel repo.
 
-## hl_report.py
+## trade_report.py (ex hl_report.py)
 
-Notifiche Telegram sui **trade** di ry-hl (Claude RyLoS Bot), **sola lettura**:
+Notifiche Telegram sui **trade** di ry-hl e ry-bybit (Claude RyLoS Bot), **sola lettura**:
 non riavvia e non tocca il bot. Il guasto resta compito del watchdog.
 
 Nato come report a orari fissi per le ferie del 2026-08-15 → 27; dal 27/08 è
