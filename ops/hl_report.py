@@ -15,6 +15,7 @@ switch); questo file si occupa solo di raccontare i trade.
 from __future__ import annotations
 
 import glob
+from datetime import datetime, timedelta
 import json
 import os
 import re
@@ -54,7 +55,7 @@ POS_RE = re.compile(
     r"^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}):\d{2}Z.*\[pos\]\s+(new|added|reduced|closed)\s+HYPE\s+"
     r"long\s+[\d.]+ @ [\d.]+\s+-> ([\d.]+) @ ([\d.]+)"
 )
-FILL_RE = re.compile(r"\[fill\].*HYPE long (\S+) ([+\-\d.]+) @ ([\d.]+)(?:, pnl=([+\-\d.]+))?")
+FILL_RE = re.compile(r"\[fill\] (\S+)? ?HYPE long (\S+) ([+\-\d.]+) @ ([\d.]+)(?:, pnl=([+\-\d.]+))?")
 # Il wallet va letto dalla riga piu' recente fra due sorgenti: [health] esce
 # ogni ~15 minuti, quindi alla chiusura di un trade e' quasi sempre vecchia e
 # riporta il saldo PRE-chiusura (visto il 28/08: messaggio con 12290.05 quando
@@ -173,6 +174,7 @@ def main() -> None:
     opened_at = state.get("opened_at")
 
     pending_step = None
+    deferred = False
     for ev in fresh:
         if ev["kind"] == "new":
             pending_step = None
@@ -212,16 +214,34 @@ def main() -> None:
             if opened_at is None:
                 end_min = int(ev["time"][:2]) * 60 + int(ev["time"][3:])
                 start = f"{ev['day']}T{(end_min - 3) // 60:02d}:{(end_min - 3) % 60:02d}"
+            # La riga [fill] arriva anche 40-50 s dopo la riga [pos] (14/09:
+            # chiusura 16:55:18, fill loggato 16:56:04 -> "+0.00 USDT" dove
+            # il pnl era +15,37). Per la finestra vale quindi l'orario del
+            # fill stesso, non quello della riga di log; e se il fill non c'e'
+            # ancora, l'evento resta in sospeso fino al giro successivo.
             pnl = 0.0
+            n_fills = 0
             for line in lines:
                 if "[fill]" not in line or "close" not in line:
                     continue
-                stamp = line[:16]  # YYYY-MM-DDTHH:MM
+                m = FILL_RE.search(line)
+                if not m:
+                    continue
+                stamp = (m.group(1) or line)[:16]  # YYYY-MM-DDTHH:MM
                 if not (start <= stamp <= end):
                     continue
-                m = FILL_RE.search(line)
-                if m and m.group(4):
-                    pnl += float(m.group(4))
+                if m.group(5):
+                    pnl += float(m.group(5))
+                    n_fills += 1
+            try:
+                log_end = datetime.strptime(lines[-1][:16], "%Y-%m-%dT%H:%M")
+            except ValueError:
+                log_end = None
+            close_at = datetime.strptime(end, "%Y-%m-%dT%H:%M")
+            if n_fills == 0 and log_end is not None and log_end <= close_at + timedelta(minutes=2):
+                # log non ancora arrivato al fill: riprovo tra 5 minuti
+                deferred = True
+                break
             opened_at = None
             grad = f" · {steps} gradini" if steps > 1 else ""
             after = [v for st, v in bal_lines if st >= end]
@@ -246,7 +266,13 @@ def main() -> None:
             f" · {ev['size'] * ev['price']:,.0f} {CCY} · {rome(ev['day'], ev['time'])}"
         )
 
-    if fresh:
+    if deferred:
+        # l'evento "closed" non e' stato processato: il prossimo giro riparte
+        # dall'evento precedente (o resta fermo se era il primo)
+        i = next(i for i, e in enumerate(fresh) if e["kind"] == "closed" and e["key"] > (state.get("last_key") or ""))
+        if i > 0:
+            state["last_key"] = fresh[i - 1]["key"]
+    elif fresh:
         state["last_key"] = fresh[-1]["key"]
     state["steps"] = steps
     state["opened_at"] = opened_at
