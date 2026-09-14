@@ -55,7 +55,8 @@ POS_RE = re.compile(
     r"^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}):\d{2}Z.*\[pos\]\s+(new|added|reduced|closed)\s+HYPE\s+"
     r"long\s+[\d.]+ @ [\d.]+\s+-> ([\d.]+) @ ([\d.]+)"
 )
-FILL_RE = re.compile(r"\[fill\] (\S+)? ?HYPE long (\S+) ([+\-\d.]+) @ ([\d.]+)(?:, pnl=([+\-\d.]+))?")
+FILL_RE = re.compile(r"\[fill\] (\S+)? ?HYPE long (\S+) ([+\-\d.]+) @ ([\d.]+)(?:, pnl=([+\-\d.]+))?(?: USDT fee=([+\-\d.]+))?")
+FEE_RE = re.compile(r" fee=([+\-\d.]+)")
 # Il wallet va letto dalla riga piu' recente fra due sorgenti: [health] esce
 # ogni ~15 minuti, quindi alla chiusura di un trade e' quasi sempre vecchia e
 # riporta il saldo PRE-chiusura (visto il 28/08: messaggio con 12290.05 quando
@@ -219,10 +220,15 @@ def main() -> None:
             # il pnl era +15,37). Per la finestra vale quindi l'orario del
             # fill stesso, non quello della riga di log; e se il fill non c'e'
             # ancora, l'evento resta in sospeso fino al giro successivo.
+            # Dal 15/09 il bot scrive anche "fee=" (cashflow con segno, negativo
+            # se pagata) su ogni fill, ingressi compresi: il messaggio riporta
+            # il netto, che e' quello che mostra l'exchange (14/09: lordo
+            # +15,37, Bybit +14,76). Con log vecchi senza fee resta il lordo.
             pnl = 0.0
+            fees = 0.0
             n_fills = 0
             for line in lines:
-                if "[fill]" not in line or "close" not in line:
+                if "[fill]" not in line:
                     continue
                 m = FILL_RE.search(line)
                 if not m:
@@ -230,9 +236,13 @@ def main() -> None:
                 stamp = (m.group(1) or line)[:16]  # YYYY-MM-DDTHH:MM
                 if not (start <= stamp <= end):
                     continue
-                if m.group(5):
+                f = FEE_RE.search(line)
+                if f:
+                    fees += float(f.group(1))
+                if "close" in m.group(2) and m.group(5):
                     pnl += float(m.group(5))
                     n_fills += 1
+            pnl += fees
             try:
                 log_end = datetime.strptime(lines[-1][:16], "%Y-%m-%dT%H:%M")
             except ValueError:

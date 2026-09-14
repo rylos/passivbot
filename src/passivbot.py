@@ -13363,6 +13363,12 @@ class Passivbot:
                 pnl_sign = "+" if event.pnl >= 0 else ""
                 msg += f", pnl={pnl_sign}{round_dynamic(event.pnl, 3)} USDT"
 
+        # Signed fee cashflow (negative when paid), so that log readers can
+        # compute net pnl = pnl + fee over a position cycle.
+        fee_paid = float(getattr(event, "fee_paid", 0.0) or 0.0)
+        if fee_paid != 0.0:
+            msg += f" fee={fee_paid:+.4f}"
+
         # Add client_order_id for unknown orders
         if order_type == "unknown" and event.client_order_id:
             msg += f" (coid={event.client_order_id})"
