@@ -65,6 +65,7 @@ FEE_RE = re.compile(r" fee=([+\-\d.]+)")
 # riporta il saldo PRE-chiusura (visto il 28/08: messaggio con 12290.05 quando
 # il wallet reale era gia' 12521.68). [balance] invece viene emessa nello
 # stesso secondo del fill che muove il saldo: e' quella che vale.
+ROCKET_PCT = 0.005
 BAL_RE = re.compile(r"\[health\].*bal=([\d.]+)|\[balance\].*equity=([\d.]+)")
 
 
@@ -259,13 +260,24 @@ def main() -> None:
             grad = f" · {steps} gradini" if steps > 1 else ""
             after = [v for st, v in bal_lines if st >= end]
             before = [v for st, v in bal_lines if st < end]
+            wallet = None
             if after:
-                bal = f" · wallet {after[0]:.2f}"
+                wallet = after[0]
+                bal = f" · wallet {wallet:.2f}"
             elif before:
-                bal = f" · wallet ≈{before[-1] + pnl:.2f}"
+                wallet = before[-1] + pnl
+                bal = f" · wallet ≈{wallet:.2f}"
             else:
                 bal = ""
-            icon = "✅" if pnl >= 0 else "❌"
+            # Missile sopra ROCKET_PCT del wallet (0.5%, scelto da Marco il
+            # 2026-09-15 sui cicli reali: ~1 su 8). Soglia relativa, non in
+            # valuta, cosi' vale per entrambi i bot e segue il wallet.
+            if pnl < 0:
+                icon = "❌"
+            elif wallet and pnl >= wallet * ROCKET_PCT:
+                icon = "🚀"
+            else:
+                icon = "✅"
             send(
                 f"{icon} <b>{NAME} chiusa</b> · <b>{pnl:+.2f}</b> {CCY}{grad}{bal}"
                 f" · {rome(ev['day'], ev['time'])}"
