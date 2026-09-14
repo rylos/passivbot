@@ -496,6 +496,7 @@ class HyperliquidBot(CCXTBot):
         return bool(getattr(self, "_hl_unified_enabled", False))
 
     def _assert_supported_live_state(self) -> None:
+        super()._assert_supported_live_state()
         if self.HIP3_ISOLATED_SUPPORTED or self._hl_supports_hip3_live_trading():
             return
         unsupported = []
@@ -668,6 +669,9 @@ class HyperliquidBot(CCXTBot):
                         level=logging.DEBUG,
                     )
                 if normalized:
+                    for order in normalized:
+                        if self._hl_ws_order_has_fill_progress(order):
+                            order["_pb_order_update_requires_authoritative_refresh"] = True
                     self.handle_order_update(normalized)
             except asyncio.CancelledError:
                 break

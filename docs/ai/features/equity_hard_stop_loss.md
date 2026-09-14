@@ -20,6 +20,15 @@ HSL drawdown state is scoped by `live.hsl_signal_mode`:
    unrealized-PnL availability. Multiple boundaries inside one replay minute retain their exact
    fill order, realized PnL, fees, and account balance at each boundary. Missing price replay may
    defer drawdown evaluation, but it must not hide an episode boundary.
+   Coin boundary balance reverses all account PnL/fees strictly after the boundary timestamp and
+   the proven same-pair fill tail within that timestamp. Other pairs at the same timestamp remain
+   included in the account timestamp cohort, matching the incremental live convention.
+   Mixed-action fills sharing a millisecond require an unambiguous exchange-provided position
+   chain; list order and locally reconstructed position annotations are not ordering evidence.
+   Each proven fill boundary evaluates its final risk sample. Distinct boundaries in the same
+   minute replace that minute's EMA sample from its prior baseline instead of advancing EMA time
+   again. Ordinary polling within the minute remains cached. A RED stop is recorded while flat,
+   before a later fill can reopen the scope; a RED-free reset seeds the next episode in that minute.
 5. Current flat state is not a timestamp. If the flattening fill is not yet available, live
    finalization and cooldown anchoring defer visibly while protective entry blocking remains active;
    they never substitute the current time. Cooldown re-panic finalization must replay fills from a
@@ -27,6 +36,11 @@ HSL drawdown state is scoped by `live.hsl_signal_mode`:
 6. Restart reconstruction uses exchange state, fill/PnL history, candles where required, config, and
    current time. Local latch files are diagnostics, not authority. Restart always reconstructs from
    authoritative exchange-derived inputs; no persisted replay state participates in the decision.
+   Live normal interventions and cooldown expiry use that same reconstruction before releasing a
+   halt, retaining entry fees and losses before the next observation. A proven RED stop follows the
+   same restart rules regardless of closing order type; terminal no-restart takes precedence.
+   Same-millisecond normal interventions require the validated fill-chain order and use its
+   cumulative PnL prefix so closing losses are excluded while entry fees survive subsequent polls.
 7. `bot.{pside}.hsl.panic_close_order_type = "market"` is an explicit protective execution
    override when HSL is enabled. Rust may emit that side's `close_panic_*` as a market order even
    when `live.market_orders_allowed = false`; the live flag gates non-panic market execution and
@@ -55,6 +69,10 @@ HSL drawdown state is scoped by `live.hsl_signal_mode`:
    finalization consumes pair metrics and must not add an account-wide PnL dependency. Coin mode
    evaluates each configured coin's effective HSL enablement, restart policy, and cooldown.
    `threshold`, `never`, pside, and unified modes remain full-lookback strict.
+   Live ordinary-boundary checks use this same proven coin window and retain its
+   initialized lower bound until canonical reconstruction replaces it. Time passing
+   must not slide the boundary past delayed fills, and newly uncertain scope evidence
+   restores strict checking. Discarded cache rows cannot reintroduce old episodes.
 9. Restart price reconstruction fetches 1m history first. When an exchange cannot provide the
    older leading portion, it may use 5m, then 15m, then 1h candles for that prefix. This is an
    explicitly approximate price path: the finest source wins and its contribution is reported.
@@ -64,8 +82,21 @@ HSL drawdown state is scoped by `live.hsl_signal_mode`:
 ## Failure Semantics
 
 Incomplete fill coverage follows `../error_contract.md`. A required episode boundary is unavailable
-until supported by fill evidence. The affected HSL scope remains protective and retries after an
-authoritative refresh; unrelated scopes remain available.
+until supported by fill evidence. Startup replay validates all enabled scope tapes before replacing
+existing protective state. The affected HSL scope remains protective and retries after an
+authoritative refresh. Flat scopes pending startup price replay retain the existing per-pair
+create gate, leaving unrelated scopes available. Ambiguous required held-episode evidence defers
+ordinary shared-account planning: the startup gate runs after portfolio intent construction and
+cannot make a plan built from unknown HSL episode state authoritative. Independently ready,
+already-latched RED supervision and required panic protection for active cooldown positions still
+run during that deferral, using fresh protective account state and the configured execution pacing.
+Cancellation-only waves remove entries from terminal no-restart scopes and resting initials from
+flat cooldown scopes without constructing new intent or changing terminal state. Manual ownership
+begins only after a proven cooldown intervention and persists through
+later flat observations; before that intervention, fresh initials remain blocked. If current fill
+evidence cannot distinguish those cases, the cancellation wave refreshes the fill tail after its
+account observation and preserves manual orders if proof remains unavailable. Graceful-stop
+adds to held positions retain their policy semantics.
 
 ## Code And Tests
 
@@ -76,3 +107,37 @@ authoritative refresh; unrelated scopes remain available.
 
 User-facing behavior and configuration are documented in `../../equity_hard_stop_loss.md` and
 `../../equity_hard_stop_loss_cooldown_contracts.md`.
+
+### Live balance input recovery
+
+A numeric current raw/sizing balance that is non-finite or non-positive, or an invalid balance
+in the required reconstructed HSL history, is explicitly unavailable for live risk evaluation.
+Python keeps the process alive and refreshes authoritative account/fill state instead of consuming
+the full-bot restart budget. Recovery has its own finite budget: `live.risk_input_max_attempts`
+(default 10, integer >= 1) counts failed attempts, including the first failure, per episode.
+The final allowed failure raises a terminal `FatalBotException`, so cleanup runs and the process
+stops without another full-bot restart. A value of 1 stops at the first failure. There is no
+unlimited setting. Startup remains unready; runtime ordinary planning waits. No balance is
+clamped to a positive substitute, no required history is discarded, and HSL remains enabled.
+Malformed configuration, payload types/shapes, and unrelated validation errors retain their strict
+failure policy. Rust and individual HSL sample consumers keep their positive-balance guards.
+
+Retry delays grow from 5 seconds to 60 seconds for current balances and 300 seconds for history.
+Account refresh, shutdown observation, and independently ready protection continue between replay
+attempts. Scoped cooldown replays observe the same deadline so protective supervision cannot
+bypass the backoff. History balance validation occurs before clearing live protection; existing
+latched/cooldown state is retained on this failure. Protection may act only with its own required
+inputs; the panic planner also requires positive current balances. Deferral does not fabricate
+replacement strategy orders or new HSL state.
+
+`risk.input.status` reports the cause, bounded balance values (non-finite values are `null`), first
+invalid historical timestamp/value, invalid-row count, replay window, failed-attempt count, limit
+and delay. Every failed attempt emits a warning; exhaustion emits an error with
+`action=stop_without_restart` and zero retry delay. The first and final failures include bounded
+frame chains without raw exception text, payloads, or locals. Polls during backoff spend no attempt
+and emit no repeated warning. Changed reasons share the same count and deadline; they cannot renew
+the budget. Successful startup initialization, a successful runtime execution operation, or a
+successful active HSL supervisor pass emits recovery and resets the episode. Passing the early
+runtime precheck alone does not reset it, since later risk consumers can still reject inputs.
+Unrelated readiness failures keep their existing policy. This state is not persisted across
+process restarts; exhausted recovery never asks the outer restart loop to create a new instance.

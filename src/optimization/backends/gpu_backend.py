@@ -27,6 +27,7 @@ from optimization.backend_shared import (
 )
 from optimization.bounds import Bound, enforce_bounds
 from optimization.callback import build_pymoo_record_entry
+from optimization.evaluation_contract import CONTRACT_KEY, recorded_evaluation_contract
 from optimization.fine_tune_anchors import ANCHOR_GENE_KEY, get_anchor_plan
 from optimization.gpu.metric_registry import (
     reject_configured_exact_only_gpu_metrics,
@@ -199,6 +200,8 @@ _SINGLE_COIN_EXPOSURE_BOUND_SUFFIXES = {
 }
 
 _SINGLE_COIN_UNSTUCK_BOUND_SUFFIXES = {
+    "unstuck_ema_span_0": "unstuck_ema_span_0",
+    "unstuck_ema_span_1": "unstuck_ema_span_1",
     "unstuck_close_pct": "unstuck_close_pct",
     "unstuck_ema_dist": "unstuck_ema_dist",
     "unstuck_loss_allowance_pct": "unstuck_loss_allowance_pct",
@@ -359,6 +362,7 @@ GPU_CAPABILITIES_DOC = "docs/optimizing.md#deliberate-current-limitations"
 GPU_SUPPORTED_STRATEGY_KINDS = frozenset(GPU_STRATEGY_BOUND_MAPS)
 
 GPU_SUPPORTED_OPTIMIZER_OVERRIDES = {
+    "couple_unstuck_ema_spans",
     "lossless_close_trailing",
     "mirror_short_from_long",
 }
@@ -565,6 +569,7 @@ def validate_gpu_preparation_scope(
             )
             scenario_config = deepcopy(config)
             _apply_config_overrides(scenario_config, overrides)
+            _fix_gpu_suite_shadowed_bounds(config, scenario_config, overrides)
             _validate_gpu_data_independent_scope(
                 scenario_config,
                 allow_suite=True,
@@ -575,22 +580,18 @@ def validate_gpu_preparation_scope(
             import torch as torch_module
         except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency path
             raise ModuleNotFoundError(
-                "Apple MPS GPU optimization requires the optional 'gpu-mps' "
-                "dependencies; install Passivbot with "
-                "`pip install -e '.[full,gpu-mps]'`. "
+                "GPU optimization requires optional GPU dependencies; install "
+                "`pip install -e '.[full,gpu-mps]'` (Apple) or "
+                "`pip install -e '.[full,gpu-cuda]'` (NVIDIA). "
                 f"See {GPU_CAPABILITIES_DOC}."
             ) from exc
-    if not torch_module.backends.mps.is_available():
-        raise RuntimeError(
-            "Apple MPS GPU optimization was requested, but MPS is unavailable in "
-            "this process. Run on Apple Silicon with an MPS-enabled PyTorch build, "
-            "or use optimize.backend='pymoo' or 'deap'. "
-            f"See {GPU_CAPABILITIES_DOC}."
-        )
+    from optimization.gpu.runtime import gpu_device
 
+    runtime = gpu_device(torch_module)
     logging.info(
-        "GPU capability preflight passed | runtime=apple_mps | strategy=%s | "
+        "GPU capability preflight passed | runtime=%s | strategy=%s | "
         "btc_collateral_cap=0 | max_coins_per_scenario=%d",
+        "apple_mps" if runtime == "mps" else "nvidia_cuda",
         strategy_kind,
         MPS_MULTICOIN_MAX_COINS,
     )
@@ -823,6 +824,7 @@ def _build_gpu_nsga2(
         ),
         mutation=PM(
             prob=float(policy["mutation"]["prob"]),
+            prob_var=float(policy["mutation"]["prob_var"]),
             eta=float(policy["mutation"]["eta"]),
         ),
         eliminate_duplicates=bool(policy["eliminate_duplicates"]),
@@ -836,6 +838,7 @@ def _gpu_nsga2_checkpoint_contract(
 
     from optimization.backends.pymoo_backend import (
         _resolve_mutation_prob,
+        _resolve_mutation_prob_per_variable,
         _resolve_pymoo_shared,
     )
 
@@ -856,6 +859,7 @@ def _gpu_nsga2_checkpoint_contract(
         "mutation": {
             "operator": "pm",
             "prob": float(_resolve_mutation_prob(shared, n_params)),
+            "prob_var": float(_resolve_mutation_prob_per_variable(shared, n_params)),
             "eta": float(shared["mutation_eta"]),
         },
         "eliminate_duplicates": bool(shared["eliminate_duplicates"]),
@@ -939,6 +943,7 @@ def _single_scenario_metric_surface(metrics: dict) -> dict:
     return flattened
 
 
+_GPU_SUITE_UNPENALIZED_OBJECTIVES_KEY = "__gpu_suite_unpenalized_objectives__"
 _GPU_SUITE_OBJECTIVES_KEY = "__gpu_suite_objectives__"
 _GPU_SUITE_VIOLATION_KEY = "__gpu_suite_constraint_violation__"
 _GPU_SUITE_METRICS_KEY = "__gpu_suite_metrics__"
@@ -998,6 +1003,9 @@ def _evaluate_gpu_suite_proxies(suite_evaluator, scenario_proxies, candidates) -
         results.append(
             {
                 _GPU_SUITE_OBJECTIVES_KEY: tuple(scored["objectives"]),
+                _GPU_SUITE_UNPENALIZED_OBJECTIVES_KEY: tuple(
+                    scored["unpenalized_objectives"]
+                ),
                 _GPU_SUITE_VIOLATION_KEY: float(scored["constraint_violation"]),
                 _GPU_SUITE_METRICS_KEY: scored["suite_metrics"],
             }
@@ -1017,6 +1025,14 @@ def _suite_limit_metric_value(suite_payload: dict, check: dict):
     if scenario is not None:
         return (entry.get("scenarios") or {}).get(scenario)
     return (entry.get("stats") or {}).get(check.get("reducer") or "mean")
+
+
+def _resolve_max_pending_exact(options: dict, workers: int) -> int:
+    # Keep a complete next validation batch in flight while exact workers drain
+    # the previous batch. A worker-only default can serialize GPU and CPU work.
+    return int(options["max_pending_exact"]) or 2 * max(
+        int(workers), int(options["validate_per_generation"])
+    )
 
 
 def _resolve_options(config: dict) -> dict:
@@ -1153,7 +1169,7 @@ def _resolve_options(config: dict) -> dict:
     exact_workers = int(options["exact_workers"]) or int(
         config.get("optimize", {}).get("n_cpus", 0)
     )
-    effective_pending = int(options["max_pending_exact"]) or exact_workers * 2
+    effective_pending = _resolve_max_pending_exact(options, exact_workers)
     if effective_pending < validations:
         raise ValueError(
             "optimize.gpu.max_pending_exact (or its exact-worker default) must be "
@@ -1626,6 +1642,7 @@ def _validate_dual_multicoin_metrics(
             "peak_recovery_hours_pnl",
             "position_held_days_mean",
             "position_held_days_max",
+            "position_held_time_weighted_mean_hours",
             "position_held_hours_mean",
             "position_held_hours_max",
             "position_unchanged_days_max",
@@ -1766,6 +1783,8 @@ def _validate_gpu_coin_overrides(
             for key in (
                 "enabled",
                 "ema_gating_enabled",
+                "ema_span_0",
+                "ema_span_1",
                 "close_pct",
                 "ema_dist",
                 "loss_allowance_pct",
@@ -1927,10 +1946,10 @@ def _gpu_suite_scenario_inputs(proxy_config: dict, suite_evaluator) -> list[dict
             raise ValueError(
                 f"GPU suite scenario {ctx.label!r} has no prepared datasets"
             )
-        scenario_config = build_config(proxy_config, ctx)
+        scenario_config = deepcopy(build_config(proxy_config, ctx))
+        _fix_gpu_suite_shadowed_bounds(proxy_config, scenario_config, overrides)
         effective_coin_sources = (
-            getattr(ctx, "config", {}).get("backtest", {}).get("coin_sources")
-            or {}
+            getattr(ctx, "config", {}).get("backtest", {}).get("coin_sources") or {}
         )
         for exchange in exchanges:
             scenario_mss = ctx.msss[exchange]
@@ -2108,6 +2127,25 @@ def _gpu_suite_scenario_override_context(
     return fixed_bound_values, fixed_parameters
 
 
+def _fix_gpu_suite_shadowed_bounds(
+    base_config: dict, scenario_config: dict, overrides: dict
+) -> None:
+    """Expose exact-last scenario bounds to scope validation and proxy constructors."""
+    from config.optimize_bounds import flatten_optimize_bounds, set_flat_optimize_bound
+
+    kind = base_config["live"]["strategy_kind"]
+    bounds = scenario_config.get("optimize", {}).get("bounds", {})
+    fixed, _ = _gpu_suite_scenario_override_context(
+        base_config,
+        scenario_config,
+        overrides,
+        flatten_optimize_bounds(bounds, strategy_kind=kind),
+        {},
+    )
+    for key, value in fixed.items():
+        set_flat_optimize_bound(bounds, kind, key, [value, value])
+
+
 def _gpu_suite_enabled(config: dict, evaluator, evaluator_for_pool) -> bool:
     enabled = evaluator_for_pool is not evaluator
     if bool(config.get("backtest", {}).get("suite_enabled")) and not enabled:
@@ -2150,6 +2188,31 @@ def _spearman(left, right) -> float:
         if denominator
         else float("nan")
     )
+
+
+def _proxy_drift_objectives(metric_rows, specs) -> np.ndarray:
+    """Use the same goal direction and suite basis without constraint penalties."""
+    from config.scoring import to_engine_value
+    from config.metrics import canonicalize_metric_name
+
+    return np.asarray(
+        [
+            metrics[_GPU_SUITE_UNPENALIZED_OBJECTIVES_KEY]
+            if _GPU_SUITE_UNPENALIZED_OBJECTIVES_KEY in metrics
+            else [
+                to_engine_value(spec, metrics[canonicalize_metric_name(spec.metric)])
+                for spec in specs
+            ]
+            for metrics in metric_rows
+        ],
+        dtype=np.float64,
+    )
+
+
+def _exact_drift_objectives(payload) -> np.ndarray:
+    return np.asarray(
+        payload["metrics"]["unpenalized_objectives"], dtype=np.float64
+    ).reshape(1, -1)
 
 
 class _ObjectiveScale:
@@ -2586,6 +2649,45 @@ def _select_validation_indices(
             selected.append((index, not is_front, is_front))
             selected_ids.add(index)
     return selected
+
+
+def _seed_proxy_key(candidate: dict) -> tuple:
+    # Match the exact effective proxy input, including inactive parameters.
+    # Canonical vector hashes serve exact-result deduplication and may collapse
+    # inputs that must not share proxy evidence.
+    return tuple(sorted((name, float(value).hex()) for name, value in candidate.items()))
+
+
+def _screen_seed_proxy_candidates(seed_candidates, base_candidate, evaluate_proxy):
+    """Include the population base in the screen without changing seed ranking."""
+    base_key = _seed_proxy_key(base_candidate) if base_candidate is not None else None
+    base_index = next(
+        (i for i, candidate in enumerate(seed_candidates)
+         if _seed_proxy_key(candidate) == base_key),
+        None,
+    ) if base_key is not None else None
+    extra = int(base_key is not None and base_index is None)
+    candidates = seed_candidates + [base_candidate] if extra else seed_candidates
+    rows = evaluate_proxy(candidates)
+    if len(rows) != len(candidates):
+        raise RuntimeError("GPU seed screen received misaligned proxy results")
+    base_row = rows[-1] if extra else (rows[base_index] if base_index is not None else None)
+    return rows[:len(seed_candidates)], base_row, extra
+
+
+def _evaluate_with_seed_proxy_reuse(candidates, cached_rows, evaluate_proxy):
+    """Reuse full-history seed evidence without changing row order or fitness."""
+    keys = [_seed_proxy_key(candidate) for candidate in candidates]
+    missing = [i for i, key in enumerate(keys) if key not in cached_rows]
+    fresh = evaluate_proxy([candidates[i] for i in missing]) if missing else []
+    if len(fresh) != len(missing):
+        raise RuntimeError("GPU seed reuse received misaligned proxy results")
+    fresh_rows = iter(fresh)
+    rows = [
+        deepcopy(cached_rows[key]) if key in cached_rows else next(fresh_rows)
+        for key in keys
+    ]
+    return rows, len(candidates) - len(missing)
 
 
 def _effective_seed_bootstrap_mode(policy: dict, seed_count: int) -> str:
@@ -3119,9 +3221,9 @@ def _gpu_unstuck_checkpoint_contract(config: dict) -> dict:
             ),
             "close_pct": float(unstuck.get("close_pct", 0.0)),
             "ema_dist": float(unstuck.get("ema_dist", 0.0)),
-            "loss_allowance_pct": float(
-                unstuck.get("loss_allowance_pct", 0.0)
-            ),
+            "ema_span_0": unstuck.get("ema_span_0"),
+            "ema_span_1": unstuck.get("ema_span_1"),
+            "loss_allowance_pct": float(unstuck.get("loss_allowance_pct", 0.0)),
             "threshold": float(unstuck.get("threshold", 0.0)),
         }
     return contract
@@ -3337,7 +3439,7 @@ def _checkpoint_signature(
             for name, index, bound in active
         ],
         "scoring": scoring,
-        "version": 3,
+        "version": 5,  # Independent adjusted unstuck EMA state in GPU screening.
     }
     if anchor_plan is not None:
         payload["anchor_plan"] = {
@@ -4104,12 +4206,18 @@ def run_backend(
     reject_configured_exact_only_gpu_metrics(config)
     options = _resolve_options(config)
     validate_optimizer_effective_configs(config)
+    evaluation_contract = recorded_evaluation_contract(config)
     checkpoint = None
     if resume:
         if checkpoint_path is None or not os.path.isfile(checkpoint_path):
             raise FileNotFoundError(f"GPU checkpoint not found: {checkpoint_path}")
         with open(checkpoint_path, "rb") as file:
             checkpoint = pickle.load(file)
+        if checkpoint.get(CONTRACT_KEY) != evaluation_contract:
+            raise ValueError(
+                "GPU checkpoint historical evaluation contract cannot be proven or changed; "
+                "start a fresh run"
+            )
 
     shape = (
         optimization_shape
@@ -4200,6 +4308,15 @@ def run_backend(
             bound_map.update(mapper(multicoin_side, gpu_optimizer_overrides))
     else:
         bound_map = GPU_STRATEGY_BOUND_MAPS[strategy_kind]
+
+    if "couple_unstuck_ema_spans" in gpu_optimizer_overrides:
+        from optimizer_overrides import COUPLED_UNSTUCK_EMA_BOUND_KEYS
+
+        bound_map = {
+            key: value
+            for key, value in bound_map.items()
+            if key not in COUPLED_UNSTUCK_EMA_BOUND_KEYS
+        }
 
     fixed_bound_values, fixed_parameter_overrides = _gpu_fixed_bound_context(
         config,
@@ -4446,11 +4563,14 @@ def run_backend(
             if bound_side not in hsl_search_sides:
                 # Dormant HSL bounds affect neither proxy nor exact Rust.
                 continue
-        if (
-            max_coin_count == 1
-            and bound_key
-            in {f"{side}_n_positions" for side in candidate_search_sides}
+        if max_coin_count == 1 and bound_key in {
+            f"{side}_n_positions" for side in candidate_search_sides
+        }:
+            continue
+        if suite_inputs and all(
+            bound_key in item["fixed_bound_values"] for item in suite_inputs
         ):
+            # Every exact scenario replaces this gene before either evaluator uses it.
             continue
         if bound_key not in bound_map:
             raise ValueError(
@@ -4503,6 +4623,7 @@ def run_backend(
 
     if suite_enabled:
         scenario_proxy_groups = {}
+        prepared_mps_data = {}
         for item in suite_inputs:
             scenario_proxy = (
                 MpsMulticoinProxy
@@ -4521,6 +4642,10 @@ def run_backend(
                 ),
                 needed_metrics=needed_metrics,
                 interrupt_check=interrupt_check,
+                **(
+                    {"prepared_data_cache": prepared_mps_data}
+                    if item["coin_count"] > 1 else {}
+                ),
             )
             item["coin_override_contract"] = getattr(
                 scenario_proxy, "coin_override_contract", {}
@@ -4687,6 +4812,7 @@ def run_backend(
     sampling[0] = normalize_vector(base_vector)
     seed_policy = options["seed_bootstrap"]
     objective_scale = _ObjectiveScale()
+    initial_seed_proxy_rows = {}
     seed_proxy_metrics = None
     seed_proxy_objectives = None
     seed_proxy_violations = None
@@ -4735,8 +4861,15 @@ def run_backend(
             seed_proxy_violations = np.asarray(
                 checkpoint_seed_plan["proxy_violations"], dtype=np.float64
             )
-            objective_scale.fit(seed_proxy_objectives)
-            seed_proxy_scores = objective_scale.score(seed_proxy_objectives)
+            if checkpoint_seed_plan.get("proxy_scores") is None:
+                raise ValueError(
+                    "GPU checkpoint lacks unpenalized seed drift scores; start a fresh run"
+                )
+            seed_proxy_scores = np.asarray(
+                checkpoint_seed_plan["proxy_scores"], dtype=np.float64
+            )
+            if seed_proxy_scores.shape != (len(starting_vectors),):
+                raise ValueError("GPU checkpoint seed drift-score count mismatch")
         seed_bootstrap_contract = deepcopy(checkpoint_seed_contract)
         _validate_seed_bootstrap_plan(
             starting_vectors,
@@ -4912,6 +5045,17 @@ def run_backend(
         algorithm = checkpoint["algorithm"]
         seed = int(checkpoint.get("seed", seed))
         generation = int(checkpoint["generation"])
+        # The surrounding evaluation contract binds this evidence to the data,
+        # proxy implementation, metrics, overrides, and search configuration.
+        if generation == 0:
+            initial_seed_proxy_rows = dict(
+                checkpoint.get("initial_seed_proxy_rows", {})
+            )
+            cache_bound = population_size + int(seed_policy["max_exact"])
+            if len(initial_seed_proxy_rows) > cache_bound:
+                raise RuntimeError(
+                    "GPU checkpoint seed proxy cache exceeds its population bound"
+                )
         exact_done = int(checkpoint["exact_done"])
         seed_exact_done = int(checkpoint.get("seed_exact_done", 0))
         seed_bootstrap_complete = bool(
@@ -5027,7 +5171,7 @@ def run_backend(
         "checkpointing": 0.0,
     }
     workers = int(options["exact_workers"]) or int(config["optimize"]["n_cpus"])
-    max_pending = int(options["max_pending_exact"]) or workers * 2
+    max_pending = _resolve_max_pending_exact(options, workers)
     if workers <= 0:
         raise ValueError("GPU exact validation requires at least one CPU worker")
     if max_pending <= 0:
@@ -5067,6 +5211,9 @@ def run_backend(
                 "selections": seed_bootstrap_selections,
                 "population_indices": seed_population_indices,
                 "proxy_metrics": seed_proxy_metrics,
+                "proxy_scores": (
+                    None if seed_proxy_scores is None else seed_proxy_scores.tolist()
+                ),
                 "proxy_objectives": (
                     None
                     if seed_proxy_objectives is None
@@ -5079,6 +5226,7 @@ def run_backend(
                 ),
             }
         return {
+            CONTRACT_KEY: deepcopy(evaluation_contract),
             "signature": signature,
             "algorithm": algorithm,
             "generation": generation,
@@ -5091,6 +5239,7 @@ def run_backend(
             ),
             "seed_bootstrap_contract": deepcopy(seed_bootstrap_contract),
             "seed_bootstrap_plan": seed_plan,
+            "initial_seed_proxy_rows": initial_seed_proxy_rows,
             "anchor_plan": deepcopy(get_anchor_plan(config)),
             "completed_hashes": sorted(completed_hashes),
             "scale_median": objective_scale.median,
@@ -5162,19 +5311,27 @@ def run_backend(
             [normalize_vector(vector) for vector in starting_vectors],
             dtype=np.float64,
         )
-        proxy_metric_rows = evaluate_proxy(parameter_dicts(seed_rows))
+        seed_candidates = parameter_dicts(seed_rows)
+        base_candidate = (
+            parameter_dicts(sampling[:1])[0] if not halving_policy["enabled"] else None
+        )
+        proxy_metric_rows, base_proxy_row, extra_base = _screen_seed_proxy_candidates(
+            seed_candidates, base_candidate, evaluate_proxy
+        )
         seed_proxy_seconds = time.perf_counter() - seed_proxy_started
         logging.info(
-            "GPU seed proxy screen complete | seeds=%d wall=%.2fs rate=%.1f/s",
+            "GPU seed proxy screen complete | seeds=%d wall=%.2fs rate=%.1f/s base_extra=%d",
             len(starting_vectors),
             seed_proxy_seconds,
-            len(starting_vectors) / max(seed_proxy_seconds, 1.0e-9),
+            (len(starting_vectors) + extra_base) / max(seed_proxy_seconds, 1.0e-9),
+            extra_base,
         )
         seed_proxy_objectives, seed_proxy_violations = proxy_fitness(
             proxy_metric_rows
         )
-        objective_scale.fit(seed_proxy_objectives)
-        seed_proxy_scores = objective_scale.score(seed_proxy_objectives)
+        seed_drift_objectives = _proxy_drift_objectives(proxy_metric_rows, specs)
+        objective_scale.fit(seed_drift_objectives)
+        seed_proxy_scores = objective_scale.score(seed_drift_objectives)
         seed_bootstrap_selections = _select_seed_bootstrap_indices(
             seed_proxy_objectives,
             seed_proxy_scores,
@@ -5190,9 +5347,20 @@ def run_backend(
             seed_proxy_violations,
             count=min(len(starting_vectors), population_size - 1),
         )
-        # Keep only compact objective arrays and the selected exact-validation
-        # metric rows. Full per-seed metrics and normalized screen inputs can be
-        # substantial for large seed archives.
+        if not halving_policy["enabled"]:
+            # Exact preference can reorder the initial population, so retain
+            # the union of both bounded selection sets, never the whole archive.
+            reuse_indices = set(seed_population_indices) | set(seed_proxy_metrics)
+            initial_seed_proxy_rows[_seed_proxy_key(base_candidate)] = base_proxy_row
+            initial_seed_proxy_rows.update(
+                {
+                    _seed_proxy_key(seed_candidates[index]): proxy_metric_rows[index]
+                    for index in reuse_indices
+                }
+            )
+        del seed_candidates
+        # Retain bounded selected metric rows and compact objective arrays;
+        # release the full archive's metrics and normalized screen inputs.
         del proxy_metric_rows
         del seed_rows
         seed_screen_complete = True
@@ -5277,9 +5445,7 @@ def run_backend(
                         proxy_violation = float(seed_proxy_violations[source_index])
                         exact_score = float(
                             objective_scale.score(
-                                np.asarray(payload["F"], dtype=np.float64).reshape(
-                                    1, -1
-                                )
+                                _exact_drift_objectives(payload)
                             )[0]
                         )
                         classification_mismatch = (
@@ -5453,7 +5619,7 @@ def run_backend(
                 result_processing_started = time.perf_counter()
             PymooAsyncRecordingRunner._raise_if_worker_failure(payload, exact_done)
             exact_score = float(
-                objective_scale.score(np.asarray(payload["F"]).reshape(1, -1))[0]
+                objective_scale.score(_exact_drift_objectives(payload))[0]
             )
             classification_mismatch = _constraint_classification_mismatch(
                 proxy_violation, payload
@@ -5570,6 +5736,7 @@ def run_backend(
                     )
                     proxy_profile_records.append(record)
 
+            seed_proxy_reused = 0
             if halving_policy["enabled"]:
                 (
                     metric_rows,
@@ -5586,7 +5753,16 @@ def run_backend(
                     stage_callback=capture_halving_profile,
                 )
             else:
-                metric_rows = evaluate_proxy(proxy_candidates)
+                if initial_seed_proxy_rows:
+                    metric_rows, seed_proxy_reused = _evaluate_with_seed_proxy_reuse(
+                        proxy_candidates, initial_seed_proxy_rows, evaluate_proxy
+                    )
+                    logging.info(
+                        "GPU initial population seed reuse | reused=%d evaluated=%d",
+                        seed_proxy_reused, len(proxy_candidates) - seed_proxy_reused,
+                    )
+                else:
+                    metric_rows = evaluate_proxy(proxy_candidates)
                 proxy_objectives, proxy_violations = proxy_fitness(metric_rows)
                 full_rung_indices = np.arange(len(rows), dtype=np.int64)
                 halving_trace = []
@@ -5596,7 +5772,7 @@ def run_backend(
             proxy_evaluations += (
                 sum(int(item["candidate_count"]) for item in halving_trace)
                 if halving_trace
-                else len(rows)
+                else len(rows) - seed_proxy_reused
             )
             if halving_trace:
                 logging.info(
@@ -5610,8 +5786,14 @@ def run_backend(
                     len(rows),
                 )
             if objective_scale.median is None:
-                objective_scale.fit(proxy_objectives[full_rung_indices])
-            proxy_scores = objective_scale.score(proxy_objectives)
+                objective_scale.fit(
+                    _proxy_drift_objectives(
+                        [metric_rows[i] for i in full_rung_indices], specs
+                    )
+                )
+            proxy_scores = objective_scale.score(
+                _proxy_drift_objectives(metric_rows, specs)
+            )
             population.set("F", proxy_objectives)
             population.set(
                 "G",
@@ -5628,6 +5810,7 @@ def run_backend(
             )
             generation_in_progress = False
             generation += 1
+            initial_seed_proxy_rows.clear()
             # PyTorch MPS may consume KeyboardInterrupt while waiting for a
             # Metal dispatch. Finish the in-progress ask/tell transaction, then
             # honor the latched signal before exact work is submitted. This is
@@ -5707,7 +5890,7 @@ def run_backend(
                 generation_wall_seconds = (
                     time.perf_counter() - generation_profile_started
                 )
-                if not halving_policy["enabled"]:
+                if not halving_policy["enabled"] and seed_proxy_reused < len(rows):
                     proxy_profile_records = [
                         deepcopy(getattr(item, "last_profile", {}))
                         for item in profile_proxies
@@ -5726,6 +5909,7 @@ def run_backend(
                     "generation",
                     generation=generation,
                     population_size=len(rows),
+                    seed_proxy_reused=seed_proxy_reused,
                     successive_halving=halving_trace,
                     full_history_candidate_count=len(full_rung_indices),
                     proxy_profiles=proxy_profile_records,

@@ -1087,11 +1087,11 @@ async def test_orchestrator_ema_bundle_tracks_missing_required_forager_ema_by_si
 
         def _strategy_params_to_rust_dict(self, pside, symbol):
             return {
-                "ema_span_0": 10.0,
-                "ema_span_1": 20.0,
                 "volatility_ema_span_1m": 5.0,
                 "volatility_ema_span_1h": 0.0,
                 "entry": {
+                    "ema_span_0": 10.0,
+                    "ema_span_1": 20.0,
                     "threshold_volatility_1m_weight": 0.0,
                     "retracement_volatility_1m_weight": 0.0,
                 },
@@ -1100,6 +1100,11 @@ async def test_orchestrator_ema_bundle_tracks_missing_required_forager_ema_by_si
                     "retracement_volatility_1m_weight": 0.0,
                 },
             }
+
+        def bp(self, pside, key, symbol):
+            if key == "unstuck_enabled":
+                return False
+            raise KeyError(key)
 
         def bot_value(self, pside, key):
             if key == "forager_volume_ema_span_1m":
@@ -1223,11 +1228,11 @@ async def test_orchestrator_ema_bundle_marks_flat_forager_candidate_required_m1_
 
         def _strategy_params_to_rust_dict(self, pside, symbol):
             return {
-                "ema_span_0": 10.0,
-                "ema_span_1": 20.0,
                 "volatility_ema_span_1m": 5.0,
                 "volatility_ema_span_1h": 0.0,
                 "entry": {
+                    "ema_span_0": 10.0,
+                    "ema_span_1": 20.0,
                     "threshold_volatility_1m_weight": 1.0,
                     "retracement_volatility_1m_weight": 0.0,
                     "threshold_volatility_1h_weight": 0.0,
@@ -1240,6 +1245,11 @@ async def test_orchestrator_ema_bundle_marks_flat_forager_candidate_required_m1_
                     "retracement_volatility_1h_weight": 0.0,
                 },
             }
+
+        def bp(self, pside, key, symbol):
+            if key == "unstuck_enabled":
+                return False
+            raise KeyError(key)
 
         def bot_value(self, pside, key):
             if key in {"forager_volume_ema_span_1m", "forager_volatility_ema_span_1m"}:
@@ -1421,11 +1431,11 @@ async def test_orchestrator_ema_bundle_projection_context_summary_is_debug(
 
         def _strategy_params_to_rust_dict(self, pside, symbol):
             return {
-                "ema_span_0": 10.0,
-                "ema_span_1": 20.0,
                 "volatility_ema_span_1m": 5.0,
                 "volatility_ema_span_1h": 0.0,
                 "entry": {
+                    "ema_span_0": 10.0,
+                    "ema_span_1": 20.0,
                     "threshold_volatility_1m_weight": 1.0,
                     "retracement_volatility_1m_weight": 0.0,
                     "threshold_volatility_1h_weight": 0.0,
@@ -1438,6 +1448,11 @@ async def test_orchestrator_ema_bundle_projection_context_summary_is_debug(
                     "retracement_volatility_1h_weight": 0.0,
                 },
             }
+
+        def bp(self, pside, key, symbol):
+            if key == "unstuck_enabled":
+                return False
+            raise KeyError(key)
 
         def bot_value(self, pside, key):
             if key == "forager_volume_ema_span_1m":

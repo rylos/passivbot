@@ -10,6 +10,8 @@ import time
 import numpy as np
 
 from config.shared_bot import flatten_shared_bot_side
+from optimizer_overrides import unstuck_ema_spans_coupled
+from optimization.gpu.runtime import checkpoint_runtime, gpu_device, synchronize
 from optimization.gpu.metric_registry import (
     BTC_INTRADAY_RISK_METRICS,
     ENTRY_INTERVAL_METRICS,
@@ -17,6 +19,9 @@ from optimization.gpu.metric_registry import (
     HARD_STOP_PROXY_METRICS,
 )
 from optimization.gpu.model import (
+    UNSTUCK_EMA_PARAM_KEYS,
+    EMA_ANCHOR_COIN_OVERRIDE_UNSTUCK_EMA_START_COLUMN,
+    TRAILING_MARTINGALE_COIN_OVERRIDE_UNSTUCK_EMA_START_COLUMN,
     EMA_ANCHOR_COIN_OVERRIDE_ALLOWANCE_PCT_COLUMN,
     EMA_ANCHOR_COIN_OVERRIDE_COLS,
     EMA_ANCHOR_COIN_OVERRIDE_COOLDOWN_COLUMN,
@@ -29,6 +34,11 @@ from optimization.gpu.model import (
     GPU_STRATEGY_PARAM_KEYS,
     HSL_COIN_OVERRIDE_PATHS,
     MPS_MULTICOIN_MAX_COINS,
+    MPS_TM_MULTICOIN_CHUNK_BARS,
+    MPS_TM_SINGLE_COIN_CHUNK_BARS,
+    MPS_TM_SINGLE_COIN_CHUNK_CANDIDATES,
+    MPS_TM_MULTICOIN_CHUNK_CANDIDATE_STEPS,
+    MPS_TM_MULTICOIN_CHUNK_CANDIDATES,
     ProxyMarket,
     ProxyRun,
     TRAILING_MARTINGALE_COIN_OVERRIDE_ALLOWANCE_PCT_COLUMN,
@@ -87,6 +97,8 @@ CORE_OUTPUT_KEYS = {
     "max_dd",
     "held_max_ms",
     "held_sum_ms",
+    "held_sum_squared_hours",
+    "gap_sum_squared_hours",
     "held_count",
     "position_unchanged_max_ms",
     "gap_hist",
@@ -340,8 +352,12 @@ def _add_gpu_runner_profile(
     if dispatch_specialization is not None:
         profile["dispatch_specializations"].append(dict(dispatch_specialization))
     profile["dispatch_count"] += dispatch_count
-    profile["cold_dispatch_count"] += dispatch_count if cold else 0
-    profile["warm_dispatch_count"] += 0 if cold else dispatch_count
+    cold_dispatches = (
+        int(cold) if "temporal_chunk_bars" in runner_profile
+        else dispatch_count if cold else 0
+    )
+    profile["cold_dispatch_count"] += cold_dispatches
+    profile["warm_dispatch_count"] += dispatch_count - cold_dispatches
     runner_steps = int(getattr(runner, "n", 0))
     if effective_candidate_steps is None:
         candidate_steps = batch_size * runner_steps
@@ -356,12 +372,20 @@ def _add_gpu_runner_profile(
         candidate_steps = int(
             np.clip(candidate_steps_array, 0, runner_steps).sum()
         )
+    # Temporal dispatches partition one replay; they do not repeat its history.
+    candidate_steps = int(runner_profile.get(
+        "kernel_candidate_steps", candidate_steps * dispatch_count
+    ))
     profile["kernel_candidate_bars"] += (
-        candidate_steps
-        * int(getattr(runner, "n_coins", 1))
-        * int(side_count)
-        * dispatch_count
+        candidate_steps * int(getattr(runner, "n_coins", 1)) * int(side_count)
     )
+    if "temporal_chunk_bars" in runner_profile:
+        profile.setdefault("temporal_dispatches", []).append({
+            key: runner_profile[key] for key in (
+                "dispatch_count", "temporal_chunk_bars", "max_dispatch_seconds",
+                "replay_state_bytes_per_candidate", "threads_per_threadgroup",
+            )
+        })
     timings = profile["timings_seconds"]
     timings["candidate_packing"] += float(
         runner_profile.get("cpu_pack_seconds", 0.0)
@@ -699,6 +723,64 @@ def _single_coin_candle_interval_minutes(backtest_params: dict) -> int:
     return int(interval)
 
 
+def _mps_single_coin_dispatch_plan(
+    strategy_kind: str, requested_batch_size: int, *, n_bars: int,
+    n_sides: int, max_candidate_bars: int,
+) -> tuple[bool, int, int]:
+    temporal_chunking = (
+        strategy_kind == "trailing_martingale"
+        and n_sides == 2
+        and n_bars > MPS_TM_SINGLE_COIN_CHUNK_BARS
+        and n_bars * n_sides * min(
+            requested_batch_size, MPS_TM_SINGLE_COIN_CHUNK_CANDIDATES
+        ) > max_candidate_bars
+    )
+    dispatch_history = (
+        min(MPS_TM_SINGLE_COIN_CHUNK_BARS, max(1, max_candidate_bars // n_sides))
+        if temporal_chunking else n_bars
+    )
+    batch = _mps_dispatch_batch_size(
+        min(requested_batch_size, MPS_TM_SINGLE_COIN_CHUNK_CANDIDATES)
+        if temporal_chunking else requested_batch_size,
+        n_bars=dispatch_history, n_sides=n_sides,
+        max_candidate_bars=max_candidate_bars,
+    )
+    return temporal_chunking, batch, dispatch_history
+
+
+def _mps_multicoin_dispatch_plan(
+    strategy_kind: str, requested_batch_size: int, *, n_bars: int, n_coins: int,
+    n_sides: int, max_candidate_bars: int,
+) -> tuple[bool, int, int]:
+    temporal_chunking = (
+        strategy_kind == "trailing_martingale"
+        and n_sides == 1
+        and n_bars > MPS_TM_MULTICOIN_CHUNK_BARS
+        and n_bars * n_coins * min(
+            requested_batch_size, MPS_TM_MULTICOIN_CHUNK_CANDIDATES
+        ) > max_candidate_bars
+    )
+    dispatch_candidates = (
+        min(requested_batch_size, MPS_TM_MULTICOIN_CHUNK_CANDIDATES)
+        if temporal_chunking else requested_batch_size
+    )
+    dispatch_history = (
+        min(
+            n_bars, MPS_TM_MULTICOIN_CHUNK_BARS,
+            MPS_TM_MULTICOIN_CHUNK_CANDIDATE_STEPS // dispatch_candidates,
+            max(1, max_candidate_bars // n_coins),
+        ) if temporal_chunking else n_bars
+    )
+    dispatch_batch_size = _mps_dispatch_batch_size(
+        dispatch_candidates,
+        n_bars=dispatch_history,
+        n_coins=n_coins,
+        n_sides=n_sides,
+        max_candidate_bars=max_candidate_bars,
+    )
+    return temporal_chunking, dispatch_batch_size, dispatch_history
+
+
 def _log_mps_dispatch_cap(
     *,
     requested_batch_size: int,
@@ -753,6 +835,7 @@ _DUAL_SIDE_MULTICOIN_INTRADAY_CUTOFF_METRICS = {
     "peak_recovery_days_pnl",
     "peak_recovery_hours_pnl",
     "position_held_days_mean",
+    "position_held_time_weighted_mean_hours",
     "position_held_hours_mean",
     "positions_held_per_day",
     "pnl_ratio_long_short",
@@ -1063,6 +1146,7 @@ def _unstuck_params(bot: dict) -> dict[str, float]:
         "unstuck_ema_dist": float(bot["unstuck_ema_dist"]),
         "unstuck_loss_allowance_pct": float(bot["unstuck_loss_allowance_pct"]),
         "unstuck_threshold": float(bot["unstuck_threshold"]),
+        **{key: float(bot[key]) for key in UNSTUCK_EMA_PARAM_KEYS},
     }
 
 
@@ -1232,20 +1316,14 @@ def _require_supported_multicoin_valid_tails(
         (candle_indices >= np.asarray(starts, dtype=np.int64)[None, :])
         & (candle_indices <= np.asarray(tails, dtype=np.int64)[None, :])
     )
-    actual_coverage = np.any(within_declared_window & actual_valid, axis=1)
-    missing = np.flatnonzero(
-        np.any(within_declared_window, axis=1) & ~actual_coverage
-    )
-    for candle_index in missing:
-        declared = within_declared_window[candle_index]
-        raw_hlc = np.asarray(values[candle_index, declared, :3], dtype=np.float64)
-        if bool(np.all(np.isnan(raw_hlc))):
-            continue
+    missing = np.argwhere(within_declared_window & ~actual_valid)
+    if missing.size:
+        candle_index, coin = (int(value) for value in missing[0])
         raise ValueError(
-            "GPU multicoin proxy only supports an all-invalid internal candle "
-            "when every declared coin's raw H/L/C is NaN; infinities, finite but "
-            "non-positive or float32-unrepresentable values remain fail-closed; "
-            f"candle_index={int(candle_index)}, valid_windows={windows}"
+            "GPU multicoin proxy requires contiguous finite positive float32 H/L/C "
+            "inside every declared coin window; non-finite, finite but non-positive "
+            "or float32-unrepresentable values remain fail-closed; "
+            f"coin index {coin}, candle_index={candle_index}, valid_windows={windows}"
         )
 
 
@@ -1306,7 +1384,7 @@ def _require_exact_safe_proxy_candles(
     last_valid_indices,
     require_positive_high_low: bool,
 ) -> None:
-    """Allow exact balance-only gaps, but reject finite unmodeled prices."""
+    """Reject missing valuation inputs in each exposure-eligible coin window."""
 
     values = np.asarray(hlcvs)
     if values.ndim != 3 or values.shape[2] < 3:
@@ -1322,7 +1400,6 @@ def _require_exact_safe_proxy_candles(
         last = min(int(last_valid_indices[coin]), values.shape[0] - 1)
         if first > last:
             continue
-        raw_hlc = np.asarray(values[first : last + 1, coin, :3], dtype=np.float64)
         packed_hlc = packed[first : last + 1, coin]
         packed_valid = (
             np.all(np.isfinite(packed_hlc), axis=1)
@@ -1332,13 +1409,11 @@ def _require_exact_safe_proxy_candles(
             packed_valid &= (packed_hlc[:, 0] > 0.0) & (
                 packed_hlc[:, 1] > 0.0
             )
-        exact_balance_only = np.all(np.isnan(raw_hlc), axis=1)
-        unsafe = np.flatnonzero(~(packed_valid | exact_balance_only))
+        unsafe = np.flatnonzero(~packed_valid)
         if unsafe.size:
             candle_index = first + int(unsafe[0])
             raise ValueError(
-                "MPS proxy only supports internal "
-                "invalid candles whose raw H/L/C values are all NaN; "
+                "MPS proxy requires contiguous valid internal candles; all-NaN, "
                 "infinite, finite but non-positive, partially invalid, or float32-"
                 "unrepresentable prices remain fail-closed; "
                 f"coin index {coin}, invalid candle at {candle_index}"
@@ -1674,10 +1749,18 @@ def _combine_hedged_multicoin_outputs(
     combined["max_dd"] = (long["max_dd"] + short["max_dd"]).clamp(max=1.0)
     combined["held_max_ms"] = long["held_max_ms"].maximum(short["held_max_ms"])
     combined["held_sum_ms"] = long["held_sum_ms"] + short["held_sum_ms"]
+    combined["held_sum_squared_hours"] = (
+        long["held_sum_squared_hours"] + short["held_sum_squared_hours"]
+    )
     combined["held_count"] = long["held_count"] + short["held_count"]
     combined["position_unchanged_max_ms"] = long[
         "position_unchanged_max_ms"
     ].maximum(short["position_unchanged_max_ms"])
+    # Separate directional streams cannot reconstruct coalesced portfolio gaps.
+    # This merged topology remains excluded from fill-gap scoring by the backend.
+    combined["gap_sum_squared_hours"] = (
+        long["gap_sum_squared_hours"] + short["gap_sum_squared_hours"]
+    )
     combined["gap_hist"] = long["gap_hist"] + short["gap_hist"]
     combined["gap_max_ms"] = long["gap_max_ms"].maximum(short["gap_max_ms"])
     combined["first_fill_ts"] = _nan_min(
@@ -1743,6 +1826,45 @@ def _combine_hedged_multicoin_outputs(
     return combined
 
 
+def _candidate_parameter_matrix(
+    candidates: list[dict],
+    param_keys,
+    base_params: dict,
+    *,
+    static_overrides: dict | None = None,
+    couple_unstuck_emas: bool = False,
+) -> np.ndarray:
+    """Pack columns directly, preserving base < candidate < fixed override precedence."""
+    if not candidates:
+        return np.asarray([], dtype=np.float64)
+    matrix = np.empty(
+        (len(candidates), len(base_params) * len(param_keys)), dtype=np.float64
+    )
+    for side_index, (side, base) in enumerate(base_params.items()):
+        overrides = (static_overrides or {}).get(side, {})
+        for column, key in enumerate(param_keys):
+            source_key = (
+                key.removeprefix("unstuck_")
+                if couple_unstuck_emas
+                and key in ("unstuck_ema_span_0", "unstuck_ema_span_1")
+                else key
+            )
+            target = side_index * len(param_keys) + column
+            if source_key in overrides:
+                matrix[:, target] = float(overrides[source_key])
+            else:
+                candidate_key = f"{side}_{source_key}"
+                matrix[:, target] = [
+                    float(
+                        candidate[candidate_key]
+                        if candidate_key in candidate
+                        else base[source_key]
+                    )
+                    for candidate in candidates
+                ]
+    return matrix
+
+
 class MpsSingleCoinProxy:
     """Batched directional screening proxy for supported single-coin strategies."""
 
@@ -1766,13 +1888,11 @@ class MpsSingleCoinProxy:
             ModuleNotFoundError
         ) as exc:  # pragma: no cover - optional dependency path
             raise ModuleNotFoundError(
-                "GPU optimization requires the optional 'gpu-mps' dependencies; "
-                "install Passivbot with `pip install -e '.[full,gpu-mps]'`"
+                "GPU optimization requires the optional GPU dependencies; "
+                "install Passivbot with `pip install -e '.[full,gpu-mps]'` (Apple) "
+                "or `pip install -e '.[full,gpu-cuda]'` (NVIDIA)"
             ) from exc
-        if not torch.backends.mps.is_available():
-            raise RuntimeError(
-                "GPU optimization requested but Apple MPS is unavailable in this process"
-            )
+        gpu_device(torch)
 
         from optimization.gpu.metrics import (
             BTC_INTRADAY_RISK_METRICS,
@@ -1858,16 +1978,17 @@ class MpsSingleCoinProxy:
         if not any(self.enabled.values()):
             raise ValueError("GPU foundation requires at least one enabled side")
         enabled_side_count = sum(self.enabled.values())
-        self.dispatch_batch_size = _mps_dispatch_batch_size(
-            self.batch_size,
-            n_bars=len(hlcvs),
-            n_sides=enabled_side_count,
-            max_candidate_bars=self.max_dispatch_candidate_bars,
+        self.temporal_chunking, self.dispatch_batch_size, dispatch_history = (
+            _mps_single_coin_dispatch_plan(
+                self.strategy_kind, self.batch_size, n_bars=len(hlcvs),
+                n_sides=enabled_side_count,
+                max_candidate_bars=self.max_dispatch_candidate_bars,
+            )
         )
         _log_mps_dispatch_cap(
             requested_batch_size=self.batch_size,
             dispatch_batch_size=self.dispatch_batch_size,
-            n_bars=len(hlcvs),
+            n_bars=dispatch_history,
             n_coins=1,
             n_sides=enabled_side_count,
             max_candidate_bars=self.max_dispatch_candidate_bars,
@@ -1886,6 +2007,7 @@ class MpsSingleCoinProxy:
                 signal_mode, enabled_side_count=sum(self.enabled.values())
             )
         hsl_panic_market = {}
+        self.couple_unstuck_emas = unstuck_ema_spans_coupled(config)
         self.base_params = {}
         configured_total_wallet_exposure_limits = {
             side: float(bot["total_wallet_exposure_limit"])
@@ -1996,6 +2118,8 @@ class MpsSingleCoinProxy:
                 else None
             ),
         )
+
+        self.checkpoint_contract.update(checkpoint_runtime(torch))
 
         self.base_total_wallet_exposure_limits = {
             side: configured_total_wallet_exposure_limits[side]
@@ -2131,6 +2255,9 @@ class MpsSingleCoinProxy:
             runner_kwargs["hsl_diagnostics_enabled"] = _hsl_diagnostics_needed(
                 self.needed_metrics
             )
+        if self.temporal_chunking:
+            runner_kwargs["max_dispatch_candidate_bars"] = self.max_dispatch_candidate_bars
+            runner_kwargs["interrupt_check"] = self.interrupt_check
         runner_kwargs["hsl_enabled"] = bool(hsl_enabled_sides)
         self.runner = runner_cls(
             self.market,
@@ -2147,24 +2274,13 @@ class MpsSingleCoinProxy:
             )
 
     def _parameter_matrix(self, candidates: list[dict]) -> np.ndarray:
-        rows = []
-        for candidate in candidates:
-            row = []
-            for side in ("long", "short"):
-                merged = dict(self.base_params[side])
-                merged.update(
-                    {
-                        key.removeprefix(f"{side}_"): value
-                        for key, value in candidate.items()
-                        if key.startswith(f"{side}_")
-                    }
-                )
-                merged.update(
-                    getattr(self, "static_coin_override_params", {}).get(side, {})
-                )
-                row.extend(float(merged[key]) for key in self.param_keys)
-            rows.append(row)
-        return np.asarray(rows, dtype=np.float64)
+        return _candidate_parameter_matrix(
+            candidates,
+            self.param_keys,
+            {side: self.base_params[side] for side in ("long", "short")},
+            static_overrides=getattr(self, "static_coin_override_params", None),
+            couple_unstuck_emas=getattr(self, "couple_unstuck_emas", False),
+        )
 
     def recent_window_for_history_fraction(
         self, history_fraction: float
@@ -2252,7 +2368,8 @@ class MpsSingleCoinProxy:
         )
         dispatch_batch_size = (
             int(getattr(self, "dispatch_batch_size", self.batch_size))
-            if end_step is None and not bounded_history
+            if (end_step is None and not bounded_history)
+            or getattr(self, "temporal_chunking", False)
             else _mps_dispatch_batch_size(
                 self.batch_size,
                 n_bars=effective_candle_count,
@@ -2320,7 +2437,7 @@ class MpsSingleCoinProxy:
                 output, self.needed_metrics
             )
             if profile is not None:
-                torch.mps.synchronize()
+                synchronize()
                 profile["timings_seconds"]["metric_reduction"] += (
                     time.perf_counter() - stage_started
                 )
@@ -2528,6 +2645,18 @@ def _build_multicoin_ema_coin_overrides(
         ):
             if patch_key in unstuck_patch:
                 matrix[coin_index, offset] = float(effective_bot[bot_key])
+        for offset, key in enumerate(UNSTUCK_EMA_PARAM_KEYS):
+            column = EMA_ANCHOR_COIN_OVERRIDE_UNSTUCK_EMA_START_COLUMN + offset
+            strategy_key = key.removeprefix("unstuck_")
+            if unstuck_ema_spans_coupled(config):
+                # Inherited spans stay NaN so each candidate supplies its own
+                # strategy value; only actual strategy coin pins remain static.
+                matrix[coin_index, column] = matrix[
+                    coin_index,
+                    EMA_ANCHOR_COIN_OVERRIDE_STRATEGY_KEYS.index(strategy_key),
+                ]
+            elif strategy_key in unstuck_patch:
+                matrix[coin_index, column] = float(effective_bot[key])
         _pack_multicoin_hsl_overrides(
             matrix,
             row=coin_index,
@@ -2671,6 +2800,20 @@ def _build_multicoin_tm_coin_overrides(
         ):
             if patch_key in unstuck_patch:
                 matrix[coin_index, offset] = float(effective_bot[bot_key])
+        for offset, key in enumerate(UNSTUCK_EMA_PARAM_KEYS):
+            column = TRAILING_MARTINGALE_COIN_OVERRIDE_UNSTUCK_EMA_START_COLUMN + offset
+            strategy_key = key.removeprefix("unstuck_")
+            if unstuck_ema_spans_coupled(config):
+                # Inherited spans stay NaN so each candidate supplies its own
+                # strategy value; only actual strategy coin pins remain static.
+                matrix[coin_index, column] = matrix[
+                    coin_index,
+                    TRAILING_MARTINGALE_COIN_OVERRIDE_PATHS.index(
+                        (strategy_key, ("entry", strategy_key))
+                    ),
+                ]
+            elif strategy_key in unstuck_patch:
+                matrix[coin_index, column] = float(effective_bot[key])
         _pack_multicoin_hsl_overrides(
             matrix,
             row=coin_index,
@@ -2732,6 +2875,7 @@ def _build_single_coin_override_params(
                 ),
             }
         )
+        unstuck_ema_start = EMA_ANCHOR_COIN_OVERRIDE_UNSTUCK_EMA_START_COLUMN
         unstuck_start = EMA_ANCHOR_COIN_OVERRIDE_UNSTUCK_START_COLUMN
         hsl_start = EMA_ANCHOR_COIN_OVERRIDE_HSL_START_COLUMN
     elif strategy_kind == "trailing_martingale":
@@ -2774,6 +2918,7 @@ def _build_single_coin_override_params(
                 ),
             }
         )
+        unstuck_ema_start = TRAILING_MARTINGALE_COIN_OVERRIDE_UNSTUCK_EMA_START_COLUMN
         unstuck_start = TRAILING_MARTINGALE_COIN_OVERRIDE_UNSTUCK_START_COLUMN
         hsl_start = TRAILING_MARTINGALE_COIN_OVERRIDE_HSL_START_COLUMN
     else:
@@ -2781,6 +2926,12 @@ def _build_single_coin_override_params(
 
     columns.update(
         {key: unstuck_start + offset for offset, key in enumerate(UNSTUCK_PARAM_KEYS)}
+    )
+    columns.update(
+        {
+            key: unstuck_ema_start + offset
+            for offset, key in enumerate(UNSTUCK_EMA_PARAM_KEYS)
+        }
     )
     columns.update(
         {
@@ -2800,6 +2951,33 @@ def _build_single_coin_override_params(
     )
 
 
+def _prepared_multicoin_data(
+    values, timestamps, *, runs, markets, checkpoint_contract, cache=None,
+):
+    """Share immutable suite tensors only for identical validated packing inputs."""
+    candles = checkpoint_contract["hlcvs"]
+    timeline = checkpoint_contract["timestamps"]
+    key = (
+        tuple(checkpoint_contract["coins"]),
+        tuple(candles["shape"]), candles["dtype"], candles["sha256"],
+        timeline["count"], timeline["first"], timeline["last"], timeline["sha256"],
+        tuple(runs), tuple(markets),
+    )
+    if cache is not None and key in cache:
+        data = cache[key]
+        logging.info(
+            "GPU suite reusing prepared MPS market tensors | coins=%d bars=%d saved=%.2f GiB",
+            data["n_coins"], data["n"], data["invariant_bytes"] / 2**30,
+        )
+        return data
+    data = build_mps_multicoin_data(
+        values, timestamps, runs=runs, markets=markets, include_hourly_ranges=True,
+    )
+    if cache is not None:
+        cache[key] = data
+    return data
+
+
 class MpsMulticoinProxy:
     """Batched multi-coin MPS proxy for the supported strategy topology."""
 
@@ -2816,18 +2994,17 @@ class MpsMulticoinProxy:
         needed_metrics,
         interrupt_check=None,
         max_dispatch_candidate_bars: int = MPS_MAX_DISPATCH_CANDIDATE_BARS,
+        prepared_data_cache: dict | None = None,
     ):
         try:
             import torch
         except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
             raise ModuleNotFoundError(
-                "GPU optimization requires the optional 'gpu-mps' dependencies; "
-                "install Passivbot with `pip install -e '.[full,gpu-mps]'`"
+                "GPU optimization requires the optional GPU dependencies; "
+                "install Passivbot with `pip install -e '.[full,gpu-mps]'` (Apple) "
+                "or `pip install -e '.[full,gpu-cuda]'` (NVIDIA)"
             ) from exc
-        if not torch.backends.mps.is_available():
-            raise RuntimeError(
-                "GPU optimization requested but Apple MPS is unavailable in this process"
-            )
+        gpu_device(torch)
 
         from optimization.gpu.metrics import (
             BTC_INTRADAY_RISK_METRICS,
@@ -2905,21 +3082,29 @@ class MpsMulticoinProxy:
                 "MPS multicoin proxy requires one or two enabled sides"
             )
         self.sides = enabled_sides
-        self.dispatch_batch_size = _mps_dispatch_batch_size(
-            self.batch_size,
-            n_bars=len(values),
-            n_coins=coin_count,
-            n_sides=len(enabled_sides),
-            max_candidate_bars=self.max_dispatch_candidate_bars,
+        self.temporal_chunking, self.dispatch_batch_size, dispatch_history = (
+            _mps_multicoin_dispatch_plan(
+                self.strategy_kind, self.batch_size, n_bars=len(values),
+                n_coins=coin_count, n_sides=len(enabled_sides),
+                max_candidate_bars=self.max_dispatch_candidate_bars,
+            )
         )
-        _log_mps_dispatch_cap(
-            requested_batch_size=self.batch_size,
-            dispatch_batch_size=self.dispatch_batch_size,
-            n_bars=len(values),
-            n_coins=coin_count,
-            n_sides=len(enabled_sides),
-            max_candidate_bars=self.max_dispatch_candidate_bars,
-        )
+        if self.temporal_chunking:
+            logging.info(
+                "GPU MPS temporal replay | candidate_batch=%d chunk_bars<=%d "
+                "history_bars=%d coins=%d max_candidate_bars=%d",
+                self.dispatch_batch_size, dispatch_history, len(values), coin_count,
+                self.max_dispatch_candidate_bars,
+            )
+        else:
+            _log_mps_dispatch_cap(
+                requested_batch_size=self.batch_size,
+                dispatch_batch_size=self.dispatch_batch_size,
+                n_bars=len(values),
+                n_coins=coin_count,
+                n_sides=len(enabled_sides),
+                max_candidate_bars=self.max_dispatch_candidate_bars,
+            )
         self.shared_account_fused = len(self.sides) == 2
         self.shared_account_proxy_mode = (
             "shared-account-fused-tm-v1"
@@ -3029,6 +3214,7 @@ class MpsMulticoinProxy:
             side: float(payload.bot_params_list[0][side]["n_positions"])
             for side in ("long", "short")
         }
+        self.couple_unstuck_emas = unstuck_ema_spans_coupled(config)
         self.base_params = {}
         for side in self.sides:
             first_bot = payload.bot_params_list[0][side]
@@ -3119,6 +3305,8 @@ class MpsMulticoinProxy:
             base_params=self.base_params,
             btc_prices=btc_values if self.btc_analysis_enabled else None,
         )
+
+        self.checkpoint_contract.update(checkpoint_runtime(torch))
 
         coins = list(backtest_params.get("coins") or [])
         if len(coins) != coin_count:
@@ -3245,12 +3433,9 @@ class MpsMulticoinProxy:
             last_valid_indices=backtest_params["last_valid_indices"],
             require_positive_high_low=True,
         )
-        self.data = build_mps_multicoin_data(
-            values,
-            timestamps,
-            runs=runs,
-            markets=markets,
-            include_hourly_ranges=True,
+        self.data = _prepared_multicoin_data(
+            values, timestamps, runs=runs, markets=markets,
+            checkpoint_contract=self.checkpoint_contract, cache=prepared_data_cache,
         )
         self.metrics_data = {
             "ts0": self.data["ts0"],
@@ -3358,6 +3543,9 @@ class MpsMulticoinProxy:
                     **common_runner_kwargs,
                 }
                 runner_kwargs["coin_overrides"] = per_side_coin_overrides[side]
+                if self.temporal_chunking:
+                    runner_kwargs["max_dispatch_candidate_bars"] = self.max_dispatch_candidate_bars
+                    runner_kwargs["interrupt_check"] = self.interrupt_check
                 self.runners[side] = runner_cls(
                     self.run,
                     self.data,
@@ -3372,18 +3560,12 @@ class MpsMulticoinProxy:
                 raise ValueError("side is required for dual-side multicoin parameters")
             side = self.sides[0]
         param_keys = getattr(self, "param_keys", EMA_ANCHOR_MULTICOIN_PARAM_KEYS)
-        rows = []
-        for candidate in candidates:
-            merged = dict(self.base_params[side])
-            merged.update(
-                {
-                    key.removeprefix(f"{side}_"): value
-                    for key, value in candidate.items()
-                    if key.startswith(f"{side}_")
-                }
-            )
-            rows.append([float(merged[key]) for key in param_keys])
-        return np.asarray(rows, dtype=np.float64)
+        return _candidate_parameter_matrix(
+            candidates,
+            param_keys,
+            {side: self.base_params[side]},
+            couple_unstuck_emas=getattr(self, "couple_unstuck_emas", False),
+        )
 
     def evaluate(self, candidates: list[dict]) -> list[dict]:
         results: list[dict] = []
@@ -3459,7 +3641,7 @@ class MpsMulticoinProxy:
                     raw_output, self.needed_metrics
                 )
                 if profile is not None:
-                    torch.mps.synchronize()
+                    synchronize()
                     profile["timings_seconds"]["metric_reduction"] += (
                         time.perf_counter() - stage_started
                     )
@@ -3496,7 +3678,7 @@ class MpsMulticoinProxy:
                     else None
                 )
                 if profile is not None:
-                    torch.mps.synchronize()
+                    synchronize()
                     profile["timings_seconds"]["metric_reduction"] += (
                         time.perf_counter() - stage_started
                     )

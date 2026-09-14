@@ -113,6 +113,13 @@ shared span cannot leak a projected strategy value into coin ranking.
 
 ## Trailing Martingale Semantics
 
+Trailing-martingale price spans belong to `entry.ema_span_0/1`. Schema v8.4.0 migrates
+old strategy-root leaves before hydration and before file/inline override merges; explicit
+new leaves win with warnings on conflicting values. Public optimizer bounds share the nested
+paths; internal optimizer keys and Metal columns retain `ema_span_0/1`. Entry subtree selectors
+include the horizons. EMA-anchor and trailing-grid-v7 paths are unchanged. Volatility horizons
+remain shared by entries and closes.
+
 Entries and closes use threshold/retracement fields.
 
 - `retracement_base_pct <= 0.0`: trailing disabled, use passive recursive limit-order behavior.
@@ -154,8 +161,32 @@ wallet-exposure modifier.
 Auto-unstuck has its own EMA trigger toggle:
 `bot.<side>.unstuck.ema_gating_enabled`. It defaults to `true`. When false, auto-unstuck skips the
 EMA trigger/readiness check but still requires `unstuck.enabled`, loss allowance, exposure
-threshold, close sizing, and valid market/exchange inputs. The toggle does not add independent
-unstuck EMA spans.
+threshold, close sizing, and valid market/exchange inputs.
+
+`bot.<side>.unstuck.ema_span_0` and `ema_span_1` independently define the unstuck price EMA
+band, using the same base candle stream and unrounded geometric-mean third span as the strategy
+band. Long eligibility uses the upper band; short eligibility uses the lower band. Strategy EMA
+changes must not change the unstuck band. Missing required unstuck EMAs follow the existing scoped
+input-unavailable contract; disabled gating does not require them or extend warmup. Live loading
+requests unstuck-only spans for held sides separately, preserving usable strategy spans when an
+unstuck horizon is unavailable. Live warmup uses that same held/static eligibility and does not
+expand flat forager candidates to an unused unstuck horizon. Monitor bands are independently
+available for each consumer.
+
+Schema v8.3.0 materializes missing unstuck spans from the effective active strategy before default
+hydration, including coin overrides and external-file/inline precedence. Explicit unstuck spans
+win. New optimizer bounds copy fixed legacy bounds, or freeze at the migrated starting values for
+varying legacy ranges unless supplied; a warning explains that independent genes cannot preserve
+the old coupled search. New defaults expose tunable spans.
+Apple MPS models a separate price EMA band for unstuck in all directional and multicoin kernels.
+It uses the same seeded recurrence, floating horizons and candle-interval scaling as exact Rust.
+Coin overrides win over candidate globals, and temporal replay persists the independent band.
+
+The opt-in optimizer override `couple_unstuck_ema_spans` derives each side/coin's unstuck pair
+from its effective strategy, after mirroring and fixed/scenario overrides. It removes redundant
+unstuck span genes and materializes explicit runtime spans in saved candidates and scenarios.
+GPU packing preserves the dependency on candidate strategy genes while retaining strategy coin
+pins. This is optimizer configuration finalization, not a live/backtest coupling mode.
 
 ## Live/Backtest Market Slippage Boundary
 

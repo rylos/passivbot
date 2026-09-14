@@ -7,6 +7,7 @@ from optimization.gpu.model import (
     EMA_ANCHOR_MULTICOIN_PARAM_KEYS,
     EMA_ANCHOR_SINGLE_COIN_PARAM_KEYS,
     TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS,
+    TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS,
 )
 from tools.gpu_proxy_benchmark import (
     HSL_PNL_LOOKBACK_BARS,
@@ -30,6 +31,7 @@ from tools.gpu_proxy_benchmark import (
         EMA_ANCHOR_SINGLE_COIN_PARAM_KEYS,
         TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS,
         EMA_ANCHOR_MULTICOIN_PARAM_KEYS,
+        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS,
     ),
 )
 def test_gpu_proxy_benchmark_candidate_matrix_is_fixed_and_finite(keys):
@@ -202,8 +204,11 @@ def test_gpu_proxy_benchmark_counts_only_recursive_close_ladder_candidates():
 def test_gpu_proxy_benchmark_applies_safety_limit_per_dispatch(
     monkeypatch, case, extra_args
 ):
+    from types import SimpleNamespace
+
     class FakeTorch:
         __version__ = "test"
+        backends = SimpleNamespace(mps=SimpleNamespace(is_available=lambda: True))
 
     monkeypatch.setattr(
         "tools.gpu_proxy_benchmark._require_mps_torch", lambda _parser: FakeTorch()

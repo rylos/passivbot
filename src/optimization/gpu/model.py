@@ -5,10 +5,18 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from optimization.gpu.runtime import gpu_device
+
 
 GAP_BINS = 128
 GAP_MAX_MINUTES = 4_000_000.0
 MPS_MULTICOIN_MAX_COINS = 64
+# Bound both temporal launch duration and per-candidate replay-state allocation.
+MPS_TM_SINGLE_COIN_CHUNK_BARS = 96_000
+MPS_TM_SINGLE_COIN_CHUNK_CANDIDATES = 1024
+MPS_TM_MULTICOIN_CHUNK_BARS = 8192
+MPS_TM_MULTICOIN_CHUNK_CANDIDATES = 512
+MPS_TM_MULTICOIN_CHUNK_CANDIDATE_STEPS = 2_097_152
 HSL_SIGNAL_MODES = {"unified", "pside", "coin"}
 
 
@@ -106,6 +114,8 @@ UNSTUCK_PARAM_KEYS = (
     "unstuck_threshold",
 )
 
+UNSTUCK_EMA_PARAM_KEYS = ("unstuck_ema_span_0", "unstuck_ema_span_1")
+
 HSL_PARAM_KEYS = (
     "hsl_enabled",
     "hsl_red_threshold",
@@ -152,7 +162,12 @@ EMA_ANCHOR_COIN_OVERRIDE_HSL_START_COLUMN = (
 EMA_ANCHOR_COIN_OVERRIDE_FORCED_ACTIVE_COLUMN = (
     EMA_ANCHOR_COIN_OVERRIDE_HSL_START_COLUMN + len(HSL_COIN_OVERRIDE_PATHS)
 )
-EMA_ANCHOR_COIN_OVERRIDE_COLS = EMA_ANCHOR_COIN_OVERRIDE_FORCED_ACTIVE_COLUMN + 1
+EMA_ANCHOR_COIN_OVERRIDE_UNSTUCK_EMA_START_COLUMN = (
+    EMA_ANCHOR_COIN_OVERRIDE_FORCED_ACTIVE_COLUMN + 1
+)
+EMA_ANCHOR_COIN_OVERRIDE_COLS = EMA_ANCHOR_COIN_OVERRIDE_UNSTUCK_EMA_START_COLUMN + len(
+    UNSTUCK_EMA_PARAM_KEYS
+)
 
 
 def encode_hsl_panic_order_type(value, *, field_name: str) -> float:
@@ -306,6 +321,7 @@ EMA_ANCHOR_SINGLE_COIN_PARAM_KEYS = (
     *UNSTUCK_PARAM_KEYS,
     *HSL_PARAM_KEYS,
     "wallet_exposure_limit",
+    *UNSTUCK_EMA_PARAM_KEYS,
 )
 
 EMA_ANCHOR_MULTICOIN_PARAM_KEYS = (
@@ -321,6 +337,7 @@ EMA_ANCHOR_MULTICOIN_PARAM_KEYS = (
     *MULTICOIN_TOTAL_EXPOSURE_ENFORCER_PARAM_KEYS,
     *UNSTUCK_PARAM_KEYS,
     *HSL_PARAM_KEYS,
+    *UNSTUCK_EMA_PARAM_KEYS,
 )
 
 TRAILING_MARTINGALE_PARAM_KEYS = (
@@ -361,6 +378,7 @@ TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS = (
     *UNSTUCK_PARAM_KEYS,
     *HSL_PARAM_KEYS,
     "wallet_exposure_limit",
+    *UNSTUCK_EMA_PARAM_KEYS,
 )
 
 TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS = (
@@ -377,11 +395,12 @@ TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS = (
     *MULTICOIN_TOTAL_EXPOSURE_ENFORCER_PARAM_KEYS,
     *UNSTUCK_PARAM_KEYS,
     *HSL_PARAM_KEYS,
+    *UNSTUCK_EMA_PARAM_KEYS,
 )
 
 TRAILING_MARTINGALE_COIN_OVERRIDE_PATHS = (
-    ("ema_span_0", ("ema_span_0",)),
-    ("ema_span_1", ("ema_span_1",)),
+    ("ema_span_0", ("entry", "ema_span_0")),
+    ("ema_span_1", ("entry", "ema_span_1")),
     ("volatility_ema_span_1h", ("volatility_ema_span_1h",)),
     ("volatility_ema_span_1m", ("volatility_ema_span_1m",)),
     ("entry_double_down_factor", ("entry", "double_down_factor")),
@@ -461,8 +480,12 @@ TRAILING_MARTINGALE_COIN_OVERRIDE_GATE_REENTRY_COLUMN = (
 TRAILING_MARTINGALE_COIN_OVERRIDE_FORCED_ACTIVE_COLUMN = (
     TRAILING_MARTINGALE_COIN_OVERRIDE_GATE_REENTRY_COLUMN + 1
 )
-TRAILING_MARTINGALE_COIN_OVERRIDE_COLS = (
+TRAILING_MARTINGALE_COIN_OVERRIDE_UNSTUCK_EMA_START_COLUMN = (
     TRAILING_MARTINGALE_COIN_OVERRIDE_FORCED_ACTIVE_COLUMN + 1
+)
+TRAILING_MARTINGALE_COIN_OVERRIDE_COLS = (
+    TRAILING_MARTINGALE_COIN_OVERRIDE_UNSTUCK_EMA_START_COLUMN
+    + len(UNSTUCK_EMA_PARAM_KEYS)
 )
 
 
@@ -500,8 +523,8 @@ def flatten_trailing_martingale_params(strategy: dict, risk: dict) -> dict:
     if mode not in {"disabled", "all", "initial", "reentry"}:
         raise ValueError(f"unsupported trailing_martingale entry.ema_gate_mode={mode!r}")
     flattened = {
-        "ema_span_0": strategy.get("ema_span_0"),
-        "ema_span_1": strategy.get("ema_span_1"),
+        "ema_span_0": entry.get("ema_span_0"),
+        "ema_span_1": entry.get("ema_span_1"),
         "volatility_ema_span_1h": strategy.get("volatility_ema_span_1h"),
         "volatility_ema_span_1m": strategy.get("volatility_ema_span_1m"),
         "entry_cooldown_minutes": float(
@@ -511,9 +534,7 @@ def flatten_trailing_martingale_params(strategy: dict, risk: dict) -> dict:
             )
             or 0.0
         ),
-        "total_wallet_exposure_limit": float(
-            risk["total_wallet_exposure_limit"]
-        ),
+        "total_wallet_exposure_limit": float(risk["total_wallet_exposure_limit"]),
         "gate_initial": float(mode in {"all", "initial"}),
         "gate_reentry": float(mode in {"all", "reentry"}),
     }
@@ -853,6 +874,23 @@ def _maximum_effective_min_cost(prices, market: ProxyMarket) -> float:
     return float(encoded)
 
 
+def _require_contiguous_mps_hlc(high, low, close, run: ProxyRun, *, coin: int = 0):
+    """Reject missing valuation inputs before any packing or GPU allocation."""
+    first = max(0, int(run.first_valid_idx))
+    last = min(int(run.last_valid_idx), len(close) - 1)
+    if first > last:
+        return
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        packed = np.asarray([high[first:last + 1], low[first:last + 1], close[first:last + 1]], dtype=np.float32)
+    invalid = np.flatnonzero(~np.all(np.isfinite(packed) & (packed > 0.0), axis=0))
+    if invalid.size:
+        raise ValueError(
+            "MPS proxy requires contiguous finite positive float32 H/L/C between "
+            "first and last valid indices; "
+            f"coin index {coin}, invalid candle at {first + int(invalid[0])}"
+        )
+
+
 def build_mps_data(high, low, close, timestamps_ms, run: ProxyRun, market: ProxyMarket):
     """Prepare immutable minute data and keep it resident on Apple MPS.
 
@@ -867,8 +905,9 @@ def build_mps_data(high, low, close, timestamps_ms, run: ProxyRun, market: Proxy
         ModuleNotFoundError
     ) as exc:  # pragma: no cover - exercised without the optional extra
         raise ModuleNotFoundError(
-            "Apple MPS optimization requires the optional 'gpu-mps' dependencies; "
-            "install Passivbot with `pip install -e '.[full,gpu-mps]'`"
+            "GPU optimization requires the optional GPU dependencies; "
+            "install Passivbot with `pip install -e '.[full,gpu-mps]'` (Apple) "
+            "or `pip install -e '.[full,gpu-cuda]'` (NVIDIA)"
         ) from exc
 
     high = np.asarray(high, dtype=np.float64)
@@ -879,6 +918,7 @@ def build_mps_data(high, low, close, timestamps_ms, run: ProxyRun, market: Proxy
         raise ValueError("MPS price and timestamp arrays must have matching lengths")
     if len(close) < 3:
         raise ValueError("MPS proxy requires at least three candles")
+    _require_contiguous_mps_hlc(high, low, close, run)
 
     n = len(close)
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -922,7 +962,7 @@ def build_mps_data(high, low, close, timestamps_ms, run: ProxyRun, market: Proxy
     max_effective_min_cost = _maximum_effective_min_cost(close, market)
 
     def tensor(values, *, dtype=None):
-        return torch.as_tensor(values, dtype=dtype, device="mps")
+        return torch.as_tensor(values, dtype=dtype, device=gpu_device())
 
     return {
         "high_f": tensor(np.where(np.isfinite(high), high, 0.0).astype(np.float32)),
@@ -968,8 +1008,9 @@ def build_mps_multicoin_data(
         import torch
     except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency path
         raise ModuleNotFoundError(
-            "Apple MPS optimization requires the optional 'gpu-mps' dependencies; "
-            "install Passivbot with `pip install -e '.[full,gpu-mps]'`"
+            "GPU optimization requires the optional GPU dependencies; "
+            "install Passivbot with `pip install -e '.[full,gpu-mps]'` (Apple) "
+            "or `pip install -e '.[full,gpu-cuda]'` (NVIDIA)"
         ) from exc
 
     values = np.asarray(hlcvs)
@@ -1004,10 +1045,13 @@ def build_mps_multicoin_data(
     if np.any(intervals != interval_ms):
         raise ValueError("MPS multicoin proxy requires a continuous candle timeline")
 
+    for coin, run in enumerate(runs):
+        _require_contiguous_mps_hlc(
+            values[:, coin, 0], values[:, coin, 1], values[:, coin, 2], run, coin=coin
+        )
     bars = np.ascontiguousarray(values[:, :, :4], dtype=np.float32)
-    # Preserve a non-finite close so portfolio-equity accumulation can mirror
-    # exact Rust by omitting that coin's unrealized PnL. Other non-finite
-    # fields use zero sentinels and remain blocked by candle validity.
+    # Unavailable listing/delisting tails remain outside the declared valid
+    # range. Internal missing H/L/C is rejected before reaching this packing.
     for field in (0, 1, 3):
         field_values = bars[:, :, field]
         field_values[~np.isfinite(field_values)] = 0.0
@@ -1089,18 +1133,21 @@ def build_mps_multicoin_data(
         + (hour_log_ranges.nbytes if hour_log_ranges is not None else 0)
     )
     recommended = None
-    recommended_fn = getattr(torch.mps, "recommended_max_memory", None)
-    if callable(recommended_fn):
-        recommended = int(recommended_fn())
+    if gpu_device(torch) == "cuda":
+        recommended = int(torch.cuda.mem_get_info()[0])
+    else:
+        recommended_fn = getattr(torch.mps, "recommended_max_memory", None)
+        if callable(recommended_fn):
+            recommended = int(recommended_fn())
     if recommended and invariant_bytes > int(recommended * 0.45):
         raise MemoryError(
-            "MPS multicoin invariant tensors would consume "
+            f"{gpu_device(torch).upper()} multicoin invariant tensors would consume "
             f"{invariant_bytes / 2**30:.2f} GiB, above the 45% safety limit of "
             f"the device's {recommended / 2**30:.2f} GiB recommended working set"
         )
 
     def tensor(array, *, dtype=None):
-        return torch.as_tensor(array, dtype=dtype, device="mps").contiguous()
+        return torch.as_tensor(array, dtype=dtype, device=gpu_device()).contiguous()
 
     first_day = int(timestamps[0] // 86_400_000)
     last_day = int(timestamps[-1] // 86_400_000)

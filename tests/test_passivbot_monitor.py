@@ -5129,12 +5129,22 @@ async def test_execute_orders_parent_records_order_opened_event():
         def _log_order_action_summary(self, *args, **kwargs):
             return None
 
+        def _build_order_params(self, _order):
+            return {}
+
+        def _emit_execution_connector_call_started_event(self, **_kwargs):
+            return None
+
         async def execute_orders(self, orders):
             context = self._execution_connector_call_context
             assert context["action"] == "create"
             assert context["orders"][0] is orders[0]
             assert context["wave"] is self._order_wave_in_progress
-            return [{"id": "abc123", **orders[0]}]
+            async def create_order(**_params):
+                return {"id": "abc123"}
+
+            self.cca = SimpleNamespace(create_order=create_order)
+            return [await pb_mod.Passivbot.execute_order(self, order) for order in orders]
 
         def did_create_order(self, executed):
             return True
@@ -5878,6 +5888,12 @@ async def test_start_bot_records_startup_error_stop_and_early_snapshot(
         def _log_startup_banner(self):
             return None
 
+        get_raw_balance = staticmethod(lambda: 100.0)
+        get_hysteresis_snapped_balance = staticmethod(lambda: 100.0)
+
+        async def refresh_authoritative_state(self):
+            return True
+
         async def init_markets(self):
             return None
 
@@ -6585,6 +6601,11 @@ async def test_build_monitor_snapshot_includes_market_forager_unstuck_and_recent
                 ("short", "entry_initial_ema_dist"): 0.01,
                 ("long", "entry_volatility_ema_span_1h"): 24.0,
                 ("short", "entry_volatility_ema_span_1h"): 24.0,
+                ("long", "unstuck_enabled"): True,
+                ("short", "unstuck_enabled"): False,
+                ("long", "unstuck_ema_gating_enabled"): True,
+                ("long", "unstuck_ema_span_0"): 10.0,
+                ("long", "unstuck_ema_span_1"): 20.0,
                 ("long", "unstuck_ema_dist"): 0.02,
                 ("short", "unstuck_ema_dist"): 0.02,
                 ("long", "unstuck_loss_allowance_pct"): 0.02,
@@ -7599,3 +7620,69 @@ async def test_update_open_orders_propagates_unexpected_fetch_errors():
 
     with pytest.raises(RuntimeError, match="exchange fetch broke"):
         await bot.update_open_orders()
+
+
+@pytest.mark.parametrize("missing_family", ["strategy", "unstuck"])
+def test_monitor_ema_families_are_independent(missing_family):
+    from types import SimpleNamespace
+    from passivbot_monitor import _build_monitor_runtime_market_hints
+
+    values = {
+        "ema_span_0": 10.0,
+        "ema_span_1": 40.0,
+        "unstuck_ema_span_0": 100.0,
+        "unstuck_ema_span_1": 400.0,
+        "unstuck_enabled": True,
+        "unstuck_ema_gating_enabled": True,
+        "entry_initial_ema_dist": 0.01,
+        "unstuck_ema_dist": 0.02,
+    }
+    bot = SimpleNamespace(bp=lambda side, key, symbol: values[key])
+    emas = {
+        10.0: 90.0,
+        20.0: 95.0,
+        40.0: 100.0,
+        100.0: 110.0,
+        200.0: 115.0,
+        400.0: 120.0,
+    }
+    del emas[10.0 if missing_family == "strategy" else 100.0]
+    hints = _build_monitor_runtime_market_hints(
+        bot, ["BTC"], {"BTC": 100.0}, {"BTC": emas}
+    )["BTC"]["ema_bands"]
+    for side in ("long", "short"):
+        assert ("entry_trigger_price" in hints[side]) == (missing_family != "strategy")
+        assert ("unstuck_trigger_price" in hints[side]) == (missing_family != "unstuck")
+
+
+@pytest.mark.parametrize("pside", ["long", "short"])
+@pytest.mark.parametrize("strategy_available", [False, True])
+def test_unstuck_monitor_renderer_uses_independent_bounds(pside, strategy_available):
+    from types import SimpleNamespace
+    from passivbot_monitor import _build_monitor_runtime_unstuck_hints
+    from monitor_tui import _render_unstuck_panel
+
+    bands = {
+        "unstuck_lower": 110.0,
+        "unstuck_upper": 120.0,
+        "unstuck_trigger_price": 122.4,
+    }
+    if strategy_available:
+        bands.update(lower=90.0, upper=100.0, entry_trigger_price=89.1)
+    market = {"BTC": {"ema_bands": {pside: bands}}}
+    hints = _build_monitor_runtime_unstuck_hints(
+        SimpleNamespace(),
+        {0: "BTC"},
+        [{"order_type": f"close_unstuck_{pside}", "symbol_idx": 0, "price": 122.4}],
+        {"BTC": 100.0},
+        market,
+    )
+    assert hints[pside]["ema_bands"] == {
+        "lower": 110.0,
+        "upper": 120.0,
+        "unstuck_trigger_price": 122.4,
+    }
+    assert bands.get("lower") == (90.0 if strategy_available else None)
+    rendered = "\n".join(_render_unstuck_panel({"unstuck": {"sides": hints}}))
+    assert "band=110..120" in rendered
+    assert "trigger=122.4" in rendered

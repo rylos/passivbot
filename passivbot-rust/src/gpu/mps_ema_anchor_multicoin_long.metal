@@ -2,9 +2,10 @@
 using namespace metal;
 
 constant int MAX_COINS = 64;
-constant int PARAM_COLS = 42;
+constant int PARAM_COLS = 44;
 constant int COIN_COLS = 13;
-constant int OVERRIDE_COLS = 30;
+constant int OVERRIDE_COLS = 32;
+constant int UNSTUCK_EMA_OVERRIDE_START = 30;
 constant int HSL_OVERRIDE_START = 19;
 constant int FORCED_ACTIVE_OVERRIDE_COL = 29;
 #if PASSIVBOT_BTC_RISK_ENABLED
@@ -13,22 +14,24 @@ constant int DAILY_COLS = 12;
 constant int DAILY_COLS = 9;
 #endif
 #if PASSIVBOT_HSL_RAW_TAIL_ENABLED
+constant int SCALAR_COLS = 69;
+constant int FUSED_SCALAR_COLS = 74;
+#elif PASSIVBOT_HSL_RAW_DRAWDOWN_ENABLED
 constant int SCALAR_COLS = 67;
 constant int FUSED_SCALAR_COLS = 72;
-#elif PASSIVBOT_HSL_RAW_DRAWDOWN_ENABLED
+#elif PASSIVBOT_HSL_EMA_TAIL_ENABLED
 constant int SCALAR_COLS = 65;
 constant int FUSED_SCALAR_COLS = 70;
-#elif PASSIVBOT_HSL_EMA_TAIL_ENABLED
+#else
 constant int SCALAR_COLS = 63;
 constant int FUSED_SCALAR_COLS = 68;
-#else
-constant int SCALAR_COLS = 61;
-constant int FUSED_SCALAR_COLS = 66;
 #endif
 constant int GAP_BINS = 128;
 #ifdef PASSIVBOT_STRATEGY_EQ_RECOVERY_DISTRIBUTION_ENABLED
 constant float RECOVERY_FAIL_CLOSED_SENTINEL = -3.402823466e+38f;
 #endif
+
+// PASSIVBOT_UNSTUCK_EMA_COMMON
 
 // PASSIVBOT_HSL_COMMON
 
@@ -79,6 +82,7 @@ inline float finalized_reducer_qty_with_ordinary(
 // behind one thread-local value lets a future fused kernel own long and short
 // portfolios concurrently without changing the proven one-side candle loop.
 struct EmaMulticoinSideState {
+    UnstuckEmaBand unstuck_ema[MAX_COINS];
     HslState hsl;
     HslState coin_hsl[MAX_COINS];
     HslStrategyEquityStats hsl_strategy_eq;
@@ -135,6 +139,8 @@ struct EmaMulticoinSideState {
 };
 
 struct EmaMulticoinSideConfig {
+    float unstuck_span0;
+    float unstuck_span1;
     float base_qty_pct;
     float span_a;
     float span_b;
@@ -195,6 +201,7 @@ struct EmaMulticoinFillState {
     float fill_count_long;
     float held_max_min;
     float held_sum_min;
+    float held_sum_sq_min;
     float held_count;
     float position_unchanged_max_min;
     float day_volume;
@@ -217,6 +224,7 @@ inline EmaMulticoinFillState init_ema_multicoin_fill_state() {
     fills.fill_count_long = 0.0f;
     fills.held_max_min = 0.0f;
     fills.held_sum_min = 0.0f;
+    fills.held_sum_sq_min = 0.0f;
     fills.held_count = 0.0f;
     fills.position_unchanged_max_min = 0.0f;
     fills.day_volume = 0.0f;
@@ -259,7 +267,9 @@ inline void record_ema_multicoin_close_fill(
     bool short_side,
     bool is_hsl_panic,
     bool collect_coin_fill_counts,
-    thread float& hsl_equity_before_fills
+    thread float& hsl_equity_before_fills,
+    thread HslState* opposite_hsl = nullptr,
+    bool opposite_has_position = false
 ) {
     const bool coin_hsl_mode =
         side.hsl.signal_mode == HSL_SIGNAL_COIN;
@@ -296,6 +306,27 @@ inline void record_ema_multicoin_close_fill(
     if (collect_coin_fill_counts) {
         coin_fill_counts[candidate_index * coin_count + coin] += 1.0f;
     }
+
+    // The caller applies the position reduction immediately after accounting.
+    // Test the pre-fill size so a complete close ends the episode before reentry.
+    if (qty >= side.psize[coin]) {
+        bool scope_has_position = false;
+        if (!coin_hsl_mode) {
+            for (int other_coin = 0; other_coin < coin_count; ++other_coin) {
+                if (other_coin != coin && side.psize[other_coin] > 0.0f) {
+                    scope_has_position = true;
+                }
+            }
+        }
+        thread HslState& controller = coin_hsl_mode ? side.coin_hsl[coin] : side.hsl;
+        float realized_scope = coin_hsl_mode ? side.coin_realized_pnl[coin]
+            : (short_side ? account.realized_pnl_short : account.realized_pnl_long);
+        finish_hsl_scoped_episode_at_flat(
+            controller, opposite_hsl, scope_has_position, opposite_has_position,
+            account.balance, account.balance - account.realized_pnl_total,
+            account.realized_pnl_total, realized_scope, float(k), 0.0f
+        );
+    }
 }
 
 inline EmaMulticoinSideConfig load_ema_multicoin_side_config(
@@ -303,6 +334,8 @@ inline EmaMulticoinSideConfig load_ema_multicoin_side_config(
     int po
 ) {
     EmaMulticoinSideConfig config;
+    config.unstuck_span0 = params[po + 42];
+    config.unstuck_span1 = params[po + 43];
     config.base_qty_pct = params[po + 0];
     config.span_a = params[po + 1];
     config.span_b = params[po + 2];
@@ -387,6 +420,11 @@ inline void init_ema_multicoin_side_state(
     for (int c = 0; c < MAX_COINS; ++c) {
         float seed_close = c < coin_count ? coin_settings[c * COIN_COLS + 9] : 0.0f;
         float seed_volume = c < coin_count ? coin_settings[c * COIN_COLS + 10] : 0.0f;
+        side.unstuck_ema[c] = init_unstuck_ema_band(
+            c < coin_count ? coin_override_or(coin_overrides, c, UNSTUCK_EMA_OVERRIDE_START, config.unstuck_span0) : config.unstuck_span0,
+            c < coin_count ? coin_override_or(coin_overrides, c, UNSTUCK_EMA_OVERRIDE_START + 1, config.unstuck_span1) : config.unstuck_span1,
+            seed_close
+        );
         side.ema0[c] = seed_close;
         side.ema1[c] = seed_close;
         side.ema2[c] = seed_close;
@@ -531,6 +569,7 @@ inline void update_ema_multicoin_side_indicators(
         }
         if (!valid) continue;
         float log_range = log(high / low);
+        update_unstuck_ema_band(side.unstuck_ema[c], close);
         side.ema0[c] = fma(
             side.alpha0_coin[c], close - side.ema0[c], side.ema0[c]
         );
@@ -1255,12 +1294,8 @@ inline int select_ema_multicoin_unstuck_coin(
             continue;
         }
         if (coin_ema_gate) {
-            const float lower = fmin(
-                side.ema0[c], fmin(side.ema1[c], side.ema2[c])
-            );
-            const float upper = fmax(
-                side.ema0[c], fmax(side.ema1[c], side.ema2[c])
-            );
+            const float lower = unstuck_ema_lower(side.unstuck_ema[c]);
+            const float upper = unstuck_ema_upper(side.unstuck_ema[c]);
             const int trigger_tick = short_side
                 ? int(floor(
                     lower * (1.0f - coin_ema_dist) / price_step
@@ -1574,8 +1609,8 @@ inline void generate_ema_multicoin_side_orders(
             continue;
         }
         if (coin_ema_gate) {
-            float lower = fmin(ema0[c], fmin(ema1[c], ema2[c]));
-            float upper = fmax(ema0[c], fmax(ema1[c], ema2[c]));
+            float lower = unstuck_ema_lower(side.unstuck_ema[c]);
+            float upper = unstuck_ema_upper(side.unstuck_ema[c]);
             int trigger_tick = short_side
                 ? int(floor(
                     lower * (1.0f - coin_ema_dist) / price_step
@@ -2479,7 +2514,9 @@ inline bool process_ema_multicoin_side_fills(
     bool collect_coin_fill_counts,
     float market_order_slippage_pct,
     bool hsl_panic_market,
-    float hsl_equity_before_fills
+    float hsl_equity_before_fills,
+    thread HslState* opposite_hsl = nullptr,
+    bool opposite_has_position = false
 ) {
     thread HslState& hsl = side.hsl;
     thread HslState* coin_hsl = side.coin_hsl;
@@ -2584,7 +2621,7 @@ inline bool process_ema_multicoin_side_fills(
                 candidate_index, coin_count, c, k, pnl, net_pnl,
                 adjusted, pprice[c], close, c_mult, short_side,
                 is_hsl_panic, collect_coin_fill_counts,
-                hsl_equity_before_fills
+                hsl_equity_before_fills, opposite_hsl, opposite_has_position
             );
             float new_size = fmax(
                 round_step(psize[c] - adjusted, qty_step), 0.0f
@@ -2599,6 +2636,7 @@ inline bool process_ema_multicoin_side_fills(
                         fills.held_max_min, held_min
                     );
                     fills.held_sum_min += held_min;
+                    fills.held_sum_sq_min += held_min * held_min;
                     fills.held_count += 1.0f;
                 }
                 position_open_k[c] = -1.0f;
@@ -2717,7 +2755,9 @@ inline bool force_close_ema_multicoin_delisted_position(
     bool short_side,
     bool collect_coin_fill_counts,
     float market_order_slippage_pct,
-    thread float& hsl_equity_before_close
+    thread float& hsl_equity_before_close,
+    thread HslState* opposite_hsl = nullptr,
+    bool opposite_has_position = false
 ) {
     if (!(side.psize[coin] > 0.0f && side.pprice[coin] > 0.0f)) {
         return false;
@@ -2747,7 +2787,8 @@ inline bool force_close_ema_multicoin_delisted_position(
         side, account, fills, coin_fill_counts,
         candidate_index, coin_count, coin, k, pnl, net_pnl,
         close_qty, position_price, close, c_mult, short_side,
-        true, collect_coin_fill_counts, hsl_equity_before_close
+        true, collect_coin_fill_counts, hsl_equity_before_close,
+        opposite_hsl, opposite_has_position
     );
     if (!coin_hsl_mode) {
         advance_coin_hsl_equity_after_close_fill(
@@ -2762,6 +2803,7 @@ inline bool force_close_ema_multicoin_delisted_position(
         const float held_min = float(k) - side.position_open_k[coin];
         fills.held_max_min = fmax(fills.held_max_min, held_min);
         fills.held_sum_min += held_min;
+        fills.held_sum_sq_min += held_min * held_min;
         fills.held_count += 1.0f;
     }
     side.position_open_k[coin] = -1.0f;
@@ -2828,17 +2870,25 @@ inline bool force_close_ema_multicoin_delisted_fused(
     for (int c = 0; c < coin_count; ++c) {
         const int last_valid = int(coin_settings[c * COIN_COLS + 7]);
         if (k != last_valid || last_valid + 1400 >= timestep_count) continue;
+        bool short_has_position = false;
+        for (int other_coin = 0; other_coin < coin_count; ++other_coin) {
+            short_has_position = short_has_position || short_side.psize[other_coin] > 0.0f;
+        }
         const bool long_closed = force_close_ema_multicoin_delisted_position(
             long_side, account, fills, bars, coin_settings, coin_fill_counts,
             candidate_index, k, coin_count, c, false,
             collect_coin_fill_counts, market_order_slippage_pct,
-            hsl_equity_before_close
+            hsl_equity_before_close, &short_side.hsl, short_has_position
         );
+        bool long_has_position = false;
+        for (int other_coin = 0; other_coin < coin_count; ++other_coin) {
+            long_has_position = long_has_position || long_side.psize[other_coin] > 0.0f;
+        }
         const bool short_closed = force_close_ema_multicoin_delisted_position(
             short_side, account, fills, bars, coin_settings, coin_fill_counts,
             candidate_index, k, coin_count, c, true,
             collect_coin_fill_counts, market_order_slippage_pct,
-            hsl_equity_before_close
+            hsl_equity_before_close, &long_side.hsl, long_has_position
         );
         if (long_closed || short_closed) {
             clear_ema_multicoin_coin_orders(long_side, c);
@@ -2960,11 +3010,13 @@ inline void passivbot_ema_anchor_multicoin_impl(
     float total_wallet_exposure_samples = 0.0f;
     thread float& held_max_min = fills.held_max_min;
     thread float& held_sum_min = fills.held_sum_min;
+    thread float& held_sum_sq_min = fills.held_sum_sq_min;
     thread float& held_count = fills.held_count;
     thread float& position_unchanged_max_min = fills.position_unchanged_max_min;
     float first_fill_k = -1.0f;
     float last_fill_k = -1.0f;
     float gap_max_min = 0.0f;
+    float gap_sum_squared_hours = 0.0f;
     float last_high_k = -1.0f;
     float recovery_max_min = 0.0f;
     float account_peak = -INFINITY;
@@ -3000,6 +3052,12 @@ inline void passivbot_ema_anchor_multicoin_impl(
     thread float& day_fill_count = fills.day_fill_count;
 
     for (int k = 1; k < stop_k; ++k) {
+        if (alive && (held_positions_have_missing_prices(side.psize, bars, coin_settings, k, C))) {
+            // The decoder rejects -2 as unavailable held-position valuation.
+            scalars[int(b) * SCALAR_COLS + 9] = -2.0f;
+            return;
+        }
+
         const int day_index = multicoin_utc_day_index(
             start_day_minute, k, interval_ms
         );
@@ -3140,6 +3198,8 @@ inline void passivbot_ema_anchor_multicoin_impl(
                     int(log(fmax(gap, 0.0f) + 1.0f) * log_bin_scale), 0, 127
                 );
                 gap_hist[int(b) * GAP_BINS + bin] += 1;
+                const float gap_hours = gap * interval_ms / 3600000.0f;
+                gap_sum_squared_hours += gap_hours * gap_hours;
                 gap_max_min = fmax(gap_max_min, gap);
             }
             if (first_fill_k < 0.0f) first_fill_k = float(k);
@@ -3180,10 +3240,8 @@ inline void passivbot_ema_anchor_multicoin_impl(
             }
         }
         float equity = balance + unrealized;
-        // Exact Rust keeps advancing balance-only equity and HSL time once
-        // portfolio tracking starts, including declared all-invalid gaps and
-        // tails. Per-coin validity still blocks fills, orders, and unrealized
-        // PnL above.
+        // Held positions have valid valuation candles; unavailable tails are unheld.
+        // Missing held-position prices were rejected before this bar's fills.
         if (can_generate && alive
             && balance > 0.0f && equity > liquidation_floor) {
             int sampled_hsl_tier = 0;
@@ -3397,6 +3455,7 @@ inline void passivbot_ema_anchor_multicoin_impl(
             float held_min = last_eq_k - position_open_k[c];
             held_max_min = fmax(held_max_min, held_min);
             held_sum_min += held_min;
+            held_sum_sq_min += held_min * held_min;
             held_count += 1.0f;
         }
         if (position_last_fill_k[c] >= 0.0f && last_eq_k >= 0.0f) {
@@ -3461,6 +3520,14 @@ inline void passivbot_ema_anchor_multicoin_impl(
     scalars[scalar_offset + 28] = pnl_recovery_max_min * interval_ms;
     scalars[scalar_offset + 29] = held_sum_min * interval_ms;
     scalars[scalar_offset + 30] = held_count;
+    scalars[scalar_offset + SCALAR_COLS - 2] = held_sum_sq_min *
+        (interval_ms / 3600000.0f) * (interval_ms / 3600000.0f);
+    scalars[scalar_offset + SCALAR_COLS - 1] = gap_sum_squared_hours;
+    if (account_peak_k >= 0.0f && last_eq_k >= 0.0f) {
+        account_recovery_max_min = fmax(
+            account_recovery_max_min, last_eq_k - account_peak_k
+        );
+    }
     scalars[scalar_offset + 31] = account_recovery_max_min * interval_ms;
     if (coin_hsl_mode) {
         write_one_side_coin_hsl_outputs(
@@ -3816,6 +3883,7 @@ inline void passivbot_ema_anchor_multicoin_fused_impl(
     float first_fill_k = -1.0f;
     float last_fill_k = -1.0f;
     float gap_max_min = 0.0f;
+    float gap_sum_squared_hours = 0.0f;
     float last_high_k = -1.0f;
     float recovery_max_min = 0.0f;
     float account_peak = -INFINITY;
@@ -3849,6 +3917,13 @@ inline void passivbot_ema_anchor_multicoin_fused_impl(
     float day_start_balance = account.balance;
 
     for (int k = 1; k < stop_k; ++k) {
+        if (alive && (held_positions_have_missing_prices(long_side.psize, bars, coin_settings, k, C)
+            || held_positions_have_missing_prices(short_side.psize, bars, coin_settings, k, C))) {
+            // The decoder rejects -2 as unavailable held-position valuation.
+            scalars[int(b) * FUSED_SCALAR_COLS + 9] = -2.0f;
+            return;
+        }
+
         const int day_index = multicoin_utc_day_index(
             start_day_minute, k, interval_ms
         );
@@ -3899,7 +3974,8 @@ inline void passivbot_ema_anchor_multicoin_fused_impl(
             bars, fill_ticks, coin_settings, long_coin_overrides,
             coin_fill_counts, int(b), k, C, false, alive,
             collect_coin_fill_counts, market_order_slippage_pct,
-            long_hsl_panic_market, long_hsl_equity_before_fills
+            long_hsl_panic_market, long_hsl_equity_before_fills,
+            &short_side.hsl, ema_multicoin_side_has_position(short_side, C)
         );
         float short_hsl_equity_before_fills = account.balance;
         short_hsl_equity_before_fills =
@@ -3917,7 +3993,8 @@ inline void passivbot_ema_anchor_multicoin_fused_impl(
             bars, fill_ticks, coin_settings, short_coin_overrides,
             coin_fill_counts, int(b), k, C, true, alive,
             collect_coin_fill_counts, market_order_slippage_pct,
-            short_hsl_panic_market, short_hsl_equity_before_fills
+            short_hsl_panic_market, short_hsl_equity_before_fills,
+            &long_side.hsl, ema_multicoin_side_has_position(long_side, C)
         );
         bool any_fill = long_fill || short_fill;
 
@@ -4144,6 +4221,8 @@ inline void passivbot_ema_anchor_multicoin_fused_impl(
                     0, 127
                 );
                 gap_hist[int(b) * GAP_BINS + bin] += 1;
+                const float gap_hours = gap * interval_ms / 3600000.0f;
+                gap_sum_squared_hours += gap_hours * gap_hours;
                 gap_max_min = fmax(gap_max_min, gap);
             }
             if (first_fill_k < 0.0f) first_fill_k = float(k);
@@ -4184,10 +4263,8 @@ inline void passivbot_ema_anchor_multicoin_fused_impl(
         float equity = joint_portfolio_equity(
             account, long_unrealized, short_unrealized
         );
-        // Exact Rust keeps advancing balance-only equity and HSL time once
-        // portfolio tracking starts, including declared all-invalid gaps and
-        // tails. Per-coin validity still blocks fills, orders, and unrealized
-        // PnL above.
+        // Held positions have valid valuation candles; unavailable tails are unheld.
+        // Missing held-position prices were rejected before this bar's fills.
         bool can_sample_hsl = (long_can_generate || short_can_generate)
             && alive
             && joint_portfolio_can_generate(
@@ -4357,6 +4434,7 @@ inline void passivbot_ema_anchor_multicoin_fused_impl(
                     - long_side.position_open_k[c];
                 fills.held_max_min = fmax(fills.held_max_min, held_min);
                 fills.held_sum_min += held_min;
+                fills.held_sum_sq_min += held_min * held_min;
                 fills.held_count += 1.0f;
             }
             if (long_side.position_last_fill_k[c] >= 0.0f
@@ -4378,6 +4456,7 @@ inline void passivbot_ema_anchor_multicoin_fused_impl(
                     - short_side.position_open_k[c];
                 fills.held_max_min = fmax(fills.held_max_min, held_min);
                 fills.held_sum_min += held_min;
+                fills.held_sum_sq_min += held_min * held_min;
                 fills.held_count += 1.0f;
             }
             if (short_side.position_last_fill_k[c] >= 0.0f
@@ -4444,6 +4523,14 @@ inline void passivbot_ema_anchor_multicoin_fused_impl(
         fills.pnl_recovery_max_min * interval_ms;
     scalars[scalar_offset + 29] = fills.held_sum_min * interval_ms;
     scalars[scalar_offset + 30] = fills.held_count;
+    scalars[scalar_offset + FUSED_SCALAR_COLS - 2] = fills.held_sum_sq_min *
+        (interval_ms / 3600000.0f) * (interval_ms / 3600000.0f);
+    scalars[scalar_offset + FUSED_SCALAR_COLS - 1] = gap_sum_squared_hours;
+    if (account_peak_k >= 0.0f && last_eq_k >= 0.0f) {
+        account_recovery_max_min = fmax(
+            account_recovery_max_min, last_eq_k - account_peak_k
+        );
+    }
     scalars[scalar_offset + 31] = account_recovery_max_min * interval_ms;
     if (long_config.coin_hsl_mode) {
         write_dual_side_coin_hsl_outputs(

@@ -102,11 +102,11 @@
             },
             "strategy": {
                 "trailing_martingale": {
-                    "ema_span_0": 770,
-                    "ema_span_1": 210,
                     "volatility_ema_span_1h": 1690,
                     "volatility_ema_span_1m": 60.0,
                     "entry": {
+                        "ema_span_0": 770,
+                        "ema_span_1": 210,
                         "double_down_factor": 0.73,
                         "initial_ema_dist": 0.0097,
                         "initial_qty_pct": 0.0276,
@@ -132,6 +132,8 @@
                 }
             },
             "unstuck": {
+                "ema_span_0": 770.0,
+                "ema_span_1": 210.0,
                 "close_pct": 0.00651,
                 "ema_dist": 0.00654,
                 "enabled": true,
@@ -175,11 +177,11 @@
             },
             "strategy": {
                 "trailing_martingale": {
-                    "ema_span_0": 100,
-                    "ema_span_1": 100,
                     "volatility_ema_span_1h": 672,
                     "volatility_ema_span_1m": 60.0,
                     "entry": {
+                        "ema_span_0": 100,
+                        "ema_span_1": 100,
                         "double_down_factor": 0.5,
                         "initial_ema_dist": -0.01,
                         "initial_qty_pct": 0.01,
@@ -205,6 +207,8 @@
                 }
             },
             "unstuck": {
+                "ema_span_0": 100.0,
+                "ema_span_1": 100.0,
                 "close_pct": 0.0286,
                 "ema_dist": -0.0532,
                 "enabled": true,
@@ -214,7 +218,7 @@
         }
     },
     "coin_overrides": {},
-    "config_version": "v8.2.0",
+    "config_version": "v8.4.0",
     "live": {
         "approved_coins": {
             "long": [
@@ -379,16 +383,6 @@
                 },
                 "strategy": {
                     "trailing_martingale": {
-                        "ema_span_0": [
-                            200,
-                            1440,
-                            10
-                        ],
-                        "ema_span_1": [
-                            200,
-                            1440,
-                            10
-                        ],
                         "volatility_ema_span_1h": [
                             672,
                             2016,
@@ -400,6 +394,16 @@
                             1
                         ],
                         "entry": {
+                            "ema_span_0": [
+                                200,
+                                1440,
+                                10
+                            ],
+                            "ema_span_1": [
+                                200,
+                                1440,
+                                10
+                            ],
                             "double_down_factor": [
                                 0.5,
                                 1,
@@ -501,6 +505,8 @@
                     }
                 },
                 "unstuck": {
+                    "ema_span_0": [770, 770],
+                    "ema_span_1": [210, 210],
                     "close_pct": [
                         0.05,
                         0.12,
@@ -606,16 +612,6 @@
                 },
                 "strategy": {
                     "trailing_martingale": {
-                        "ema_span_0": [
-                            200,
-                            1440,
-                            10
-                        ],
-                        "ema_span_1": [
-                            200,
-                            1440,
-                            10
-                        ],
                         "volatility_ema_span_1h": [
                             672,
                             2016,
@@ -627,6 +623,16 @@
                             1
                         ],
                         "entry": {
+                            "ema_span_0": [
+                                200,
+                                1440,
+                                10
+                            ],
+                            "ema_span_1": [
+                                200,
+                                1440,
+                                10
+                            ],
                             "double_down_factor": [
                                 0.5,
                                 1,
@@ -728,6 +734,8 @@
                     }
                 },
                 "unstuck": {
+                    "ema_span_0": [100, 100],
+                    "ema_span_1": [100, 100],
                     "close_pct": [
                         0.05,
                         0.12,
@@ -822,7 +830,8 @@
                 "crossover_prob_var": 0.64,
                 "eliminate_duplicates": true,
                 "mutation_eta": 20.0,
-                "mutation_prob_var": 0.05
+                "mutation_prob": 0.05,
+                "mutation_prob_per_variable": "auto"
             }
         },
         "round_to_n_significant_digits": 3,

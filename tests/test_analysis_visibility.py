@@ -130,6 +130,7 @@ def test_validate_visible_metrics_config_accepts_fill_activity_metrics():
         "fills_gap_p95_hours",
         "fills_gap_p99_hours",
         "fills_gap_time_weighted_mean_hours",
+        "position_held_time_weighted_mean_hours",
         "fills_per_day",
         "fills_per_day_close",
         "fills_per_day_entry",
@@ -139,6 +140,17 @@ def test_validate_visible_metrics_config_accepts_fill_activity_metrics():
         "fills_per_day_per_position_slot_short",
         "fills_per_day_short",
         "fills_top_symbol_share",
+    ]
+
+    validate_visible_metrics_config(cfg)
+
+
+def test_validate_visible_metrics_config_accepts_gain_quality_metrics():
+    cfg = get_template_config()
+    cfg["backtest"]["visible_metrics"] = [
+        "adg_rolling_hmean_strategy_eq",
+        "adg_time_integrated_strategy_eq",
+        "positive_gain_participation_strategy_eq",
     ]
 
     validate_visible_metrics_config(cfg)

@@ -87,6 +87,8 @@ OVERRIDABLE_SHARED_BOT_PATHS = frozenset(
         "risk.we_excess_allowance_pct",
         "unstuck.close_pct",
         "unstuck.ema_dist",
+        "unstuck.ema_span_0",
+        "unstuck.ema_span_1",
         "unstuck.ema_gating_enabled",
         "unstuck.enabled",
         "unstuck.loss_allowance_pct",
@@ -278,7 +280,10 @@ def _extract_allowed_patch(
 ) -> dict:
     """Extract explicitly supplied allowed leaves without hydrating defaults."""
 
-    source_doc = _unwrap_override_document(document, source=source)
+    source_doc = deepcopy(_unwrap_override_document(document, source=source))
+    from .migrations.entry_ema import migrate_entry_ema_tree
+
+    migrate_entry_ema_tree(source_doc, path=source)
     _reject_flat_strategy_coin_overrides(source_doc, coin=coin)
     source_live = source_doc.get("live")
     if isinstance(source_live, dict) and "strategy_kind" in source_live:

@@ -46,6 +46,12 @@ def test_default_objective_goal_recognizes_fill_activity_metrics():
     assert default_objective_goal("backtest_completion_ratio") == "max"
 
 
+def test_default_objective_goal_recognizes_gain_quality_metrics():
+    assert default_objective_goal("adg_rolling_hmean_strategy_eq") == "max"
+    assert default_objective_goal("adg_time_integrated_strategy_eq") == "max"
+    assert default_objective_goal("positive_gain_participation_strategy_eq") == "max"
+
+
 def test_default_objective_goal_recognizes_strategy_eq_recovery_metrics():
     assert default_objective_goal("drawdown_worst_strategy_eq_long") == "min"
     assert default_objective_goal("drawdown_worst_strategy_eq_short") == "min"
@@ -103,6 +109,16 @@ def test_peak_recovery_days_strategy_eq_normalizes_to_recovery_max_alias():
     assert [(spec.metric, spec.goal) for spec in specs] == [
         ("strategy_eq_recovery_days_max", "min")
     ]
+
+
+@pytest.mark.parametrize("suffix", ["", "_mean", "_min", "_max", "_std", "_median"])
+def test_profit_ratio_alias_resolves_both_artifact_spellings(suffix):
+    alias = f"long_short_profit_ratio{suffix}"
+    canonical = f"pnl_ratio_long_short{suffix}"
+
+    assert canonicalize_metric_name(alias) == canonical
+    assert resolve_metric_value({alias: 0.3}, canonical) == 0.3
+    assert resolve_metric_value({canonical: 0.3}, alias) == 0.3
 
 
 def test_strategy_eq_recovery_max_resolves_legacy_peak_metric_value():
@@ -260,3 +276,22 @@ def test_scoring_reducer_override_requires_effective_suite_scenario():
             default_scenario="base",
             reducer_cfg={"default": "mean"},
         )
+
+
+@pytest.mark.parametrize("metric", ["n_days", "fills_analysis_duration_days"])
+def test_duration_aliases_load_with_default_max_objective(metric):
+    from config import prepare_config
+    from config_utils import get_template_config
+
+    config = get_template_config()
+    config["optimize"]["scoring"] = [metric]
+    prepared = prepare_config(config, verbose=False)
+    assert prepared["optimize"]["scoring"] == [{"metric": "n_days", "goal": "max"}]
+    assert default_objective_goal(metric) == "max"
+
+
+def test_position_held_time_weighted_metric_defaults_to_minimize():
+    specs, _ = normalize_scoring_entries(["position_held_time_weighted_mean_hours"])
+    assert [(spec.metric, spec.goal) for spec in specs] == [
+        ("position_held_time_weighted_mean_hours", "min")
+    ]

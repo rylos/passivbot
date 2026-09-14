@@ -57,6 +57,10 @@ make held positions wholly nontradable.
 
 ## Private Order Websocket Normalization
 
+Order rows proving fill progress (`filled > 0` or `remaining < amount`) request an authoritative
+account refresh even when their status remains open and they match a recent local creation.
+A creation acknowledgement may be a self-echo; fill progress invalidates the account-wide plan.
+
 Authoritative REST open-order reconciliation remains strict. Binance and KuCoin
 private websocket notifications for Passivbot-owned orders may omit native
 long/short metadata; only that hint path may recover `position_side`, only in
@@ -170,6 +174,17 @@ Handling in Passivbot:
 Primary reference: `src/fill_events_manager.py` (`BybitFetcher._fetch_positions_history`).
 
 ## KuCoin Futures
+
+### First-candle market-age discovery
+
+KuCoin rejects `from=1`. Request daily candles from a valid millisecond timestamp
+before futures launch (`2018-01-01`), with `to` explicitly set to the current time.
+Pinned CCXT otherwise derives `to=since + limit * duration`; with `limit=1`, that
+queries only one pre-listing day and returns no data. Retain the first returned
+candle as the age basis. Empty or failed responses remain unknown and do not
+bypass the configured minimum market age; zero cache entries are retried.
+
+Primary reference: [KuCoin futures klines](https://www.kucoin.com/docs-new/rest/futures-trading/market-data/get-klines).
 
 ### IPv4 API-key whitelist transport
 
@@ -715,6 +730,22 @@ Handling:
    it is not a supported WEEX data source in this release.
 
 Primary reference: [WEEX V3 trade-detail API](https://www.weex.com/api-doc/contract/Transaction_API/GetTradeDetails).
+
+## Unavailable Configured Live Markets
+
+Live coin overrides are resolved against the current exchange market snapshot before downstream
+mode or sizing lookups. Skip an unavailable market (including an exact identifier classified as
+`UnknownMarketIdentifier`) with a bounded notice on change, retaining the original config so the
+next market refresh can reconsider it. Do not synthesize an active market or change the shared
+resolver's historical/backtest behavior. Ambiguous identifiers, conflicting overrides, and other
+resolution failures still propagate; a failed refresh must not publish a partial override map.
+
+An inactive market is not an absent market: retain its overrides and existing protective-mode
+handling. Never drop exchange positions or open orders because their coin is unavailable in config;
+missing market metadata for such state remains an explicit failure. Approved-list filtering also
+applies when the eligible market set is empty.
+Connector-specific live-state hooks must run the shared base validation before any connector
+early return, including Hyperliquid unified-account support.
 
 ## General Guidance
 

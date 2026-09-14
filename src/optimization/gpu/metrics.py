@@ -95,8 +95,10 @@ BTC_ACCOUNT_METRICS = frozenset(
 # still emit the normal complete metric set; this list governs only which
 # metrics may guide Metal screening or proxy-side limits.
 _GPU_PROXY_METRIC_CANDIDATES = (
+    "adg_rolling_hmean_strategy_eq",
     "adg_strategy_eq",
     "adg_strategy_eq_w",
+    "adg_time_integrated_strategy_eq",
     "backtest_completion_ratio",
     "calmar_ratio_strategy_eq",
     "calmar_ratio_strategy_eq_w",
@@ -155,9 +157,11 @@ _GPU_PROXY_METRIC_CANDIDATES = (
     "pnl_ratio_long_short",
     "position_held_days_mean",
     "position_held_days_max",
+    "position_held_time_weighted_mean_hours",
     "position_held_hours_mean",
     "position_held_hours_max",
     "positions_held_per_day",
+    "positive_gain_participation_strategy_eq",
     "position_unchanged_days_max",
     "position_unchanged_hours_max",
     "peak_recovery_hours_strategy_eq_long",
@@ -235,6 +239,7 @@ _WEIGHTED_PNL_METRICS = {
 
 _FILL_ACTIVITY_METRICS = {
     "fills_analysis_duration_days",
+    "n_days",
     "fills_active_days_count",
     "fills_active_days_ratio",
     "fills_active_symbols_count",
@@ -431,6 +436,141 @@ def _smoothed_gain_adg(day_eq, active):
 
 def _smoothed_adg(day_eq, active):
     return _smoothed_gain_adg(day_eq, active)[1]
+
+
+def _gain_quality_metrics(day_eq, active, requested):
+    """Reduce compact daily closes into path-sensitive gain-quality metrics."""
+
+    names = {
+        "adg_rolling_hmean_strategy_eq",
+        "adg_time_integrated_strategy_eq",
+        "positive_gain_participation_strategy_eq",
+    }
+    requested = set(requested) & names
+    if not requested:
+        return {}
+
+    batch_size, day_count = day_eq.shape
+    zeros = torch.zeros(batch_size, dtype=day_eq.dtype, device=day_eq.device)
+    if day_count < 2:
+        return {name: zeros for name in requested}
+
+    indices = (
+        torch.arange(day_count, device=day_eq.device)
+        .unsqueeze(0)
+        .expand(batch_size, day_count)
+    )
+    counts = active.sum(dim=1)
+    compact_order = torch.argsort(
+        torch.where(active, indices, indices + day_count), dim=1
+    )
+    compact_eq = day_eq.gather(1, compact_order)
+    compact_active = indices < counts.unsqueeze(1)
+    valid_equity = (
+        (~compact_active | (torch.isfinite(compact_eq) & (compact_eq > 0.0)))
+        .all(dim=1)
+        & (counts >= 2)
+    )
+    safe_eq = torch.where(
+        compact_active & (compact_eq > 0.0) & torch.isfinite(compact_eq),
+        compact_eq,
+        torch.ones_like(compact_eq),
+    )
+    log_eq = safe_eq.log()
+    n_intervals = (counts - 1).clamp(min=1)
+    result = {}
+
+    if "positive_gain_participation_strategy_eq" in requested:
+        adjacent = compact_active[:, :-1] & compact_active[:, 1:]
+        positive = torch.where(
+            adjacent,
+            (log_eq[:, 1:] - log_eq[:, :-1]).clamp(min=0.0),
+            torch.zeros_like(log_eq[:, 1:]),
+        )
+        positive_sum = positive.sum(dim=1)
+        positive_squares_sum = (positive * positive).sum(dim=1)
+        participation = torch.where(
+            valid_equity & (positive_squares_sum > torch.finfo(day_eq.dtype).eps),
+            positive_sum * positive_sum
+            / (
+                n_intervals.to(day_eq.dtype)
+                * positive_squares_sum.clamp(min=torch.finfo(day_eq.dtype).eps)
+            ),
+            zeros,
+        )
+        result["positive_gain_participation_strategy_eq"] = participation
+
+    if "adg_time_integrated_strategy_eq" in requested:
+        relative_log_eq = log_eq - log_eq[:, :1]
+        trapezoid_weights = compact_active.to(day_eq.dtype)
+        trapezoid_weights[:, 0] *= 0.5
+        last_indices = (counts - 1).clamp(min=0)
+        last_weights = trapezoid_weights.gather(1, last_indices.unsqueeze(1))
+        trapezoid_weights.scatter_(1, last_indices.unsqueeze(1), last_weights * 0.5)
+        area = (relative_log_eq * trapezoid_weights).sum(dim=1)
+        daily_log_growth = 2.0 * area / n_intervals.to(day_eq.dtype).square()
+        result["adg_time_integrated_strategy_eq"] = torch.where(
+            valid_equity,
+            torch.expm1(daily_log_growth),
+            torch.where(counts >= 2, torch.full_like(zeros, -1.0), zeros),
+        )
+
+    if "adg_rolling_hmean_strategy_eq" in requested:
+        daily_log_growth_sum = zeros.clone()
+        horizon_count = torch.zeros_like(counts)
+        prior_horizons = []
+        for effective_count, minimum, maximum in (
+            (48, 7, 30),
+            (16, 14, 90),
+            (8, 30, 180),
+        ):
+            horizon = torch.div(n_intervals, effective_count, rounding_mode="floor")
+            horizon = horizon.clamp(min=minimum, max=maximum)
+            horizon = torch.minimum(horizon, n_intervals)
+            include = torch.div(n_intervals, horizon, rounding_mode="floor") >= 8
+            for prior in prior_horizons:
+                include &= horizon != prior
+            prior_horizons.append(horizon)
+
+            end_indices = indices
+            start_indices = (end_indices - horizon.unsqueeze(1)).clamp(min=0)
+            window_mask = (
+                include.unsqueeze(1)
+                & (end_indices >= horizon.unsqueeze(1))
+                & (end_indices < counts.unsqueeze(1))
+            )
+            log_growth = log_eq - log_eq.gather(1, start_indices)
+            inverse_log_growth = torch.where(
+                window_mask, -log_growth, torch.full_like(log_growth, float("-inf"))
+            )
+            window_count = window_mask.sum(dim=1).clamp(min=1)
+            log_harmonic_growth = (
+                window_count.to(day_eq.dtype).log()
+                - torch.logsumexp(inverse_log_growth, dim=1)
+            )
+            daily_log_growth_sum += torch.where(
+                include,
+                log_harmonic_growth / horizon.to(day_eq.dtype),
+                zeros,
+            )
+            horizon_count += include.to(horizon_count.dtype)
+
+        fallback = (
+            log_eq.gather(1, (counts - 1).clamp(min=0).unsqueeze(1)).squeeze(1)
+            - log_eq[:, 0]
+        ) / n_intervals.to(day_eq.dtype)
+        rolling_daily_log_growth = torch.where(
+            horizon_count > 0,
+            daily_log_growth_sum / horizon_count.clamp(min=1).to(day_eq.dtype),
+            fallback,
+        )
+        result["adg_rolling_hmean_strategy_eq"] = torch.where(
+            valid_equity,
+            torch.expm1(rolling_daily_log_growth),
+            torch.where(counts >= 2, torch.full_like(zeros, -1.0), zeros),
+        )
+
+    return result
 
 
 def _equity_shape_metrics(day_eq, active):
@@ -639,7 +779,7 @@ def _weighted_percentile(values, counts, percentile):
 
 
 def _fill_gap_metrics(out, run):
-    """Conservatively reduce coalesced fill timestamps and log-gap bins."""
+    """Reduce streamed gap moments and conservative percentile log bins."""
 
     interval_ms = max(float(run.interval_ms), 1.0)
     first_eq_ts = out["first_eq_ts"].to(torch.float64)
@@ -714,8 +854,14 @@ def _fill_gap_metrics(out, run):
     time_weighted_mean = torch.where(
         span_hours > 0.0,
         (
-            weighted_values.square() * counts.to(values.dtype)
-        ).sum(dim=1)
+            torch.where(
+                has_fill,
+                out["gap_sum_squared_hours"].to(torch.float64),
+                torch.zeros_like(span_hours),
+            )
+            + lead_hours.square()
+            + trail_hours.square()
+        )
         / span_hours.clamp(min=1.0e-12),
         torch.zeros_like(span_hours),
     )
@@ -876,6 +1022,7 @@ def _weighted_subset_context(
         )
         subsets.append(
             active & (day_ids.unsqueeze(0) >= subset_start_day.unsqueeze(1))
+            & (subset_start_step <= last_eq_steps).unsqueeze(1)
         )
         subset_start_steps.append(subset_start_step)
         subset_start_timestamps.append(subset_start_ts)
@@ -929,7 +1076,8 @@ def _weighted_adg(
         total += torch.where(
             eligible, _smoothed_adg(day_eq, subset), torch.zeros_like(total)
         )
-    return total / 10.0
+    count = torch.stack([subset.any(dim=1) for subset in subsets]).sum(dim=0)
+    return total / count.clamp(min=1).to(total.dtype)
 
 
 WEIGHTED_STRATEGY_EQ_METRICS = {
@@ -981,7 +1129,7 @@ def _weighted_daily_series_metrics(
         first_timestamp,
         interval_ms,
     )
-    fill_eligible = fill_count.to(torch.float64) > 1.0
+    fill_eligible = fill_count.to(torch.float64) > 0.0
     timestamp_origin = float(first_timestamp)
     finite_last_fill = torch.isfinite(last_fill_ts)
     relative_last_fill_ms = torch.where(
@@ -992,11 +1140,9 @@ def _weighted_daily_series_metrics(
     last_fill_steps = torch.floor(
         relative_last_fill_ms / float(interval_ms) + 0.5
     ).to(torch.long)
-    # Unlike weighted equity-return metrics, Rust's weighted shape and volume
-    # analysis admits a one-sample equity run when it has multiple fills. The
-    # full-run analysis contributes one tenth, then the first empty suffix ends
-    # the loop. Only finite, ordered timestamps and one active sample are
-    # required here.
+    # Equity-only suffixes remain evaluable after the last fill. The full
+    # run still needs actual fill evidence, and empty sample windows do not
+    # contribute to the denominator.
     eligible = (
         fill_eligible
         & torch.isfinite(first_eq_ts)
@@ -1025,9 +1171,7 @@ def _weighted_daily_series_metrics(
     for subset_index, (subset, subset_start_step, subset_start_ts) in enumerate(
         zip(subsets, subset_start_steps, subset_start_timestamps)
     ):
-        subset_eligible = (
-            eligible & finite_last_fill & (last_fill_steps >= subset_start_step)
-        )
+        subset_eligible = eligible & subset.any(dim=1)
         if "volume_pct_per_day_avg_w" in requested:
             if subset_index == 0:
                 volume_fill_mask = day_has_fill & subset
@@ -1059,7 +1203,8 @@ def _weighted_daily_series_metrics(
                 torch.zeros_like(totals["volume_pct_per_day_avg_w"]),
             )
             totals["volume_pct_per_day_avg_w"] += torch.where(
-                subset_eligible & (fill_days > 0),
+                subset_eligible & finite_last_fill
+                & (last_fill_steps >= subset_start_step) & (fill_days > 0),
                 value,
                 torch.zeros_like(value),
             )
@@ -1070,10 +1215,9 @@ def _weighted_daily_series_metrics(
                 totals[name] += torch.where(
                     subset_eligible, value, torch.zeros_like(value)
                 )
-    result = {name: value / 10.0 for name, value in totals.items()}
-    # analyze_backtest returns early for zero or one fill. Preserve the custom
-    # Analysis defaults for weighted shape metrics; weighted volume defaults
-    # to zero.
+    count = torch.stack([subset.any(dim=1) for subset in subsets]).sum(dim=0)
+    result = {name: value / count.clamp(min=1).to(value.dtype) for name, value in totals.items()}
+    # Preserve the exact no-fill Analysis defaults.
     for name in shape_names:
         result[name] = torch.where(
             fill_eligible, result[name], torch.ones_like(result[name])
@@ -1159,7 +1303,8 @@ def _weighted_strategy_eq_metrics(
             totals[name] += torch.where(
                 eligible, value, torch.zeros_like(value)
             )
-    return {name: value / 10.0 for name, value in totals.items()}
+    count = torch.stack([subset.any(dim=1) for subset in subsets]).sum(dim=0)
+    return {name: value / count.clamp(min=1).to(value.dtype) for name, value in totals.items()}
 
 
 def _daily_pnl_stats(day_net_pnl, day_last_fill_balance, mask):
@@ -1249,6 +1394,7 @@ def _fill_activity_metrics(out: dict, run, requested: set[str]) -> dict:
         / duration_days.ceil().clamp(min=1.0),
         "fills_active_symbols_count": fills_active_symbols_count,
         "fills_analysis_duration_days": duration_days,
+        "n_days": duration_days,
         "fills_count": fill_count,
         "fills_count_close": fills_count_close,
         "fills_count_entry": fills_count_entry,
@@ -1323,7 +1469,7 @@ def _weighted_pnl_metrics(
     fill_count = torch.where(
         active, day_fill_count, torch.zeros_like(day_fill_count)
     )
-    eligible = fill_count.sum(dim=1) > 1.0
+    eligible = fill_count.sum(dim=1) > 0.0
     totals = {
         name: torch.zeros(
             day_net_pnl.shape[0],
@@ -1352,7 +1498,8 @@ def _weighted_pnl_metrics(
             totals[name] += torch.where(
                 include, values[name], torch.zeros_like(values[name])
             )
-    return {name: value / 10.0 for name, value in totals.items()}
+    count = torch.stack([subset.any(dim=1) for subset in subsets]).sum(dim=0)
+    return {name: value / count.clamp(min=1).to(value.dtype) for name, value in totals.items()}
 
 
 def _hard_stop_lifecycle_metrics(out: dict, run) -> dict:
@@ -1620,6 +1767,12 @@ def _daily_peak_recovery_ms(day_end_eq, active):
         peak_day = torch.where(
             new_high, torch.full_like(peak_day, day), peak_day
         )
+        # Count the still-unrecovered interval through every valid sample.
+        recovery_days = torch.where(
+            valid & started,
+            torch.maximum(recovery_days, (day - peak_day).to(day_end_eq.dtype)),
+            recovery_days,
+        )
         started |= valid
     return torch.where(
         started,
@@ -1850,7 +2003,7 @@ def _btc_account_metrics(out: dict, run, data: dict, requested) -> dict:
         "mdg_w_per_exposure_short_btc",
     }:
         wanted_safe_weighted_sources.add("mdg_strategy_eq_w")
-    enough_fills = out["fill_count"].to(torch.float64) > 1.0
+    enough_fills = out["fill_count"].to(torch.float64) > 0.0
     if wanted_safe_weighted_sources:
         safe_weighted = _weighted_strategy_eq_metrics(
             day_end_btc,
@@ -1963,6 +2116,9 @@ def compute_objectives(out: dict, run, data: dict, needed=None) -> dict:
     }
 
     gain, adg = _smoothed_gain_adg(day_end_eq, active)
+    gain_quality_metrics = _gain_quality_metrics(
+        day_end_eq, active, requested_sources
+    )
     daily_changes, change_mask = _pct_change(day_end_eq, active)
     mdg = _masked_median(daily_changes, change_mask)
     omega = _omega_ratio(daily_changes, change_mask)
@@ -2110,6 +2266,18 @@ def compute_objectives(out: dict, run, data: dict, needed=None) -> dict:
             torch.zeros_like(held_count),
         )
 
+    held_time_weighted_hours = zeros
+    if "position_held_time_weighted_mean_hours" in requested:
+        held_hours_sum = out["held_sum_ms"].to(torch.float64) / 3_600_000.0
+        held_time_weighted_hours = torch.where(
+            held_hours_sum > 0.0,
+            out["held_sum_squared_hours"].to(torch.float64)
+            / torch.where(
+                held_hours_sum > 0.0, held_hours_sum, torch.ones_like(held_hours_sum)
+            ),
+            torch.zeros_like(held_hours_sum),
+        )
+
     boundary_lead = torch.where(
         torch.isfinite(out["first_fill_ts"]),
         (out["first_fill_ts"] - first_eq_ts) / 60_000.0,
@@ -2212,6 +2380,7 @@ def compute_objectives(out: dict, run, data: dict, needed=None) -> dict:
         "omega_ratio_strategy_eq": omega,
         "position_held_days_mean": held_hours_mean / 24.0,
         "position_held_days_max": held_days,
+        "position_held_time_weighted_mean_hours": held_time_weighted_hours,
         "position_held_hours_mean": held_hours_mean,
         "position_held_hours_max": held_days * 24.0,
         "positions_held_per_day": positions_held_per_day,
@@ -2309,6 +2478,7 @@ def compute_objectives(out: dict, run, data: dict, needed=None) -> dict:
     objectives.update(weighted_daily_series_metrics)
     objectives.update(weighted_pnl_metrics)
     objectives.update(equity_shape_metrics)
+    objectives.update(gain_quality_metrics)
     for name, (source, side) in _USD_PER_EXPOSURE_METRICS.items():
         if name not in requested:
             continue

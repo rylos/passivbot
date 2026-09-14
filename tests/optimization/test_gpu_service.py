@@ -48,6 +48,7 @@ from optimization.gpu.service import (
     _hsl_params,
     _hsl_diagnostics_needed,
     _mps_dispatch_batch_size,
+    _mps_multicoin_dispatch_plan,
     _mps_strategy_eq_recovery_distribution,
     _new_gpu_dispatch_progress,
     _new_gpu_proxy_profile,
@@ -406,6 +407,27 @@ def test_single_coin_shader_topology_is_fail_closed(
     )
 
 
+@pytest.mark.parametrize("strategy,batch,bars,sides,cap,expected", [
+    ("trailing_martingale", 4096, 900000, 1, 1_000_000_000, (True, 512, 4096)),
+    ("trailing_martingale", 4096, 60000, 1, 1_000_000_000, (False, 574, 60000)),
+    ("trailing_martingale", 4096, 4320, 1, 1_000_000_000, (False, 4096, 4320)),
+    ("trailing_martingale", 16, 900000, 1, 1_000_000_000, (False, 16, 900000)),
+    ("trailing_martingale", 4096, 900000, 2, 1_000_000_000, (False, 19, 900000)),
+    ("ema_anchor", 4096, 900000, 1, 1_000_000_000, (False, 38, 900000)),
+    ("trailing_martingale", 4096, 900000, 1, 100, (True, 1, 3)),
+])
+def test_mps_multicoin_temporal_plan_preserves_work_limit(
+    strategy, batch, bars, sides, cap, expected
+):
+    result = _mps_multicoin_dispatch_plan(
+        strategy, batch, n_bars=bars, n_coins=29, n_sides=sides,
+        max_candidate_bars=cap,
+    )
+    assert result == expected
+    _, candidate_batch, history_chunk = result
+    assert candidate_batch * history_chunk * 29 * sides <= cap
+
+
 def test_mps_dispatch_batch_size_bounds_single_and_multicoin_work():
     n_bars = 1_923_175
 
@@ -597,7 +619,7 @@ def test_single_coin_proxy_profile_records_dispatch_shape_and_timings(monkeypatc
         return output
 
     proxy.runner.run = profiled_run
-    monkeypatch.setattr(torch.mps, "synchronize", lambda: None)
+    monkeypatch.setattr("optimization.gpu.service.synchronize", lambda: None)
 
     proxy.evaluate([{"value": float(index)} for index in range(5)])
 
@@ -737,6 +759,26 @@ def test_gpu_profile_candidate_bars_include_coin_and_side_topology():
 
     assert profile["candidate_bars"] == 1_600
     assert profile["kernel_candidate_bars"] == 1_600
+
+
+def test_gpu_profile_temporal_dispatches_count_replayed_steps_once():
+    proxy = SimpleNamespace(batch_size=256, dispatch_batch_size=256,
+                            strategy_kind="trailing_martingale")
+    runner = SimpleNamespace(n=60_000, n_coins=29, last_profile={
+        "batch_size": 256, "dispatch_count": 8, "cold": True,
+        "kernel_candidate_steps": 256 * 59_999, "temporal_chunk_bars": 8192,
+        "max_dispatch_seconds": 4.0, "replay_state_bytes_per_candidate": 29_296,
+        "threads_per_threadgroup": 32,
+    })
+    profile = _new_gpu_proxy_profile(proxy, [{}] * 256, (runner,), coin_count=29,
+                                     side_count=1)
+    _add_gpu_runner_profile(profile, runner)
+    assert profile["kernel_candidate_bars"] == 256 * 59_999 * 29
+    assert profile["dispatch_count"] == 8
+    assert profile["cold_dispatch_count"] == 1
+    assert profile["warm_dispatch_count"] == 7
+    assert profile["temporal_dispatches"][0]["max_dispatch_seconds"] == 4.0
+    assert profile["temporal_dispatches"][0]["threads_per_threadgroup"] == 32
 
 
 def test_gpu_profile_candidate_bars_use_truncated_effective_steps():
@@ -1567,6 +1609,26 @@ def test_multicoin_proxy_constructs_fused_shared_account_runner(
         # directional surfaces participate in global auto-unstuck selection.
         config["bot"][side]["unstuck"]["enabled"] = True
         config["bot"][side]["hsl"]["enabled"] = True
+        for key in ("ema_span_0", "ema_span_1"):
+            strategy = config["bot"][side]["strategy"][strategy_kind]
+            span = (
+                strategy["entry"]
+                if strategy_kind == "trailing_martingale"
+                else strategy
+            )[key]
+            config["bot"][side]["unstuck"][key] = span
+            strategy_bounds = config["optimize"]["bounds"][side]["strategy"][
+                strategy_kind
+            ]
+            (
+                strategy_bounds["entry"]
+                if strategy_kind == "trailing_martingale"
+                else strategy_bounds
+            )[key] = [
+                span,
+                span,
+            ]
+            config["optimize"]["bounds"][side]["unstuck"][key] = [span, span]
         flat = flatten_shared_bot_side(config["bot"][side])
         config["bot"][side].update(
             {key: value for key, value in flat.items() if key.startswith("unstuck_")}
@@ -1761,11 +1823,12 @@ def test_gpu_multicoin_proxy_accepts_staggered_valid_gaps_and_ended_tails():
         _require_supported_multicoin_valid_tails(hlcvs, [99, 0], [98, 99])
 
 
-def test_gpu_multicoin_proxy_accepts_all_nan_candle_in_windows():
+def test_gpu_multicoin_proxy_rejects_all_nan_candle_in_windows():
     hlcvs = np.ones((100, 2, 4), dtype=np.float64)
     hlcvs[40, :, :3] = np.nan
 
-    _require_supported_multicoin_valid_tails(hlcvs, [0, 0], [59, 99])
+    with pytest.raises(ValueError, match="contiguous.*candle_index=40"):
+        _require_supported_multicoin_valid_tails(hlcvs, [0, 0], [59, 99])
 
 
 def test_gpu_multicoin_proxy_rejects_all_nan_first_valid_candle():
@@ -1856,17 +1919,18 @@ def test_gpu_multicoin_hsl_requires_each_coin_to_have_contiguous_valid_candles()
     )
 
 
-def test_gpu_proxy_accepts_only_exact_balance_only_internal_gaps():
+def test_gpu_proxy_rejects_all_internal_gaps():
     hlcvs = np.ones((4, 2, 4), dtype=np.float64)
     hlcvs[2, 1, :3] = np.nan
 
-    _require_exact_safe_proxy_candles(
-        hlcvs,
-        exposure_eligible_coins=[True, True],
-        first_valid_indices=[0, 0],
-        last_valid_indices=[3, 3],
-        require_positive_high_low=True,
-    )
+    with pytest.raises(ValueError, match="all-NaN.*invalid candle at 2"):
+        _require_exact_safe_proxy_candles(
+            hlcvs,
+            exposure_eligible_coins=[True, True],
+            first_valid_indices=[0, 0],
+            last_valid_indices=[3, 3],
+            require_positive_high_low=True,
+        )
 
     hlcvs[2, 1, :3] = 0.0
     with pytest.raises(ValueError, match="coin index 1, invalid candle at 2"):
@@ -1899,7 +1963,7 @@ def test_gpu_proxy_accepts_only_exact_balance_only_internal_gaps():
         )
 
 
-def test_gpu_single_coin_accepts_nan_gap_but_rejects_zero_for_all_metrics():
+def test_gpu_single_coin_rejects_nan_gap_and_zero_for_all_metrics():
     hlcvs = np.ones((4, 1, 4), dtype=np.float64)
     hlcvs[2, 0, :3] = np.nan
     kwargs = {
@@ -1907,7 +1971,8 @@ def test_gpu_single_coin_accepts_nan_gap_but_rejects_zero_for_all_metrics():
         "last_valid_idx": 3,
     }
 
-    _require_no_unsafe_single_coin_candles(hlcvs, **kwargs)
+    with pytest.raises(ValueError, match="invalid candle at 2"):
+        _require_no_unsafe_single_coin_candles(hlcvs, **kwargs)
 
     hlcvs[2, 0, :3] = 0.0
     with pytest.raises(ValueError, match="invalid candle at 2"):
@@ -2021,6 +2086,8 @@ def test_tm_total_exposure_repair_packs_exact_rust_inputs(
 def test_single_coin_unstuck_packs_exact_rust_inputs():
     assert _unstuck_params(
         {
+            "unstuck_ema_span_0": 17.25,
+            "unstuck_ema_span_1": 211.75,
             "unstuck_enabled": True,
             "unstuck_ema_gating_enabled": False,
             "unstuck_close_pct": 0.125,
@@ -2029,6 +2096,8 @@ def test_single_coin_unstuck_packs_exact_rust_inputs():
             "unstuck_threshold": 0.85,
         }
     ) == {
+        "unstuck_ema_span_0": 17.25,
+        "unstuck_ema_span_1": 211.75,
         "unstuck_enabled": 1.0,
         "unstuck_ema_gating_enabled": 0.0,
         "unstuck_close_pct": 0.125,
@@ -2358,9 +2427,11 @@ def test_combine_hedged_multicoin_outputs_uses_conservative_surface():
             ),
             "max_dd": torch.tensor([0.20]),
             "held_max_ms": torch.tensor([100.0]),
+            "held_sum_squared_hours": torch.tensor([9.0]),
             "held_sum_ms": torch.tensor([300.0]),
             "held_count": torch.tensor([2.0]),
             "position_unchanged_max_ms": torch.tensor([150.0]),
+            "gap_sum_squared_hours": torch.tensor([4.0]),
             "gap_hist": torch.tensor([[1, 2]]),
             "gap_max_ms": torch.tensor([300.0]),
             "first_fill_ts": torch.tensor([first_fill]),
@@ -2400,6 +2471,7 @@ def test_combine_hedged_multicoin_outputs_uses_conservative_surface():
     short["max_dd"] = torch.tensor([0.30])
     short["held_max_ms"] = torch.tensor([200.0])
     short["held_sum_ms"] = torch.tensor([500.0])
+    short["held_sum_squared_hours"] = torch.tensor([25.0])
     short["held_count"] = torch.tensor([3.0])
     short["position_unchanged_max_ms"] = torch.tensor([250.0])
     short["gap_max_ms"] = torch.tensor([250.0])
@@ -2435,6 +2507,7 @@ def test_combine_hedged_multicoin_outputs_uses_conservative_surface():
     assert combined["fill_count_long"].item() == 2.0
     assert combined["fills_active_days_count"].item() == 1.0
     assert combined["held_sum_ms"].item() == 800.0
+    assert combined["held_sum_squared_hours"].item() == 34.0
     assert combined["held_count"].item() == 5.0
     assert combined["position_unchanged_max_ms"].item() == 250.0
     assert combined["pnl_recovery_max_ms"].item() == 450.0
@@ -2477,9 +2550,11 @@ def test_combine_hedged_multicoin_outputs_detects_shared_equity_liquidation():
             "day_fill_count": torch.ones((1, 3)),
             "max_dd": torch.tensor([0.48]),
             "held_max_ms": torch.tensor([100.0]),
+            "held_sum_squared_hours": torch.zeros(1),
             "held_sum_ms": torch.tensor([100.0]),
             "held_count": torch.tensor([1.0]),
             "position_unchanged_max_ms": torch.tensor([150.0]),
+            "gap_sum_squared_hours": torch.tensor([4.0]),
             "gap_hist": torch.tensor([[1, 2]]),
             "gap_max_ms": torch.tensor([300.0]),
             "first_fill_ts": torch.tensor([100.0]),
@@ -2526,9 +2601,11 @@ def test_combine_hedged_multicoin_outputs_detects_shared_balance_depletion():
             "day_fill_count": torch.ones((1, 3)),
             "max_dd": torch.tensor([0.40]),
             "held_max_ms": torch.tensor([100.0]),
+            "held_sum_squared_hours": torch.zeros(1),
             "held_sum_ms": torch.tensor([100.0]),
             "held_count": torch.tensor([1.0]),
             "position_unchanged_max_ms": torch.tensor([150.0]),
+            "gap_sum_squared_hours": torch.tensor([4.0]),
             "gap_hist": torch.tensor([[1, 2]]),
             "gap_max_ms": torch.tensor([300.0]),
             "first_fill_ts": torch.tensor([100.0]),
@@ -2579,6 +2656,8 @@ def test_multicoin_coin_overrides_pack_only_explicit_exact_values():
                     "risk_entry_cooldown_minutes": 15.0,
                     "wallet_exposure_limit": 0.4,
                     "risk_we_excess_allowance_pct": 0.25,
+                    "unstuck_ema_span_0": 17.25,
+                    "unstuck_ema_span_1": 211.75,
                     "unstuck_enabled": True,
                     "unstuck_ema_gating_enabled": False,
                     "unstuck_close_pct": 0.125,
@@ -2603,6 +2682,8 @@ def test_multicoin_coin_overrides_pack_only_explicit_exact_values():
                         },
                         "wallet_exposure_limit": 0.4,
                         "unstuck": {
+                            "ema_span_0": 17.25,
+                            "ema_span_1": 211.75,
                             "enabled": True,
                             "ema_gating_enabled": False,
                             "close_pct": 0.125,
@@ -2638,7 +2719,8 @@ def test_multicoin_coin_overrides_pack_only_explicit_exact_values():
     assert matrix[1, 13:19].tolist() == pytest.approx(
         [1.0, 0.0, 0.125, -0.01, 0.02, 0.85]
     )
-    assert np.isnan(matrix[1, 19:]).all()
+    assert np.isnan(matrix[1, 19:-2]).all()
+    assert matrix[1, -2:].tolist() == pytest.approx([17.25, 211.75])
     assert contract["coins"] == ["BTC", "ETH"]
     assert contract["values"][0] == [None] * EMA_ANCHOR_COIN_OVERRIDE_COLS
     assert contract["exact_overrides"] == [
@@ -3039,11 +3121,11 @@ def test_multicoin_tm_coin_overrides_pack_only_explicit_exact_values():
         key for key, _path in TRAILING_MARTINGALE_COIN_OVERRIDE_PATHS
     ) == TRAILING_MARTINGALE_PARAM_KEYS[:23]
     strategy_base = {
-        "ema_span_0": 10.0,
-        "ema_span_1": 20.0,
         "volatility_ema_span_1h": 30.0,
         "volatility_ema_span_1m": 40.0,
         "entry": {
+            "ema_span_0": 10.0,
+            "ema_span_1": 20.0,
             "ema_gate_mode": "all",
             "double_down_factor": 1.1,
             "initial_ema_dist": 0.01,
@@ -3259,11 +3341,11 @@ def test_trailing_martingale_flattening_preserves_nested_params_and_gates(
     mode, expected
 ):
     strategy = {
-        "ema_span_0": 10.0,
-        "ema_span_1": 20.0,
         "volatility_ema_span_1h": 30.0,
         "volatility_ema_span_1m": 40.0,
         "entry": {
+            "ema_span_0": 10.0,
+            "ema_span_1": 20.0,
             "ema_gate_mode": mode,
             "double_down_factor": 1.1,
             "initial_ema_dist": 0.01,
@@ -3312,11 +3394,9 @@ def test_trailing_martingale_flattening_rejects_unknown_gate_mode():
 
 def test_trailing_martingale_flattening_reads_canonical_payload_cooldown():
     strategy = {
-        "ema_span_0": 10.0,
-        "ema_span_1": 20.0,
         "volatility_ema_span_1h": 30.0,
         "volatility_ema_span_1m": 40.0,
-        "entry": {"ema_gate_mode": "all"},
+        "entry": {"ema_span_0": 10.0, "ema_span_1": 20.0, "ema_gate_mode": "all"},
         "close": {},
     }
     for key in TRAILING_MARTINGALE_COIN_OVERRIDE_PATHS:
@@ -3335,3 +3415,70 @@ def test_trailing_martingale_flattening_reads_canonical_payload_cooldown():
     )
 
     assert flattened["entry_cooldown_minutes"] == 37.0
+
+
+@pytest.mark.parametrize("strategy,batch,bars,sides,cap,expected", [
+    ("trailing_martingale", 4096, 3000000, 2, 1_000_000_000, (True, 1024, 96000)),
+    ("trailing_martingale", 4096, 3000000, 1, 1_000_000_000, (False, 333, 3000000)),
+    ("ema_anchor", 4096, 3000000, 2, 1_000_000_000, (False, 166, 3000000)),
+    ("trailing_martingale", 16, 3000000, 2, 1_000_000_000, (False, 16, 3000000)),
+    ("trailing_martingale", 4096, 4320, 2, 1_000_000_000, (False, 4096, 4320)),
+    ("trailing_martingale", 4096, 3000000, 2, 100, (True, 1, 50)),
+])
+def test_mps_single_coin_temporal_plan_preserves_work_limit(strategy, batch, bars, sides, cap, expected):
+    from optimization.gpu.service import _mps_single_coin_dispatch_plan
+    plan = _mps_single_coin_dispatch_plan(strategy, batch, n_bars=bars, n_sides=sides, max_candidate_bars=cap)
+    assert plan == expected
+    assert plan[1] * plan[2] * sides <= cap
+
+
+@pytest.mark.parametrize("coupled", [False, True])
+def test_parameter_columns_preserve_fixed_override_then_ema_coupling(coupled):
+    proxy = MpsEmaAnchorProxy.__new__(MpsEmaAnchorProxy)
+    proxy.param_keys = (
+        "ema_span_0",
+        "ema_span_1",
+        "unstuck_ema_span_0",
+        "unstuck_ema_span_1",
+        "offset",
+    )
+    proxy.base_params = {
+        "short": dict(zip(proxy.param_keys, [6.0, 7.0, 8.0, 9.0, 0.1])),
+        "long": dict(zip(proxy.param_keys, [1.0, 2.0, 3.0, 4.0, 0.2])),
+    }
+    proxy.static_coin_override_params = {
+        "long": {"ema_span_0": 10.25, "unstuck_ema_span_0": 999.0},
+        "short": {"offset": 0.125},
+    }
+    proxy.couple_unstuck_emas = coupled
+    candidate = {
+        "long_ema_span_0": 12.5,
+        "long_ema_span_1": 2.5,
+        "long_unstuck_ema_span_1": 13.5,
+        "long_offset": 0.5,
+        "short_offset": 0.75,
+        "unrelated": -999.0,
+    }
+    original = dict(candidate)
+    expected = (
+        [10.25, 2.5, 10.25, 2.5, 0.5, 6.0, 7.0, 6.0, 7.0, 0.125]
+        if coupled
+        else [10.25, 2.5, 999.0, 13.5, 0.5, 6.0, 7.0, 8.0, 9.0, 0.125]
+    )
+    matrix = proxy._parameter_matrix([candidate, candidate])
+    np.testing.assert_array_equal(matrix, [expected, expected])
+    assert matrix.dtype == np.float64
+    assert matrix.flags.c_contiguous
+    assert candidate == original
+
+
+def test_parameter_columns_keep_candidate_fallback_and_missing_key_failure():
+    proxy = MpsMulticoinEmaProxy.__new__(MpsMulticoinEmaProxy)
+    proxy.param_keys = ("offset",)
+    proxy.sides = ["short"]
+    proxy.base_params = {"short": {}}
+    np.testing.assert_array_equal(proxy._parameter_matrix([{"short_offset": 0.125}]), [[0.125]])
+    with pytest.raises(KeyError, match="offset"):
+        proxy._parameter_matrix([{}])
+    with pytest.raises((TypeError, ValueError)):
+        proxy._parameter_matrix([{"short_offset": None}])

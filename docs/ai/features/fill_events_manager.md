@@ -13,6 +13,17 @@
    non-quote fee converted by a fresh ticker, reported fee rate, then
    `live.fee_pct_fallback`. Every fill is sanity-checked by fee/notional ratio
    against `live.fee_pct_sanity_abs_max`; outliers use the fallback percentage.
+   Explicit finite zero fees and fully resolved zero-sum fee lists are authoritative amounts.
+   Loading a cached fallback or rate estimate rechecks retained amounts and persists a resolved fee;
+   unresolved historical estimates retain their original policy. Same-currency offsetting
+   fees need no ticker when their net amount is zero.
+   Coalescing preserves missing or malformed fee amounts for fallback resolution.
+   A zero non-quote fee needs no ticker and records `fee_conversion_source=zero_amount`.
+   Cached conversion quotes remain subject to `live.fee_conversion_max_age_ms` against the
+   current time, fetch time, and each fill timestamp. Failed conversion lookups retry after
+   at most one minute, bounded further by that same configured age. A batch reuses an identical
+   pair/fill-time lookup, including an unavailable result. A quote rejected only for one fill
+   timestamp must not create a pair-wide failed lookup.
 6. Do not mix legacy/missing-contract cache rows with current rows. Repair or
    rebuild legacy fill-event caches before using trading-critical accounting.
 7. Newly discovered fills may carry immutable `provenance` with attribution
@@ -150,7 +161,16 @@ logs, runtime windows, and immutable manifests.
 6. KuCoin position-history PnL is authoritative for a completed position cycle. Overlapping trade
    refreshes may return the same close as pending again; they must preserve an already reconciled
    cycle value. Reapplying an unchanged cycle observation is a no-op, while a changed authoritative
-   total is redistributed across that lifecycle and persisted.
+   total is redistributed across that lifecycle and persisted. Classify trade reductions from
+   `side` and `position_side` before optional order-label enrichment; trade-window estimates
+   are pending until reconstruction against the cached basis or cycle reconciliation.
+   On ordinary current-contract cache load, use the KuCoin doctor to back up and repair
+   trade-derived reductions mislabeled as `authoritative`, including nonzero estimates.
+   Preserve explicit synthetic and cycle-reconciled sources, raw data, provenance, coverage,
+   and the incremental refresh checkpoint. This accounting normalization is automatic;
+   standalone doctor check mode remains read-only. An incomplete basis remains degraded
+   and blocks enabled PnL risk consumers. Repeated loads do not create another backup once
+   the mislabeled rows have been repaired.
 7. Fills sharing one millisecond carry no execution order in exchange responses or caches, yet
    position reconstruction replays them in list order. When the exchange reports the position size
    preceding each fill (Hyperliquid `startPosition`), retain each execution boundary and reorder an

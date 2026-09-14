@@ -309,7 +309,8 @@ impl EquityHardStopRuntimePy {
         ema_span_minutes,
         tier_ratio_yellow,
         tier_ratio_orange,
-        latch_red = true
+        latch_red = true,
+        at_fill_boundary = false
     ))]
     pub fn apply_sample(
         &mut self,
@@ -322,6 +323,7 @@ impl EquityHardStopRuntimePy {
         tier_ratio_yellow: f64,
         tier_ratio_orange: f64,
         latch_red: bool,
+        at_fill_boundary: bool,
     ) -> PyResult<Py<PyDict>> {
         self.last_rolling_peak = peak_strategy_equity;
         let cfg = ehsl::HardStopConfig {
@@ -332,13 +334,14 @@ impl EquityHardStopRuntimePy {
                 orange: tier_ratio_orange,
             },
         };
-        let step = ehsl::step_with_peak_strategy_equity_latch(
+        let step = ehsl::step_with_peak_strategy_equity_at_boundary(
             &mut self.state,
             cfg,
             equity,
             peak_strategy_equity,
             timestamp_ms,
             latch_red,
+            at_fill_boundary,
         )
         .map_err(PyValueError::new_err)?;
 
@@ -1728,6 +1731,11 @@ fn run_backtest_core<'py>(
             strategy.short.peak_recovery_days_strategy_eq;
         analysis_usd.gain_strategy_eq = strategy.overall.gain_strategy_eq;
         analysis_usd.adg_strategy_eq = strategy.overall.adg_strategy_eq;
+        analysis_usd.adg_rolling_hmean_strategy_eq = strategy.overall.adg_rolling_hmean_strategy_eq;
+        analysis_usd.adg_time_integrated_strategy_eq =
+            strategy.overall.adg_time_integrated_strategy_eq;
+        analysis_usd.positive_gain_participation_strategy_eq =
+            strategy.overall.positive_gain_participation_strategy_eq;
         analysis_usd.mdg_strategy_eq = strategy.overall.mdg_strategy_eq;
         analysis_usd.sharpe_ratio_strategy_eq = strategy.overall.sharpe_ratio_strategy_eq;
         analysis_usd.sortino_ratio_strategy_eq = strategy.overall.sortino_ratio_strategy_eq;
@@ -1824,6 +1832,11 @@ fn run_backtest_core<'py>(
             strategy.short.peak_recovery_days_strategy_eq;
         analysis_btc.gain_strategy_eq = strategy.overall.gain_strategy_eq;
         analysis_btc.adg_strategy_eq = strategy.overall.adg_strategy_eq;
+        analysis_btc.adg_rolling_hmean_strategy_eq = strategy.overall.adg_rolling_hmean_strategy_eq;
+        analysis_btc.adg_time_integrated_strategy_eq =
+            strategy.overall.adg_time_integrated_strategy_eq;
+        analysis_btc.positive_gain_participation_strategy_eq =
+            strategy.overall.positive_gain_participation_strategy_eq;
         analysis_btc.mdg_strategy_eq = strategy.overall.mdg_strategy_eq;
         analysis_btc.sharpe_ratio_strategy_eq = strategy.overall.sharpe_ratio_strategy_eq;
         analysis_btc.sortino_ratio_strategy_eq = strategy.overall.sortino_ratio_strategy_eq;
@@ -2192,11 +2205,12 @@ fn trailing_martingale_strategy_params_from_dict(dict: &PyDict) -> PyResult<Valu
     let entry = extract_value::<&PyDict>(dict, "entry")?;
     let close = extract_value::<&PyDict>(dict, "close")?;
     Ok(serde_json::json!({
-        "ema_span_0": extract_value::<f64>(dict, "ema_span_0")?,
-        "ema_span_1": extract_value::<f64>(dict, "ema_span_1")?,
+
         "volatility_ema_span_1h": extract_value::<f64>(dict, "volatility_ema_span_1h")?,
         "volatility_ema_span_1m": extract_value::<f64>(dict, "volatility_ema_span_1m")?,
         "entry": {
+            "ema_span_0": extract_value::<f64>(entry, "ema_span_0")?,
+            "ema_span_1": extract_value::<f64>(entry, "ema_span_1")?,
             "double_down_factor": extract_value::<f64>(entry, "double_down_factor")?,
             "ema_gate_mode": extract_optional_string(entry, "ema_gate_mode", "initial")?,
             "initial_ema_dist": extract_value::<f64>(entry, "initial_ema_dist")?,
@@ -2559,6 +2573,8 @@ fn bot_params_from_dict(dict: &PyDict) -> PyResult<BotParams> {
         )?,
         unstuck_close_pct: extract_value(dict, "unstuck_close_pct")?,
         unstuck_ema_dist: extract_value(dict, "unstuck_ema_dist")?,
+        unstuck_ema_span_0: extract_value(dict, "unstuck_ema_span_0")?,
+        unstuck_ema_span_1: extract_value(dict, "unstuck_ema_span_1")?,
         unstuck_loss_allowance_pct: extract_value(dict, "unstuck_loss_allowance_pct")?,
         unstuck_threshold: extract_value(dict, "unstuck_threshold")?,
         rylos_4rsi_enabled: extract_optional_bool(dict, "rylos_4rsi_enabled", false)?,
@@ -2800,6 +2816,16 @@ fn validate_hsl_risk_unstuck_bot_params(
         None,
         true,
     )?;
+    for (key, span) in [
+        ("unstuck_ema_span_0", params.unstuck_ema_span_0),
+        ("unstuck_ema_span_1", params.unstuck_ema_span_1),
+    ] {
+        if !span.is_finite() || span <= 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "{path_prefix}.{key} must be positive and finite"
+            )));
+        }
+    }
     if !params.unstuck_ema_dist.is_finite() {
         return Err(PyValueError::new_err(format!(
             "{path_prefix}.unstuck_ema_dist must be finite"
@@ -2943,6 +2969,8 @@ fn make_trailing_martingale_entry_params(
         entry_trailing_threshold_pct,
     );
     TrailingMartingaleEntryParams {
+        ema_span_0: 0.0,
+        ema_span_1: 0.0,
         double_down_factor: entry_grid_double_down_factor,
         ema_gate_mode: EmaGateMode::Initial,
         initial_ema_dist: entry_initial_ema_dist,

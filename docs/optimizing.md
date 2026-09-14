@@ -1,5 +1,36 @@
 # Optimizing
 
+Optimizer resume reuses checkpoint fitness only when its fixed evaluation contract matches the
+current run. This includes backtest execution and data policies, backtest-consumed live settings,
+fixed bot parameters, resolved coin overrides, and all fixed fine-tune anchor values. Candidate
+vector values, `optimize.n_cpus`, and output paths are excluded. The shared resume check still
+compares the complete `optimize.gpu` mapping, including GPU worker and hardware-sizing controls;
+changing those controls currently requires a fresh run. Dataset selectors
+`backtest.market_settings_sources`, `backtest.ohlcv_source_dir`, and `backtest.hlcvs_data_dir`
+are compared as configured. Moving input directories therefore requires a fresh run even when
+contents match; input paths are data selectors, not excluded output paths.
+New result records include an `optimizer_evaluation_contract` snapshot. It binds fitness to
+content hashes of the prepared candles, BTC prices, timestamps, selected scenario slices, and
+market settings, plus the evaluator's transitive local Python imports, Python version, imported
+package/dependency versions, and the verified loaded Rust source and artifact.
+Changing a prepared input in place therefore requires a fresh run even when its directory is unchanged.
+Rust artifact identity is deliberately strict: rebuilding the binary can require a fresh run even
+from unchanged sources. The source identity follows imports conservatively, including imports
+inside optional branches; an unresolvable dynamic import includes all local Python sources. Docs,
+tests, and unrelated installed packages are excluded. Changes to an imported dependency can require
+a fresh run even when the affected branch was not used. Hashing happens once during preparation
+with bounded memory use.
+Legacy results without historical evaluator and prepared-data evidence require a fresh run;
+current files or current code cannot establish how their scores were produced. Every reconstructed
+result in a compressed stream is validated, and GPU seed checkpoints carry the same evidence before
+reusing proxy scores. Importing starting candidate configs for fresh evaluation remains supported.
+Moving an override file without changing its resolved values does not change this contract.
+Override files are resolved before CPU candidate evaluation and snapshotting. Every backend records
+the effective external suite and scenario filter, with prepared concrete scenario dates and resolved
+per-scenario coin patches. Prepared candidates use those same frozen patches, so later file edits
+cannot change a running evaluation silently. Dynamic end-date tokens (`now`, `today`, empty, or null) resolve during config preparation; a later resolved
+cutoff requires a fresh run instead of reusing scores from the earlier window.
+
 Passivbot configurations can be optimized using a multi-objective evolutionary algorithm to balance performance metrics while meeting constraints.
 
 The canonical defaults live in `src/config/schema.py`. The example config
@@ -85,21 +116,60 @@ Example:
 }
 ```
 
-### Apple MPS GPU Backend (Experimental)
+### GPU Backend (Experimental)
 
-The GPU backend is an additive research backend for Apple Silicon. Install the normal optimizer
-dependencies plus its optional PyTorch runtime:
+<a id="apple-mps-gpu-backend-experimental"></a>
+
+The GPU backend is an additive research backend for Apple Silicon and NVIDIA GPUs on Linux,
+including Ubuntu under Windows WSL2. Install the normal optimizer dependencies plus the
+GPU runtime for your platform:
+
+Apple Silicon:
 
 ```bash
 python3 -m pip install -e ".[full,gpu-mps]"
 ```
+
+NVIDIA on Linux or WSL2 (Python 3.12 recommended):
+
+```bash
+python3 -m pip install -e ".[full,gpu-cuda]"
+python3 -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name())"
+```
+
+The NVIDIA path uses CUDA runtime/compiler wheels and the same Rust-owned screening
+strategy sources as Apple MPS. A compatible NVIDIA driver is required; in WSL2 install
+the driver on Windows, not inside Ubuntu. No system-wide CUDA toolkit is required.
+The runtime selects available Apple MPS or NVIDIA CUDA automatically; it fails visibly
+when neither is available. Exact Rust backtests still determine all archived results.
+
+Start with a small batch and few exact workers, then increase after measuring memory and
+throughput. CUDA multi-coin input preparation limits invariant tensors to 45% of currently
+free GPU memory. Native Windows Python is not supported by this installation profile.
+
+For NVIDIA throughput tuning, use the deterministic proxy benchmark to hold candidate work
+fixed while varying dispatch batch size:
+
+```bash
+PYTHONPATH=src python src/tools/gpu_proxy_benchmark.py --case tm-single-long \
+  --candidates 1024 --dispatch-batch-size 1024 --single-bars 23040 --warm-runs 5
+```
+
+Compare `--dispatch-batch-size 16`, `256`, and `1024` using the same candidate count and seed.
+Small setup-test batches can spend much of their time on repeated launches and host processing.
+For a modest dataset, a population and batch of 1024 are a useful starting point; retain the
+existing dispatch and memory limits, and reduce the batch if the workload approaches VRAM capacity.
+Increasing population size changes the search workload, whereas increasing batch size alone only
+changes how a fixed population is dispatched. Measure complete optimization runs separately,
+including exact Rust workers, startup, and checkpointing; proxy throughput is not end-to-end speedup.
 
 Select it with `--backend gpu` or `optimize.backend: "gpu"`. Normal live operation, backtesting,
 and the DEAP/pymoo CPU optimizers do not import or require PyTorch.
 
 The supported slice is intentionally narrow:
 
-- Apple Silicon with `torch.backends.mps.is_available()`
+- Apple Silicon with `torch.backends.mps.is_available()`, or NVIDIA CUDA on Linux/WSL2
+  with `torch.cuda.is_available()`
 - one prepared dataset per independent run or suite scenario; single- and multi-coin EMA Anchor
   and Trailing Martingale runs accept any positive integer
   `backtest.candle_interval_minutes`; the dataset may be an
@@ -246,7 +316,8 @@ The supported slice is intentionally narrow:
   unchanged. Legacy-raw mode applies the raw multiplier. The optional side-wide entry gate caps
   aggregate entries at TWEL times its positive threshold (never above raw TWEL). Disabling the gate
   permits aggregate entries beyond TWEL while each symbol remains subject to its allowed WEL
-- `position_held_hours_mean`, `position_held_days_mean`, `positions_held_per_day`,
+- `position_held_time_weighted_mean_hours`, `position_held_hours_mean`,
+  `position_held_days_mean`, `positions_held_per_day`,
   `position_unchanged_hours_max`, and `position_unchanged_days_max` may be used for scoring and
   limits in single-coin and multi-coin runs. Metal counts each completed position and open tail,
   sums its holding duration, and tracks the latest fill independently for each coin and position
@@ -419,6 +490,12 @@ The supported slice is intentionally narrow:
 
 #### Deliberate current limitations
 
+Independent unstuck EMA horizons are supported on Apple MPS for EMA Anchor and Trailing Martingale,
+including single-coin, directional multicoin, and fused long/short searches. Global bounds and
+per-coin span overrides follow the CPU configuration contract. GPU screening remains float32;
+exact CPU validation still owns accepted results. Start a fresh GPU run after this parameter-layout
+change; old screening checkpoints are incompatible.
+
 The following boundaries are intentional rather than silent fallbacks:
 
 - `trailing_grid_v7` is outside the Apple MPS implementation. Use `optimize.backend: "pymoo"` or
@@ -505,8 +582,27 @@ Exact-selected seeds are placed first in the initial GPU population, followed by
 seeds and then random candidates. Their exact objective values are never inserted into the proxy
 NSGA-II fitness matrix.
 
-The V8 `optimize.enable_overrides` values `mirror_short_from_long` and
-`lossless_close_trailing` are applied to Metal candidates in the same order as exact candidate
+To search the strategy and unstuck EMA horizons together, set:
+
+```json
+"enable_overrides": ["couple_unstuck_ema_spans"]
+```
+
+This opt-in setting belongs under `optimize`. It restores the former coupled EMA search on CPU
+and Apple MPS: each candidate's effective strategy spans determine its unstuck spans, including
+per-coin strategy overrides. Independent unstuck span bounds and existing unstuck span pins are
+ignored while coupling is enabled, and the redundant genes are omitted. Strategy spans must be
+positive and finite. The default remains independent search.
+
+Coupling runs after fixed runtime overrides and long-to-short mirroring, and follows effective
+scenario strategy overrides. Saved candidates materialize the derived spans, including scenario
+and coin overrides, so normal backtests and live bots reproduce them without an optimizer hook.
+Disable the option and set unstuck bounds explicitly to resume independent search; remove any
+saved per-coin unstuck pins when you want to tune a shared global pair. Start a fresh optimizer
+run when changing this option because its search dimensions and evaluation policy differ.
+
+The V8 `optimize.enable_overrides` values `mirror_short_from_long`, `couple_unstuck_ema_spans`,
+and `lossless_close_trailing` are applied to Metal candidates in the same order as exact candidate
 materialization. Mirroring may be used with the supported single-coin directional scopes; short
 genes that exact materialization overwrites are omitted from the proxy search dimensions.
 `lossless_close_trailing` is available only with `strategy_kind: trailing_martingale`. The legacy
@@ -555,8 +651,8 @@ Positive `backtest.btc_collateral_cap` remains unsupported and fails before GPU 
 Daily USD equity choppiness, jerkiness, and exponential fit error are reduced from that same active
 daily closing-equity surface with Rust's no-fill defaults and short-series behavior.
 Gross close-fill loss/profit ratios are supported both in aggregate and separately for long and
-short. `pnl_ratio_long_short` uses each side's signed realized PnL and Rust's neutral `0.5` result
-when combined signed PnL is zero. Directional kernels
+short. `pnl_ratio_long_short` (also accepted as `long_short_profit_ratio`) uses each side's signed
+realized PnL and Rust's neutral `0.5` result when combined signed PnL is zero. Directional kernels
 retain the four gross side sums, while one-sided and dual-side multi-coin dispatches preserve the
 same side partition before reduction.
 Full-run fill activity is supported for single-coin and multi-coin topologies through combined
@@ -695,8 +791,14 @@ duplicate-elimination controls as the ordinary pymoo optimizer.
   size, candidate order, NSGA-II ask/tell semantics, and the number of proxy evaluations are
   unchanged. Ctrl+C is polled between those bounded dispatches. If it arrives during a generation,
   that incomplete ask/tell transaction is discarded and the last complete checkpoint is retained.
-  A topology whose single candidate already exceeds the safety envelope fails closed with guidance
-  to shorten the date range or reduce its coin count.
+  Long-history, single-coin Trailing Martingale with both sides enabled can instead split history
+  into chunks of at most 96,000 candles and run up to 1,024 candidates concurrently. The complete
+  replay state remains on the GPU between chunks; metrics are finalized only after the last chunk.
+  Small actual batches that fit the work envelope use unchunked replay, even when the configured
+  batch ceiling requires temporal chunks.
+  The same work envelope applies to each chunk, and interruption is checked between chunks.
+  Topologies without temporal replay fail closed when even one candidate exceeds the envelope,
+  with guidance to shorten the date range or reduce the coin count.
 - `max_dispatch_candidate_bars` sets that MPS work envelope. The default is 1 billion, allowing
   roughly 512 candidates per dispatch across 1.95 million one-sided candle bars on a dedicated
   optimization Mac. Set it to `500000000` for the former conservative behavior when desktop
@@ -712,7 +814,12 @@ duplicate-elimination controls as the ordinary pymoo optimizer.
   active-volatility kernels, nor to kernels with optional metric feature paths enabled.
 - `seed_bootstrap.mode` controls `-t/--start` handling. `auto` exact-evaluates all deduplicated seeds
   up to `seed_bootstrap.max_exact`, then switches to full-history proxy screening plus capped exact
-  validation for larger pools. `exact` forces exact evaluation of every seed even above the cap;
+  validation for larger pools. With successive halving disabled, screened seeds reuse their
+  full-history proxy metrics in the initial population. This bounded cache survives resume and is
+  released after the initial population completes; exact validation still runs normally. The
+  initial base-config candidate is screened alongside the seeds, without entering seed ranking
+  or drift calibration, so a fully seeded population can avoid replay entirely.
+  `exact` forces exact evaluation of every seed even above the cap;
   `screened` always performs proxy screening and validates at most the cap; and `legacy` restores
   the former behavior of copying seeds directly into the first proxy population without an
   authoritative bootstrap archive. Bootstrap exact evaluations are recorded in `all_results.bin`
@@ -761,7 +868,9 @@ duplicate-elimination controls as the ordinary pymoo optimizer.
   `validate_per_generation` so each generation requests proxy-front safety evidence. A partial
   final validation batch scales its reserved probe count down proportionally.
 - `exact_workers: 0` inherits `optimize.n_cpus`; a positive value overrides it for this backend.
-- `max_pending_exact: 0` defaults to twice the exact-worker count.
+- `max_pending_exact: 0` defaults to twice the larger of the exact-worker count and
+  `validate_per_generation`. This leaves room for the next validation batch while CPU workers
+  finish the previous one. Explicit positive queue limits keep their configured size.
   It must be at least `validate_per_generation` so throttling cannot change the configured
   proxy-front/broad-probe evidence allocation; the backend waits for that capacity before
   screening another generation.
@@ -793,6 +902,26 @@ metric-reduction work was adapted from RustyCZ's Passivbot GPU branch at commit 
 MPS Metal integration and hybrid validation gates are specific to this implementation.
 
 #### Profiling Apple MPS optimization
+
+For long multi-coin Trailing Martingale datasets with one active side, MPS can retain each
+candidate's replay state between history chunks. This activates automatically when the full-history
+dispatch cap would admit fewer than 512 candidates (or the requested batch size, if smaller).
+Each dispatch processes at most 8,192 bars, shortening to 4,096 for a full 512-candidate batch,
+and stays within `max_dispatch_candidate_bars`; the
+runner synchronizes and checks interruption between dispatches. Up to 512 candidates can then
+advance together, scheduled in groups of at most 32 threads to distribute independent replays
+across GPU cores. Every candidate still processes its complete history, and exact Rust validation
+remains authoritative. Shorter workloads and dual-side portfolios retain their existing dispatch
+path.
+
+Suite scenarios with identical candle contents, timelines, market settings, and prepared replay
+boundaries share their immutable MPS market tensors. Strategy parameters, output buffers, and replay
+state remain separate for every scenario. Reuse is logged during preparation and lasts only for
+that optimizer run; differing fees, validity windows, or candle contents require separate tensors.
+
+Temporal replay profiling includes `temporal_dispatches`, with chunk lengths, replay-state memory,
+`threads_per_threadgroup`, and `max_dispatch_seconds`. These are portions of one replay;
+candidate-bar totals count each processed step once.
 
 Set `PASSIVBOT_GPU_PROFILE=1` to emit structured `[gpu-profile]` JSON records. Profiling is disabled
 by default because its synchronization points deliberately trade throughput for trustworthy phase
@@ -849,6 +978,7 @@ passivbot tool gpu-proxy-benchmark --case tm-single-long-close-ladder
 passivbot tool gpu-proxy-benchmark --case tm-single-long-hsl
 passivbot tool gpu-proxy-benchmark --case ema-multicoin-overhead
 passivbot tool gpu-proxy-benchmark --case ema-multicoin-overrides
+passivbot tool gpu-proxy-benchmark --case tm-multicoin-overhead
 # Hold one candidate matrix constant while measuring dispatch chunking:
 passivbot tool gpu-proxy-benchmark --case ema-single-long \
   --candidates 4096 --dispatch-batch-size 1024
@@ -882,6 +1012,17 @@ seed, and all other parameters constant while switching entry retracement from p
 Reports include the number of recursive-entry candidates. Homogeneous recursive-entry dispatches
 select the recursive-only Metal variant; mixed entry modes retain the generic kernel.
 
+#### GPU Calibration Compatibility
+
+GPU drift ranks use unpenalized, goal-oriented objectives with a fixed median/IQR scale from
+initial full-history proxy evaluations (or the screened seed pool). Constraint classification
+continues to be checked separately, and evolutionary fitness retains its configured penalties.
+Suite drift uses the same ordered scenario/reducer objective values as exact suite scoring.
+The fill-gap time-weighted mean streams squared coalesced gaps; percentile metrics continue to
+use conservative histogram bounds. These metric and calibration changes invalidate older GPU
+checkpoint signatures: start a fresh run, optionally supplying existing exact-result configs as
+seeds. Population size, validation quota, drift thresholds, and algorithm defaults are unchanged.
+
 ### Pymoo Configuration
 
 Pymoo-specific settings live under `optimize.pymoo`:
@@ -897,7 +1038,8 @@ Pymoo-specific settings live under `optimize.pymoo`:
         "crossover_eta": 20.0,
         "crossover_prob_var": 0.5,
         "mutation_eta": 20.0,
-        "mutation_prob_var": "auto",
+        "mutation_prob": "auto",
+        "mutation_prob_per_variable": "auto",
         "eliminate_duplicates": true
       },
       "algorithms": {
@@ -975,11 +1117,17 @@ Current meaning of the main pymoo knobs:
   - SBX distribution index.
   - Higher values keep offspring closer to the parents; lower values explore more aggressively.
   - Default `20` is a standard conservative setting and is usually a good starting point.
-- `optimize.pymoo.shared.mutation_prob_var`
-  - Per-variable polynomial-mutation probability.
-  - `"auto"` means `1 / n_params`.
-  - This is the default and is usually the right choice for Passivbot's parameter counts because
-    it scales automatically with the number of tunable parameters.
+- `optimize.pymoo.shared.mutation_prob`
+  - Per-individual polynomial-mutation probability; `"auto"` means `1 / n_params`.
+  - Preserves the historical mutation intensity. The old `mutation_prob_var` config key
+    is accepted as an alias for this control because it was wired to pymoo's individual gate.
+- `optimize.pymoo.shared.mutation_prob_per_variable`
+  - Conditional per-variable mutation probability; `"auto"` means `min(0.5, 1 / n_params)`,
+    matching pymoo's historical implicit default.
+  - The probability of selecting a coordinate for mutation is the product of the two gates. To experiment
+    with approximately one mutated coordinate per offspring, set `mutation_prob: 1.0` and
+    leave this control on `"auto"`. This is a stronger mutation regime, not the default.
+  - `n_params` is the CPU problem's vector length or the GPU problem's active vector length.
 - `optimize.pymoo.shared.mutation_eta`
   - Polynomial-mutation distribution index.
   - Higher values make smaller, more local mutations.
@@ -996,7 +1144,7 @@ Current meaning of the main pymoo knobs:
 Recommended defaults for typical Passivbot runs:
 
 - Use `optimize.backend: pymoo` with `optimize.pymoo.algorithm: auto`.
-- Keep `mutation_prob_var: "auto"`.
+- Keep `mutation_prob: "auto"`.
 - Keep `crossover_eta: 20` and `mutation_eta: 20` unless you have a specific reason to make
   variation much more local or much more aggressive.
 - Keep `crossover_prob_var: 0.5` unless you have evidence that crossover is either too timid or
@@ -1018,7 +1166,8 @@ Practical interpretation for the default shared block:
   "crossover_prob_var": 0.5,
   "eliminate_duplicates": true,
   "mutation_eta": 20,
-  "mutation_prob_var": "auto"
+  "mutation_prob": "auto",
+  "mutation_prob_per_variable": "auto"
 }
 ```
 
@@ -1028,8 +1177,10 @@ Practical interpretation for the default shared block:
   - each parameter has a 50% chance of participating in crossover
 - `mutation_eta: 20`
   - conservative mutation; most mutations are relatively local
-- `mutation_prob_var: "auto"`
-  - mutate each parameter with probability `1 / n_params`
+- `mutation_prob: "auto"`
+  - select each offspring for mutation with probability `1 / n_params`
+- `mutation_prob_per_variable: "auto"`
+  - within selected offspring, mutate each coordinate with probability `min(0.5, 1 / n_params)`
 - `eliminate_duplicates: true`
   - do not spend backtests on duplicate candidates
 
@@ -1532,6 +1683,9 @@ over all exchanges before scoring.
 | `mdg`, `mdg_w` | Median Daily Gain and its recency-biased counterpart |
 | `gain` | Final balance gain (end/start ratio) |
 | `adg_strategy_eq`, `adg_strategy_eq_w` | Collateral-agnostic geometric growth on the synthetic strategy-equity curve |
+| `adg_rolling_hmean_strategy_eq` | Harmonic mean of automatic rolling 30/90/180-day-equivalent strategy-equity growth windows, dailyized and combined in log space. Higher values reward growth that survives many start/end windows; retain terminal ADG alongside it. |
+| `adg_time_integrated_strategy_eq` | Dailyized area under log strategy equity. Higher values reward earlier sustained growth; retain terminal ADG alongside it. |
+| `positive_gain_participation_strategy_eq` | Normalized effective participation of positive daily log gains. Higher values mean gains are distributed across more days instead of concentrated in windfalls; pair it with a gain objective. |
 | `mdg_strategy_eq`, `mdg_strategy_eq_w` | Median-day version of the same strategy-equity growth family |
 | `*_per_exposure_{long,short}` | Above metrics divided by the configured exposure limit per side |
 
@@ -1564,6 +1718,7 @@ over all exchanges before scoring.
 |--------|-------------|
 | `positions_held_per_day` | Average number of unique positions opened per day |
 | `position_held_hours_{mean,median,max}`, `position_held_days_{mean,median,max}` | Holding-time statistics in hours and equivalent days |
+| `position_held_time_weighted_mean_hours` | Minimize `sum(held_hours^2) / sum(held_hours)` across coin/side holding episodes, including open tails. Adds and partial closes do not reset an episode. Returns zero when no positive holding time exists; supported by CPU and GPU scoring. |
 | `position_unchanged_hours_max`, `position_unchanged_days_max` | Longest span without modifying an existing position, in hours and equivalent days |
 | `fills_gap_time_weighted_mean_hours` | Time-weighted mean portfolio no-fill gap: `sum(gap_hours^2) / sum(gap_hours)` over unique fill timestamps and the analysis boundaries. Lower values reward distributing fills through long droughts instead of clustering activity. |
 | `volume_pct_per_day_avg`, `volume_pct_per_day_avg_w` | Average traded volume as % of account per day, with recency bias |

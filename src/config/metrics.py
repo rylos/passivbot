@@ -57,6 +57,7 @@ SHARED_METRICS = {
     "backtest_completion_ratio",
     "positions_held_per_day",
     "positions_held_per_day_w",
+    "position_held_time_weighted_mean_hours",
     "position_held_hours_mean",
     "position_held_hours_max",
     "position_held_hours_median",
@@ -74,6 +75,7 @@ SHARED_METRICS = {
     "fills_active_days_ratio",
     "fills_active_symbols_count",
     "fills_analysis_duration_days",
+    "n_days",
     "fills_count",
     "fills_count_close",
     "fills_count_entry",
@@ -119,6 +121,9 @@ SHARED_METRICS = {
     "sortino_ratio_pnl_w",
     "gain_strategy_eq",
     "adg_strategy_eq",
+    "adg_rolling_hmean_strategy_eq",
+    "adg_time_integrated_strategy_eq",
+    "positive_gain_participation_strategy_eq",
     "mdg_strategy_eq",
     "sharpe_ratio_strategy_eq",
     "sortino_ratio_strategy_eq",
@@ -205,6 +210,8 @@ ANALYSIS_SHARED_KEYS = SHARED_METRICS | {
 STAT_SUFFIXES = ("min", "max", "mean", "std", "median")
 
 METRIC_ALIASES = {
+    "long_short_profit_ratio": "pnl_ratio_long_short",
+    "fills_analysis_duration_days": "n_days",
     "gain_strategy_pnl_rebased": "gain_strategy_eq",
     "adg_strategy_pnl_rebased": "adg_strategy_eq",
     "mdg_strategy_pnl_rebased": "mdg_strategy_eq",

@@ -19,8 +19,10 @@ class ScenarioSelection(Enum):
 
 
 DEFAULT_OBJECTIVE_GOALS = {
+    "n_days": "max",
     "positions_held_per_day": "min",
     "positions_held_per_day_w": "min",
+    "position_held_time_weighted_mean_hours": "min",
     "position_held_hours_mean": "min",
     "position_held_hours_max": "min",
     "position_held_hours_median": "min",
@@ -62,6 +64,9 @@ DEFAULT_OBJECTIVE_GOALS = {
     "adg_pnl_w": "max",
     "gain_strategy_eq": "max",
     "adg_strategy_eq": "max",
+    "adg_rolling_hmean_strategy_eq": "max",
+    "adg_time_integrated_strategy_eq": "max",
+    "positive_gain_participation_strategy_eq": "max",
     "mdg_strategy_eq": "max",
     "sharpe_ratio_strategy_eq": "max",
     "sortino_ratio_strategy_eq": "max",

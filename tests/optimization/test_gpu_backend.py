@@ -97,6 +97,7 @@ from optimization.backends.gpu_backend import (
     validate_gpu_preparation_scope,
     _GPU_SUITE_METRICS_KEY,
     _GPU_SUITE_OBJECTIVES_KEY,
+    _GPU_SUITE_UNPENALIZED_OBJECTIVES_KEY,
     _GPU_SUITE_VIOLATION_KEY,
     EMA_MULTICOIN_LONG_BOUND_MAP,
     EMA_MULTICOIN_SHORT_BOUND_MAP,
@@ -245,6 +246,10 @@ def test_gpu_interrupt_checkpoints_complete_generation_state():
 def _long_only_ema_config():
     config = copy.deepcopy(get_template_config())
     config["live"]["strategy_kind"] = "ema_anchor"
+    # These scope fixtures exercise reducers without an EMA eligibility gate.
+    # Independent EMA screening support is covered by its explicit guard tests.
+    for side in ("long", "short"):
+        config["bot"][side]["unstuck"]["ema_gating_enabled"] = False
     config["live"]["approved_coins"] = {"long": ["BTC"], "short": []}
     config["bot"]["long"]["risk"]["total_wallet_exposure_limit"] = 1.0
     config["bot"]["long"]["risk"]["n_positions"] = 1
@@ -1102,7 +1107,7 @@ def test_gpu_nsga2_uses_configured_pymoo_variation_operators():
         "population_size": 8,
         "configured_seed": None,
         "crossover": {"operator": "sbx", "prob_var": 0.7, "eta": 11.0},
-        "mutation": {"operator": "pm", "prob": 0.2, "eta": 13.0},
+        "mutation": {"operator": "pm", "prob": 0.2, "prob_var": 0.2, "eta": 13.0},
         "eliminate_duplicates": False,
     }
 
@@ -1168,6 +1173,8 @@ def test_trailing_martingale_bound_map_covers_both_directional_shapes():
         "total_wallet_exposure_limit",
         "unstuck_close_pct",
         "unstuck_ema_dist",
+        "unstuck_ema_span_0",
+        "unstuck_ema_span_1",
         "unstuck_loss_allowance_pct",
         "unstuck_threshold",
         "hsl_cooldown_minutes_after_red",
@@ -2422,6 +2429,7 @@ def test_gpu_suite_proxy_rows_use_canonical_suite_scorer():
             ]
             return {
                 "objectives": (-min(values),),
+                "unpenalized_objectives": (-min(values),),
                 "constraint_violation": max(values),
                 "suite_metrics": {"values": values},
             }
@@ -2438,11 +2446,13 @@ def test_gpu_suite_proxy_rows_use_canonical_suite_scorer():
     assert rows == [
         {
             _GPU_SUITE_OBJECTIVES_KEY: (-0.01,),
+            _GPU_SUITE_UNPENALIZED_OBJECTIVES_KEY: (-0.01,),
             _GPU_SUITE_VIOLATION_KEY: 0.10,
             _GPU_SUITE_METRICS_KEY: {"values": [0.10, 0.01]},
         },
         {
             _GPU_SUITE_OBJECTIVES_KEY: (-0.02,),
+            _GPU_SUITE_UNPENALIZED_OBJECTIVES_KEY: (-0.02,),
             _GPU_SUITE_VIOLATION_KEY: 0.20,
             _GPU_SUITE_METRICS_KEY: {"values": [0.20, 0.02]},
         },
@@ -2469,6 +2479,7 @@ def test_gpu_suite_proxy_combines_exchange_metrics_before_suite_reduction():
             assert sorted(result.per_exchange) == ["binance", "bybit"]
             return {
                 "objectives": (-stats["mean"],),
+                "unpenalized_objectives": (-stats["mean"],),
                 "constraint_violation": stats["max"],
                 "suite_metrics": {"stats": stats},
             }
@@ -2519,6 +2530,7 @@ def test_gpu_suite_proxy_applies_scenario_parameter_overrides_without_mutating_c
         def score_scenario_results(results):
             return {
                 "objectives": (0.0,),
+                "unpenalized_objectives": (0.0,),
                 "constraint_violation": 0.0,
                 "suite_metrics": {},
             }
@@ -2761,7 +2773,7 @@ def test_gpu_preparation_preflight_accepts_modeled_tm_exposure_repair_override()
 
 
 def test_gpu_preparation_preflight_requires_available_mps():
-    with pytest.raises(RuntimeError, match=r"MPS is unavailable.*pymoo"):
+    with pytest.raises(RuntimeError, match=r"GPU optimization requires.*pymoo"):
         validate_gpu_preparation_scope(
             _long_only_ema_config(),
             torch_module=_fake_torch_with_mps(False),
@@ -4697,6 +4709,7 @@ def test_gpu_foundation_accepts_time_weighted_fill_gap_metric():
         "peak_recovery_hours_pnl",
         "position_held_days_mean",
         "position_held_days_max",
+        "position_held_time_weighted_mean_hours",
         "position_held_hours_mean",
         "position_held_hours_max",
         "position_unchanged_days_max",
@@ -4752,6 +4765,7 @@ def test_gpu_dual_multicoin_metric_gate_does_not_narrow_single_side():
             "peak_recovery_hours_pnl",
             "position_held_days_mean",
             "position_held_days_max",
+            "position_held_time_weighted_mean_hours",
             "position_held_hours_mean",
             "position_held_hours_max",
             "position_unchanged_days_max",
@@ -6566,6 +6580,7 @@ def test_gpu_checkpoint_signature_tracks_single_coin_unstuck_contract():
     scoring = [{"goal": "max", "metric": "adg_strategy_eq"}]
     config = _long_only_ema_config()
     config["bot"]["long"]["unstuck"]["enabled"] = True
+    config["bot"]["long"]["unstuck"]["ema_gating_enabled"] = True
     proxy = SimpleNamespace(coin_override_contract=None)
     original_contract = _gpu_runtime_checkpoint_contract(config, proxy)
     original = _checkpoint_signature(
@@ -6577,6 +6592,8 @@ def test_gpu_checkpoint_signature_tracks_single_coin_unstuck_contract():
         "ema_gating_enabled": False,
         "close_pct": 0.234,
         "ema_dist": -0.012,
+        "ema_span_0": 333.5,
+        "ema_span_1": 777.25,
         "loss_allowance_pct": 0.034,
         "threshold": 0.876,
     }
@@ -7689,3 +7706,173 @@ def test_resume_records_broad_probe_constraint_disagreement_without_immediate_ha
     )
 
     assert pairs == [(0.1, 0.2, True, True, False)]
+
+
+@pytest.mark.parametrize("shadow", ["all", "strategy_only", "none", "mismatch"])
+def test_gpu_suite_unstuck_scope_validates_effective_scenario_bounds(shadow):
+    from optimization.warmup import _apply_config_overrides
+
+    config = _directional_tm_config(long_enabled=True, short_enabled=False)
+    config["backtest"]["suite_enabled"] = True
+    config["bot"]["long"]["unstuck"].update(
+        enabled=True,
+        ema_gating_enabled=True,
+        close_pct=0.1,
+        threshold=0.9,
+        loss_allowance_pct=0.01,
+    )
+    overrides = {}
+    for family in ("strategy.trailing_martingale", "unstuck"):
+        if shadow == "none" or (shadow == "strategy_only" and family == "unstuck"):
+            continue
+        for i in (0, 1):
+            overrides[f"bot.long.{family}.ema_span_{i}"] = 120.5 + i * 60
+    if shadow == "mismatch":
+        overrides["bot.long.unstuck.ema_span_0"] = 999.5
+    original = copy.deepcopy(config)
+    suite_cfg = {
+        "enabled": True,
+        "scenarios": [{"label": "fixed", "overrides": overrides}],
+    }
+    ctx = SimpleNamespace(
+        label="fixed",
+        overrides=overrides,
+        exchanges=["bybit"],
+        msss={"bybit": {"BTC": {}, "__meta__": {}}},
+        timestamps={"bybit": np.arange(10, dtype=np.int64)},
+    )
+
+    class Suite:
+        contexts = [ctx]
+
+        @staticmethod
+        def get_prepared_context_data(_ctx, _exchange):
+            return np.zeros((10, 1, 4)), np.ones(10), [0]
+
+        @staticmethod
+        def build_scenario_candidate_config(proxy_config, _ctx):
+            scenario = copy.deepcopy(proxy_config)
+            _apply_config_overrides(scenario, overrides)
+            return scenario
+
+    validate_gpu_preparation_scope(
+        config, suite_cfg, torch_module=_fake_torch_with_mps()
+    )
+    prepared = _gpu_suite_scenario_inputs(config, Suite())
+    for path, value in overrides.items():
+        family = prepared[0]["config"]["optimize"]["bounds"]
+        from config.param_paths import resolve_dotted_config_path
+
+        for part in resolve_dotted_config_path(config, path)[1:-1]:
+            family = family[part]
+        assert family[path.split(".")[-1]] == [value, value]
+    suite_cfg["scenarios"].append({"label": "unshadowed", "overrides": {}})
+    validate_gpu_preparation_scope(
+        config, suite_cfg, torch_module=_fake_torch_with_mps()
+    )
+    assert config == original
+
+
+@pytest.mark.parametrize("roundtrip", [False, True])
+def test_seed_proxy_reuse_preserves_order_and_nested_metric_evidence(roundtrip):
+    import pickle
+    from optimization.backends.gpu_backend import _seed_proxy_key, _evaluate_with_seed_proxy_reuse
+
+    seed = {"long_span": 17.25, "short_span": 42.5}
+    evidence = {"adg": 0.125, "suite_objectives": [1.0, 2.0]}
+    cached = {_seed_proxy_key(seed): evidence}
+    if roundtrip:
+        cached = pickle.loads(pickle.dumps(cached))
+    changed = dict(seed, short_span=42.50001)
+    requested = [changed, dict(reversed(list(seed.items()))), seed]
+    calls = []
+    def evaluate(candidates):
+        calls.append(candidates)
+        return [{"adg": 0.25} for _ in candidates]
+    rows, reused = _evaluate_with_seed_proxy_reuse(requested, cached, evaluate)
+    assert calls == [[changed]]
+    assert reused == 2
+    assert rows == [{"adg": 0.25}, evidence, evidence]
+    rows[1]["suite_objectives"][0] = 99.0
+    assert cached[_seed_proxy_key(seed)]["suite_objectives"] == [1.0, 2.0]
+    assert rows[2]["suite_objectives"] == [1.0, 2.0]
+
+
+def test_seed_proxy_reuse_all_hits_avoids_dispatch_and_handles_absent_cache():
+    from optimization.backends.gpu_backend import _seed_proxy_key, _evaluate_with_seed_proxy_reuse
+
+    candidate = {"span": 17.25}
+    evidence = {"adg": 0.125}
+    cached = {_seed_proxy_key(candidate): evidence}
+    def unexpected(_candidates):
+        pytest.fail("cached seed should not be dispatched again")
+    assert _evaluate_with_seed_proxy_reuse([candidate], cached, unexpected) == ([evidence], 1)
+    assert _evaluate_with_seed_proxy_reuse([candidate], {}, lambda c: [evidence]) == ([evidence], 0)
+
+
+def test_seed_proxy_reuse_interrupted_misses_do_not_commit_partial_evidence():
+    from optimization.backends.gpu_backend import _seed_proxy_key, _evaluate_with_seed_proxy_reuse
+
+    candidate = {"span": 17.25}
+    evidence = {"adg": 0.125}
+    cached = {_seed_proxy_key(candidate): evidence}
+    def interrupt(_candidates):
+        raise KeyboardInterrupt
+    with pytest.raises(KeyboardInterrupt):
+        _evaluate_with_seed_proxy_reuse([candidate, {"span": 99.0}], cached, interrupt)
+    assert cached == {_seed_proxy_key(candidate): evidence}
+    with pytest.raises(RuntimeError, match="misaligned"):
+        _evaluate_with_seed_proxy_reuse([{"span": 99.0}], cached, lambda c: [])
+
+
+def test_seed_proxy_reuse_preserves_nsga_next_population_after_resume():
+    import pickle
+    from pymoo.algorithms.moo.nsga2 import NSGA2
+    from pymoo.core.problem import Problem
+    from optimization.backends.gpu_backend import _seed_proxy_key, _evaluate_with_seed_proxy_reuse
+
+    sampling = np.linspace(0.05, 0.95, 8).reshape(-1, 1)
+    algorithm = NSGA2(pop_size=8, sampling=sampling)
+    algorithm.setup(Problem(n_var=1, n_obj=2, n_ieq_constr=1, xl=0.0, xu=1.0), seed=19)
+    def evaluate(candidates):
+        return [{"F": [c["x"] ** 2, (1.0 - c["x"]) ** 2], "G": c["x"] - 0.7}
+                for c in candidates]
+    seeds = [{"x": float(x)} for x in sampling[1:, 0]]
+    cache = {_seed_proxy_key(c): m for c, m in zip(seeds, evaluate(seeds))}
+    checkpoint = pickle.dumps({"algorithm": algorithm, "initial_seed_proxy_rows": cache})
+    populations = []
+    for reuse in (False, True):
+        restored = pickle.loads(checkpoint)
+        algorithm = restored["algorithm"]
+        population = algorithm.ask()
+        candidates = [{"x": float(x)} for x in population.get("X")[:, 0]]
+        if reuse:
+            rows, count = _evaluate_with_seed_proxy_reuse(
+                candidates, restored["initial_seed_proxy_rows"], evaluate
+            )
+            assert count == 7
+        else:
+            rows = evaluate(candidates)
+        population.set("F", np.asarray([row["F"] for row in rows]))
+        population.set("G", np.asarray([[row["G"]] for row in rows]))
+        algorithm.tell(infills=population)
+        populations.append((algorithm.pop.get("F"), algorithm.pop.get("G"), algorithm.ask().get("X")))
+    for before, after in zip(*populations):
+        np.testing.assert_array_equal(before, after)
+
+
+@pytest.mark.parametrize("base", [{"x": 0.5}, {"x": 0.25}, None])
+def test_seed_screen_includes_population_base_without_changing_seed_rows(base):
+    from optimization.backends.gpu_backend import _screen_seed_proxy_candidates
+
+    seeds = [{"x": 0.25}, {"x": 0.75}]
+    calls = []
+    def evaluate(candidates):
+        calls.append(list(candidates))
+        return [{"score": c["x"]} for c in candidates]
+    rows, base_row, extra = _screen_seed_proxy_candidates(seeds, base, evaluate)
+    assert seeds == [{"x": 0.25}, {"x": 0.75}]
+    assert rows == [{"score": 0.25}, {"score": 0.75}]
+    assert base_row == (None if base is None else {"score": base["x"]})
+    assert extra == int(base == {"x": 0.5})
+    assert calls == [seeds + [base] if extra else seeds]

@@ -6,11 +6,73 @@ This page documents the main backtest metrics exposed by `passivbot-rust`. Value
 BTC collateral. Metrics without a suffix are currency-agnostic (e.g., position counts) or already
 expressed as percentages/ratios.
 
+## Effective backtest period
+
+- `n_days`: Elapsed days between the first and last actual equity-analysis timestamps,
+  including idle periods. This excludes pre-analysis warmup and reflects early termination.
+  It is not a count of days with fills or a per-coin coverage measure.
+  `fills_analysis_duration_days` remains available with the same value; both names default to
+  maximizing duration and work in exact/CPU scoring and metric lookup, including older result files.
+  Both remain excluded from GPU proxy scoring and proxy-side limits, while computed diagnostic
+  values stay available.
+- `effective_start_date` and `effective_end_date`: Those actual boundaries as UTC ISO timestamps.
+  Empty equity histories have null dates and zero duration; a single timestamp has equal dates
+  and zero duration. Dates are output metadata and are never averaged or used as scoring metrics.
+
+Standalone result configs keep finite values in `metrics.stats` and encode undefined numeric
+diagnostics as strings (`"inf"`, `"-inf"`, or `"nan"`) in `metrics.nonfinite_diagnostics`. The raw
+`analysis.json` remains unchanged, and fills and plots still persist. Optimizer and suite scoring
+continue to reject non-finite metric values.
+
+Standalone backtests retain the flat `analysis.json` and also embed structured results in
+`config.json` under `metrics`, matching Pareto members: duration is at `metrics.stats.n_days`
+(`mean`, `min`, `max`, `std`, `median`), and dates are directly under `metrics` when all evaluation
+windows match. `metrics.exchanges.<exchange>` preserves each exchange's dates.
+
+Suites use `suite_metrics.metrics.n_days` for duration statistics and per-scenario values.
+Dates are at `suite_metrics.scenarios.<label>` and its `exchanges.<exchange>` entries;
+shared dates appear directly under `suite_metrics` only when all windows match.
+Suite backtests also save a root `config.json` containing `suite_metrics` alongside
+`suite_summary.json`, preserving effective suite exchange defaults for repeat runs. Both duration
+spellings use the same configured suite reducer. Each output config contains fresh results,
+replacing prior `metrics` and `suite_metrics` blocks. `config.original.json`, when present, remains the input snapshot.
+Requested config dates and detailed dataset coverage in the manifest retain their existing roles.
+
 ## Core growth metrics
+
 - `gain`: Terminal equity divided by starting equity, where terminal equity is the mean of the
   last up to three daily equity values.
 - `adg`: Average daily gain derived from that smoothed terminal equity (`gain.powf(1 / n_days) - 1`).
 - `adg_w`: Mean of `adg` computed on the trailing 10% slices (full run, last half, last third, …).
+- `adg_rolling_hmean_strategy_eq`: Path-sensitive growth on collateral-agnostic strategy equity.
+  For each automatic horizon `h`, it computes every complete rolling growth factor
+  `G(t,h) = equity(t) / equity(t-h)`, then calculates
+  `R(h) = harmonic_mean(G(t,h))^(1/h) - 1`. The final metric is the geometric mean of
+  `1 + R(h)`, minus one, so each horizon contributes equally in daily log-growth space. The automatic
+  horizons retain roughly 48, 16, and 8 non-overlapping-window equivalents and are capped at 30,
+  90, and 180 days; histories of about four years or more therefore use exactly 30/90/180 days.
+  The harmonic mean makes persistently weak windows matter more than isolated windfalls. Keep
+  terminal `adg_strategy_eq` as a separate objective because overlapping rolling windows give the
+  ends of the backtest less coverage than its middle.
+- `adg_time_integrated_strategy_eq`: Dailyized area under log strategy equity relative to its
+  starting value: `exp(2 * trapezoid_sum(log(equity/start)) / days^2) - 1`. It equals ordinary ADG
+  on a perfectly exponential curve, rewards gains that arrive earlier, and penalizes equity that
+  spends much of the run below its start. Use it together with terminal ADG: an early windfall
+  followed by deterioration can still have positive area.
+- `positive_gain_participation_strategy_eq`: Effective participation of positive daily log gains,
+  normalized to `[0, 1]`: `(sum(p)^2) / (N * sum(p^2))`, where
+  `p = max(log(equity(t) / equity(t-1)), 0)`. If positive gain is spread equally across `k` of `N`
+  daily intervals, the score is `k / N`; concentration in a few unusually large positive days
+  lowers it further. The metric deliberately ignores negative returns, leaving their magnitude and
+  duration to Sortino and drawdown objectives, and should be paired with a gain objective so tiny
+  frequent gains cannot win on participation alone.
+
+For example, over 240 daily intervals, equal positive gains on all 240 days score `1.0`; equal
+positive gains on 120, 24, or one day score `0.5`, `0.1`, or about `0.0042`. Unequal gains reduce
+the score further. Two curves can therefore finish at the same equity while participation strongly
+prefers the one whose gains were broadly shared. Rolling-harmonic ADG asks a different question:
+whether growth remains sound across many possible 30/90/180-day start and end points.
+
 - `adg_pnl`: Collateral-agnostic daily PnL ratio. For each day, sum all `pnl` and divide by that
   day’s last recorded `usd_total_balance`, then average those daily ratios across the run.
 - `adg_pnl_w`: Weighted version of `adg_pnl` using the same 10-slice trailing averaging as `adg_w`.
@@ -42,6 +104,9 @@ and more stable across collateral caps.
 - `exposure_mean_ratio`: `adg` divided by the mean absolute recorded wallet exposure.
 
 Weighted `_w` variants use the same trailing-slice averaging as the rest of the `_w` metrics.
+Equity-based metrics include every nonempty trailing equity slice even when no new fills occur;
+equity-versus-balance calculations carry the last actual fill balance into each slice. Fill-only
+statistics remain zero for a slice without fills. Short runs average the available nonempty slices.
 
 ## Drawdown and tail metrics
 - `drawdown_worst`: Maximum absolute drawdown over the equity curve.
@@ -60,6 +125,14 @@ Weighted `_w` variants use the same trailing-slice averaging as the rest of the 
 - `volume_pct_per_day_avg`: Average daily traded notional as a percentage of balance at fill time.
 - `positions_held_per_day`: Average number of positions opened per day.
 - `position_held_hours_mean/median/max`: Holding-time stats for closed (or still-open) positions.
+- `position_held_time_weighted_mean_hours`: Duration-weighted mean holding time, computed as
+  `sum(held_hours^2) / sum(held_hours)` over the same per-coin, per-position-side episodes.
+  An episode starts on opening and ends on a full close; adds and partial closes do not reset it.
+  Still-open episodes run to the analysis end. Concurrent positions contribute independently,
+  without position-size or exposure weighting. No positive holding time returns `0`.
+  Minimize this metric for a distribution-sensitive penalty on long holds; retain the maximum
+  as a diagnostic or limit. As with the fill-gap metric, it is a duration-weighted average,
+  so shortening an episode already much shorter than the average need not lower the score.
 - `position_held_days_mean/median/max`: Same holding-time stats converted to days.
 - `position_unchanged_hours_max`: Longest span with no fills on an open position.
 - `position_unchanged_days_max`: Same unchanged-position span converted to days.
@@ -68,7 +141,8 @@ Weighted `_w` variants use the same trailing-slice averaging as the rest of the 
   gaps `g`; the metric is `sum(g^2) / sum(g)`. A randomly selected moment is therefore weighted by
   the length of the gap containing it, so long droughts contribute more strongly than clustered
   fills. A zero-fill run equals the full analysis duration.
-- `peak_recovery_hours_equity`: Longest time to make a new high on the equity curve.
+- `peak_recovery_hours_equity`: Longest equity peak-to-recovery interval, including an unrecovered
+  tail from the last peak to the final equity sample.
 - `peak_recovery_days_equity`: Same equity recovery duration converted to days.
 - `peak_recovery_hours_pnl`: Same calculation on cumulative realized PnL.
 - `peak_recovery_days_pnl`: Same realized-PnL recovery duration converted to days.

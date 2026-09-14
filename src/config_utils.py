@@ -62,7 +62,10 @@ from config.overrides import (
 from config.parse import load_raw_config
 from config.project import project_config
 from config.runtime_compile import compile_runtime_config
-from config.schema import get_template_config as get_schema_template_config
+from config.schema import (
+    CONFIG_SCHEMA_VERSION,
+    get_template_config as get_schema_template_config,
+)
 from config.strategy import prune_inactive_strategy_subtrees
 from config.tree_ops import (
     add_missing_keys_recursively,
@@ -1492,7 +1495,37 @@ RESERVED_CLI_ARGS = {
         "group": {"optimize": "Optimize Common"},
         "help": "Replace optimize.limits for this run with a JSON/HJSON list of limit objects.",
     },
+    "optimize.pymoo.shared.mutation_prob": {
+        "visible": ["--optimize.pymoo.shared.mutation_prob"],
+        "hidden": [
+            "--optimize_pymoo_shared_mutation_prob",
+            "--optimize.pymoo.shared.mutation_prob_var",
+            "--optimize_pymoo_shared_mutation_prob_var",
+            "-psmpv",
+        ],
+        "type": str,
+        "metavar": "VALUE",
+        "commands": {"optimize"},
+        "help": "Per-individual mutation probability, or auto for 1 / n_params.",
+    },
 }
+
+# Keep these convenience aliases stable across config grouping changes.
+for _pside in ("long", "short"):
+    for _param, _acronym, _help in (
+        ("total_wallet_exposure_limit", "twel", "Total wallet exposure limit"),
+        ("n_positions", "np", "Target number of concurrent position slots"),
+    ):
+        _key = f"bot.{_pside}.risk.{_param}"
+        RESERVED_CLI_ARGS[_key] = {
+            "visible": [f"--{_key}", f"-{_pside[0]}{_acronym}"],
+            "hidden": [f"--{_key.replace('.', '_')}", f"-{_pside[0]}r{_acronym}"],
+            "type": float,
+            "metavar": "FLOAT",
+            "commands": {"live", "backtest"},
+            "group": {"live": "Behavior", "backtest": "Backtest Runtime"},
+            "help": f"{_help} for the {_pside} side.",
+        }
 
 RESERVED_CLI_ARGS.update(OPTIMIZE_FIXED_BOT_RUNTIME_CLI_ARGS)
 
@@ -1582,6 +1615,11 @@ def _argument_metavar(type_, full_name: str, value):
 
 
 CLI_HELP_OVERRIDES = {
+    "optimize.enable_overrides": (
+        "Optimizer convenience overrides. couple_unstuck_ema_spans derives each coin and side's "
+        "unstuck horizons from its effective strategy, removing redundant unstuck span genes. "
+        "Saved candidates retain explicit spans. Default: no overrides."
+    ),
     "backtest.scenarios": (
         "Suite scenario definitions. Use --scenarios to select labels; use "
         "--suite-config for complex scenario files. Scenario entries support "
@@ -1648,7 +1686,7 @@ CLI_HELP_OVERRIDES = {
         "Terminal metric visibility config. null uses optimize scoring/limits; "
         "[] shows all; a list adds named metrics. Full analysis is still saved."
     ),
-    "config_version": "Config schema version. Canonical V8 configs use v8.2.0.",
+    "config_version": f"Config schema version. Canonical V8 configs use {CONFIG_SCHEMA_VERSION}.",
 }
 
 for _pside in ("long", "short"):
@@ -2160,6 +2198,19 @@ def add_arguments_recursively(
                 else parser
             )
             hidden_names = [f"--{full_name.replace('.', '_')}"]
+            if full_name.endswith(
+                tuple(f"trailing_martingale.entry.ema_span_{i}" for i in (0, 1))
+            ):
+                old_name = full_name.replace(
+                    "trailing_martingale.entry.ema_span_",
+                    "trailing_martingale.ema_span_",
+                )
+                hidden_names.extend(
+                    [f"--{old_name}", f"--{old_name.replace('.', '_')}"]
+                )
+                old_acronym = create_acronym(old_name, acronyms)
+                hidden_names.append(f"-{old_acronym}")
+                acronyms.add(old_acronym)
             if command is None or len(acronym) > 1:
                 hidden_names.append(f"-{acronym}")
             _register_argument(
@@ -2239,9 +2290,16 @@ def recursive_config_update(config, key, value, path=None, verbose=False):
     )
 
 
+def effective_config_payload(config: dict) -> dict:
+    """Return the supported payload without discarding wrapper provenance."""
+    return config["config"] if detect_flavor(config, {}) == "nested_current" else config
+
+
 def update_config_with_args(
     config, args, verbose=False, allowed_keys: Optional[set[str]] = None
 ):
+    transform_root = config
+    config = effective_config_payload(config)
     changed_keys = []
     diffs = []
     for key, value in vars(args).items():
@@ -2271,11 +2329,29 @@ def update_config_with_args(
         if change:
             changed_keys.append(key)
             diffs.append(change)
+        # Supported flat risk leaves win during normalization, so synchronize an
+        # existing alias when the CLI explicitly overrides its grouped value.
+        path = key.split(".")
+        if (
+            len(path) == 4
+            and path[0] == "bot"
+            and path[1] in {"long", "short"}
+            and path[2] == "risk"
+            and path[3] in {"total_wallet_exposure_limit", "n_positions"}
+            and path[3] in config["bot"][path[1]]
+        ):
+            flat_key = f"bot.{path[1]}.{path[3]}"
+            flat_change = recursive_config_update(
+                config, flat_key, value, verbose=verbose
+            )
+            if flat_change:
+                changed_keys.append(flat_key)
+                diffs.append(flat_change)
     if changed_keys:
         details = {"keys": changed_keys}
         if diffs:
             details["diffs"] = diffs
-        record_transform(config, "update_config_with_args", details)
+        record_transform(transform_root, "update_config_with_args", details)
 
 
 def get_template_config():
