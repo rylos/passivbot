@@ -66,6 +66,8 @@ FEE_RE = re.compile(r" fee=([+\-\d.]+)")
 # il wallet reale era gia' 12521.68). [balance] invece viene emessa nello
 # stesso secondo del fill che muove il saldo: e' quella che vale.
 ROCKET_PCT = 0.005
+# Oltre questo numero di eventi in un log nuovo non si rigioca (raffica).
+MAX_REPLAY = 10
 BAL_RE = re.compile(r"\[health\].*bal=([\d.]+)|\[balance\].*equity=([\d.]+)")
 
 
@@ -155,6 +157,15 @@ def main() -> None:
     if last_key in known:
         idx = next(i for i, e in enumerate(events) if e["key"] == last_key)
         fresh = events[idx + 1 :]
+    elif (
+        events[0]["key"].split("|")[0] > last_key.split("|")[0]
+        and len(events) <= MAX_REPLAY
+    ):
+        # Log nuovo dopo un riavvio del bot: last_key sta nel file vecchio e
+        # tutti gli eventi qui sono successivi. Il silenzio perdeva il primo
+        # trade dopo ogni riavvio (15/09: aperture delle 00:35 mai notificate
+        # su entrambi i bot). Pochi eventi, tutti nuovi: si mandano.
+        fresh = events
     else:
         # last_key fuori dal buffer (log ruotato, o script fermo abbastanza a
         # lungo da farlo scorrere via). Rigiocare tutto manderebbe una raffica
