@@ -264,7 +264,7 @@ def main() -> None:
                 log_end = None
             close_at = datetime.strptime(end, "%Y-%m-%dT%H:%M")
             if n_fills == 0 and log_end is not None and log_end <= close_at + timedelta(minutes=2):
-                # log non ancora arrivato al fill: riprovo tra 5 minuti
+                # log non ancora arrivato al fill: riprovo al giro dopo
                 deferred = True
                 break
             opened_at = None

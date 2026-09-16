@@ -6,7 +6,7 @@ sopravvivere a una ricostruzione del server e a versionare le modifiche.
 | file | dove gira | cron |
 |---|---|---|
 | `watchdog_ry_hl.py` | amazon, `~/watchdog/watchdog.py` | `*/10 * * * *` (ry-hl) e `3-59/10 * * * *` con argomento `bybit` (ry-bybit) |
-| `trade_report.py` | amazon, `~/watchdog/trade_report.py` | `*/5 * * * *` (ry-hl) e `*/5 * * * *` con argomento `bybit` (ry-bybit) |
+| `trade_report.py` | amazon, `~/watchdog/trade_report.py` | `*/2 * * * *` (ry-hl) e `*/2 * * * *` con argomento `bybit` (ry-bybit) |
 
 Dopo ogni modifica qui, ricopiare sul server e verificare che l'md5 combaci:
 
