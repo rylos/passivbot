@@ -1,0 +1,271 @@
+//@version=6
+indicator("RyLoS passivbot — ry-bybit (2cab1b32)", overlay = true, max_labels_count = 300)
+
+// Replica della config live di ry-bybit (config_bybit_4rsi.json, dal 2026-09-07).
+// Da usare su grafico 5m. Tutte le percentuali sono sul PREZZO; l'esposizione
+// (WE) e' notional / wallet, come la calcola passivbot.
+
+// ══ Gate 4RSI (rylos_4rsi) ══
+gS = "4RSI (candela 5m chiusa)"
+oscIn   = input.float(-24.39476, "Entry: osc 4RSI <",  group = gS)
+stochIn = input.float(12.2364,   "Entry: stoch %K <",  group = gS)
+oscOut  = input.float(19.82,     "Exit: osc 4RSI >",   group = gS)
+stochOut= input.float(87.1754,   "Exit: stoch %K >",   group = gS)
+minGain = input.float(0.0035,    "Exit 4RSI: guadagno minimo sul medio", step = 0.0001, group = gS)
+
+// ══ Entry iniziale e griglia (trailing_grid_v7.entry) ══
+gE = "Entry e griglia DCA"
+span0   = input.float(302.64,   "EMA span 0 (minuti)",           group = gE)
+span1   = input.float(333.72,   "EMA span 1 (minuti)",           group = gE)
+emaDist = input.float(0.010232, "initial_ema_dist", step = 0.0001, group = gE)
+iqp     = input.float(0.008296, "initial_qty_pct",  step = 0.0001, group = gE)
+gsp     = input.float(0.010732, "grid_spacing_pct", step = 0.0001, group = gE)
+gsVolW  = input.float(15.0892,  "grid_spacing_volatility_weight", group = gE)
+gsWeW   = input.float(5.4988,   "grid_spacing_we_weight",         group = gE)
+ddf     = input.float(0.286,    "grid_double_down_factor",        group = gE)
+volSpan = input.float(1562.32,  "volatility_ema_span_hours",      group = gE)
+
+// ══ Chiusure (trailing_grid_v7.close) ══
+gC = "Chiusure"
+trThr   = input.float(0.050916, "trailing_threshold_pct",   step = 0.0001, group = gC)
+trRet   = input.float(0.02028,  "trailing_retracement_pct", step = 0.0001, group = gC)
+cTgr    = input.float(0.11,     "close trailing_grid_ratio",               group = gC)
+mkStart = input.float(0.003195, "grid_markup_start", step = 0.0001,        group = gC)
+mkEnd   = input.float(-0.019667,"grid_markup_end",   step = 0.0001,        group = gC)
+
+// ══ Rischio ══
+gR = "Rischio"
+twel    = input.float(3.0,   "total_wallet_exposure_limit", group = gR)
+allow   = input.float(2.326, "we_excess_allowance_pct (legacy_raw)", group = gR)
+
+// ══ Override live (per allineare alla posizione vera) ══
+gM = "Override live"
+manAvg = input.float(0.0, "Prezzo medio (0 = simulato)",     group = gM)
+manWe  = input.float(0.0, "Esposizione WE (0 = simulata)",   step = 0.01, group = gM)
+manVol = input.float(0.0, "Volatilita' 1h (0 = calcolata)",  step = 0.0001, group = gM)
+manN   = input.int(0,     "Gradino attuale da Telegram (0 = non numerare)", group = gM)
+
+// ══ Visuale ══
+gV = "Visuale"
+showBand = input.bool(true, "Banda entry (EMA bassa − dist)", group = gV)
+showGate = input.bool(true, "Segnali 4RSI (anche senza fill)", group = gV)
+showSim  = input.bool(true, "Fill simulati (entry, DCA, uscite)", group = gV)
+nLvl     = input.int(3, "Gradini DCA da mostrare", minval = 1, maxval = 6, group = gV)
+lvlBars  = input.int(40, "Lunghezza linee (barre)", group = gV)
+
+// WEL effettivo per posizione: TWEL/n_positions × (1 + allowance), come
+// wallet_exposure_limit_with_allowance in modalita' legacy_raw.
+wela    = twel * (1 + allow)
+initWe  = wela * iqp                      // esposizione del primo ordine (~8,3%)
+
+// ══ Indicatori 5m ══
+osc   = (ta.rsi(close, 2) + ta.rsi(close, 7) + ta.rsi(close, 14)) / 3 - 50
+k     = ta.sma(ta.stoch(close, high, low, 14), 3)
+// colore: passivbot confronta con la chiusura 5m precedente, non con l'open
+rossa = close < close[1]
+verde = close > close[1]
+gateIn  = osc < oscIn and k < stochIn and rossa
+sigOut  = osc > oscOut and k > stochOut and verde
+
+// EMA su 1m del bot, approssimate su 5m dividendo lo span per 5
+tfMin = timeframe.in_seconds() / 60
+ema0  = ta.ema(close, math.max(1, math.round(span0 / tfMin)))
+ema1  = ta.ema(close, math.max(1, math.round(span1 / tfMin)))
+ema2  = ta.ema(close, math.max(1, math.round(math.sqrt(span0 * span1) / tfMin)))
+emaLow = math.min(ema0, ema1, ema2)
+bandPx = emaLow * (1 - emaDist)
+
+// volatilita': EMA "adjusted" del log range orario ln(high/low), span in ore
+adjEma(x, span) =>
+    a = 2.0 / (span + 1.0)
+    var float num = 0.0
+    var float den = 0.0
+    if not na(x)
+        num := a * x + (1 - a) * num
+        den := a + (1 - a) * den
+    den > 0 ? num / den : na
+volChiusa() =>
+    v = adjEma(math.log(high / low), volSpan)
+    v[1]
+// [1] + lookahead_on = ultima ora CHIUSA, senza repaint
+volAuto = request.security(syminfo.tickerid, "60", volChiusa(), lookahead = barmerge.lookahead_on)
+vol = manVol > 0 ? manVol : volAuto
+
+spacing(we) => gsp * (1 + we / wela * gsWeW + nz(vol) * gsVolW)
+
+// ══ Simulazione della posizione (wallet = 1, pnl non reinvestito) ══
+var float sAvg = na
+var float sWe  = 0.0          // notional / wallet
+var int   sN   = 0
+var float mx   = na
+var float mnAfterMx = na
+evento = ""
+
+if sN > 0
+    if high > mx
+        mx := high
+        mnAfterMx := close
+    else
+        mnAfterMx := math.min(mnAfterMx, low)
+
+    chiuso = false
+    // 1) uscita 4RSI: segnale sulla candela chiusa, si vende all'open della successiva
+    if sigOut[1] and open / sAvg - 1 > minGain
+        evento := "EXIT 4RSI " + str.tostring(100 * (open / sAvg - 1), "+#.##") + "%"
+        chiuso := true
+    // 2) chiusura trailing (sotto 11% del WEL effettivo, cioe' WE < ~1,1): vende tutto
+    else if sWe < cTgr * wela
+        if mx > sAvg * (1 + trThr) and mnAfterMx < mx * (1 - trRet)
+            evento := "TRAILING " + str.tostring(100 * (trThr - trRet), "+#.##") + "%"
+            chiuso := true
+    // 3) sopra quella soglia: chiusura a griglia della sola eccedenza
+    else
+        r  = math.min(1.0, sWe / wela)
+        cp = sAvg * (1 + mkStart + (mkEnd - mkStart) * r)
+        if high >= cp
+            sWe := math.max(0.0, sWe - (sWe - cTgr * wela) * 1.01)
+            evento := "GRID CLOSE " + str.tostring(100 * (cp / sAvg - 1), "+#.##") + "%"
+    if chiuso
+        sN := 0
+        sWe := 0.0
+        sAvg := na
+        mx := na
+        mnAfterMx := na
+    // 4) DCA a griglia: distanza dal PREZZO MEDIO, non dall'ultimo fill
+    else if sWe < math.min(wela, twel) * 0.999
+        p = sAvg * (1 - spacing(sWe))
+        if low <= p
+            fp  = math.min(open, p)
+            qty = math.max(sWe / sAvg * ddf, initWe / fp)
+            qty := math.min(qty, math.max(0.0, twel - sWe) / fp)   // gate TWEL
+            if qty > 0
+                qOld = sWe / sAvg
+                sAvg := (qOld * sAvg + qty * fp) / (qOld + qty)
+                sWe  := (qOld + qty) * sAvg
+                sN   += 1
+                mx   := high
+                mnAfterMx := close
+                evento := "DCA " + str.tostring(sN) + " @" + str.tostring(fp, format.mintick)
+else if gateIn[1] and low <= bandPx
+    // l'ordine iniziale sta a min(bid, banda): entra solo se il gate della
+    // candela chiusa e' vero E il prezzo arriva alla banda
+    fp = math.min(open, bandPx)
+    sAvg := fp
+    sWe  := initWe
+    sN   := 1
+    mx   := high
+    mnAfterMx := close
+    evento := "ENTRY @" + str.tostring(fp, format.mintick)
+
+// stato effettivo: override se impostato
+avgOra = manAvg > 0 ? manAvg : sAvg
+weOra  = manWe > 0 ? manWe : sWe
+inPos  = not na(avgOra) and weOra > 0
+
+// ══ Grafica ══
+plot(showBand ? bandPx : na, "Banda entry", color.new(color.red, 50), 1)
+plot(inPos ? avgOra : na, "Prezzo medio", color.new(color.yellow, 20), 1, plot.style_linebr)
+plot(inPos ? avgOra * (1 + trThr) : na, "Soglia trailing +5,09%",
+     color.new(color.lime, 60), 1, plot.style_linebr)
+
+plotshape(showGate and gateIn and barstate.isconfirmed, "Gate 4RSI", shape.circle,
+     location.belowbar, color.new(color.lime, 50), size = size.tiny)
+plotshape(showGate and sigOut and barstate.isconfirmed, "Segnale exit 4RSI", shape.circle,
+     location.abovebar, color.new(color.red, 50), size = size.tiny)
+
+isEntry = str.startswith(evento, "ENTRY")
+isDca   = str.startswith(evento, "DCA")
+isExit  = evento != "" and not isEntry and not isDca
+plotshape(showSim and isEntry, "Entry simulata", shape.triangleup, location.belowbar,
+     color.lime, size = size.small)
+plotshape(showSim and isDca, "DCA simulato", shape.triangleup, location.belowbar,
+     color.aqua, size = size.small)
+plotshape(showSim and isExit, "Uscita simulata", shape.triangledown, location.abovebar,
+     color.red, size = size.small)
+if showSim and isExit
+    label.new(bar_index, high, evento, style = label.style_label_down, size = size.tiny,
+         color = color.new(color.red, 70), textcolor = color.white)
+
+// ══ Gradini DCA successivi (solo ultima barra) ══
+var line[]  lns = array.new_line()
+var label[] lbs = array.new_label()
+if barstate.islast
+    for ln in lns
+        line.delete(ln)
+    array.clear(lns)
+    for lb in lbs
+        label.delete(lb)
+    array.clear(lbs)
+    if inPos
+        float a = avgOra
+        float w = weOra
+        for i = 0 to nLvl - 1
+            if w >= math.min(wela, twel) * 0.999
+                break
+            p   = a * (1 - spacing(w))
+            q   = math.min(math.max(w / a * ddf, initWe / p), (twel - w) / p)
+            qo  = w / a
+            a  := (qo * a + q * p) / (qo + q)
+            w  := (qo + q) * a
+            array.push(lns, line.new(bar_index - lvlBars, p, bar_index + 3, p,
+                 color = color.new(color.aqua, 20 + i * 20)))
+            array.push(lbs, label.new(bar_index + 3, p,
+                 (manN > 0 ? "gradino " + str.tostring(manN + i + 1) : "prossimo +" + str.tostring(i + 1)) + "  " + str.tostring(p, format.mintick) +
+                 "  (" + str.tostring(100 * (p / avgOra - 1), "+#.##;-#.##") + "%, WE → " +
+                 str.tostring(w, "#.##") + ")",
+                 style = label.style_label_left, color = color.new(color.aqua, 80),
+                 textcolor = color.white, size = size.small))
+
+// ══ Tabella ══
+var tbl = table.new(position.top_right, 3, 22, border_width = 1,
+     bgcolor = color.new(color.black, 45), border_color = color.new(color.gray, 60))
+bg = color.new(color.black, 45)
+col(c) => c ? color.new(color.green, 40) : color.new(color.red, 40)
+riga(r, e, v, c) =>
+    table.cell(tbl, 0, r, e, text_size = size.small, text_color = color.white, bgcolor = bg, text_halign = text.align_left)
+    table.cell(tbl, 1, r, v, text_size = size.small, text_color = color.white, bgcolor = bg)
+    table.cell(tbl, 2, r, c ? "✓" : "✗", text_size = size.small, text_color = color.white, bgcolor = col(c))
+info(r, e, v) =>
+    table.cell(tbl, 0, r, e, text_size = size.small, text_color = color.white, bgcolor = bg, text_halign = text.align_left)
+    table.cell(tbl, 1, r, v, text_size = size.small, text_color = color.white, bgcolor = bg)
+    table.cell(tbl, 2, r, "", bgcolor = bg)
+titolo(r, t, c) =>
+    table.cell(tbl, 0, r, t, text_size = size.small, text_color = color.white, bgcolor = c)
+    table.merge_cells(tbl, 0, r, 2, r)
+f1(x) => str.tostring(x, "#.#")
+pct(x) => str.tostring(100 * x, "+#.##;-#.##") + "%"
+
+if barstate.islast
+    gain = inPos ? close / avgOra - 1 : na
+    info(0, "Grafico", timeframe.period == "5" ? "5m ✓" : timeframe.period + " — usa il 5m!")
+
+    titolo(1, "ENTRATA (solo a posizione chiusa)", color.new(color.blue, 50))
+    riga(2, "4RSI sotto " + f1(oscIn), f1(osc), osc < oscIn)
+    riga(3, "Stoch sotto " + f1(stochIn), f1(k), k < stochIn)
+    riga(4, "Candela rossa", rossa ? "rossa" : "verde", rossa)
+    riga(5, "Prezzo sotto banda", pct(close / bandPx - 1), close <= bandPx)
+    riga(6, "→ ENTRA", gateIn and close <= bandPx ? "SI'" : "no", gateIn and close <= bandPx)
+
+    titolo(7, "USCITA 4RSI (vende tutto)", color.new(color.purple, 50))
+    riga(8, "4RSI sopra " + f1(oscOut), f1(osc), osc > oscOut)
+    riga(9, "Stoch sopra " + f1(stochOut), f1(k), k > stochOut)
+    riga(10, "Candela verde", verde ? "verde" : "rossa", verde)
+    riga(11, "Gain sopra " + pct(minGain), inPos ? pct(gain) : "—", inPos and gain > minGain)
+    riga(12, "→ VENDE", inPos and sigOut and gain > minGain ? "SI'" : "no", inPos and sigOut and gain > minGain)
+
+    titolo(13, "USCITA TRAILING (vende tutto)", color.new(color.purple, 50))
+    riga(14, "Arma sopra", inPos ? str.tostring(avgOra * (1 + trThr), format.mintick) + " (" + pct(trThr) + ")" : "—", inPos and gain > trThr)
+    info(15, "poi vende a", inPos ? str.tostring(avgOra * (1 + trThr - trRet), format.mintick) + " (" + pct(trThr - trRet) + ")" : "—")
+
+    titolo(16, "POSIZIONE", color.new(color.gray, 40))
+    info(17, "Stato", not inPos ? "piatto" : manAvg > 0 ? (manN > 0 ? "gradino " + str.tostring(manN) : "reale (override)") : str.tostring(sN) + " fill simulati")
+    info(18, "Medio / gain", inPos ? str.tostring(avgOra, format.mintick) + "  " + pct(gain) : "—")
+    info(19, "Esposizione", str.tostring(weOra, "#.###") + " / " + str.tostring(twel, "#.#"))
+    info(20, "Prossimo DCA", inPos ? str.tostring(avgOra * (1 - spacing(weOra)), format.mintick) + " (" + pct(-spacing(weOra)) + ")" : "—")
+    info(21, "Volatilita' 1h", str.tostring(vol, "#.#####"))
+
+// ══ Alert ══
+alertcondition(gateIn and barstate.isconfirmed, "ry-bybit gate entry",
+     "ry-bybit: gate 4RSI aperto su {{ticker}} (entra se tocca la banda)")
+alertcondition(sigOut and barstate.isconfirmed, "ry-bybit segnale exit",
+     "ry-bybit: segnale exit 4RSI su {{ticker}} (vende se gain > 0,35%)")

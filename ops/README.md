@@ -105,3 +105,17 @@ rinominato via API il 2026-09-03: stesso uuid, stesso URL di ping.
 ⚠️ Bybit in hedge mode: passivbot lo imposta all'avvio e Bybit non permette di
 cambiare position mode con una posizione aperta. Se freqtrade dovesse tornare su
 questo account, va rimesso one-way **a conto piatto**.
+
+## tradingview/rylos_bybit.pine
+
+Indicatore Pine v6 per TradingView (grafico HYPEUSDT **5m**), non gira su nessun
+server: replica gate 4RSI, griglia DCA (`trailing_grid_v7`) e uscite della config
+live di ry-bybit (`2cab1b32`, `exit_min_gain` 0,0035). Se la config cambia, vanno
+aggiornati a mano i default degli input.
+
+- La posizione simulata sul grafico non coincide con quella vera: per allinearla
+  usare gli input "Override live" (prezzo medio, esposizione WE = notional/wallet,
+  gradino attuale da Telegram) e rimetterli a 0 quando la posizione si chiude.
+- La volatilità 1h auto-calcolata è sottostimata (TradingView ha poca storia
+  oraria rispetto allo span di 1562 h del bot): impostarla a mano. Il 2026-09-23
+  il valore 0,0198 riproduceva esattamente il prossimo ordine DCA del bot (92,32).
