@@ -111,3 +111,10 @@ Due difetti: (1) il retry dei gap persistenti fetcha prima il gap iniziale del 2
 
 ## ⚠️ Backtest: mai due `backtest.py` in parallelo (visto il 2026-09-13)
 La cartella di output è `backtests/<exchange>/<YYYY-MM-DDTHH_MM_SS>`: due run avviate nello stesso secondo scrivono nella stessa cartella e si sovrascrivono a vicenda (analysis.json di una, `balance_and_equity.csv.gz` corrotto/non-gzip). Lanciarli sempre in sequenza (`run1; run2`), oppure distanziarli di almeno 2 s, e verificare subito dopo quale config c'è in `<dir>/config.json`.
+
+## Prossimo optimize proposto: robustezza ai fill (in attesa del via di Marco, 2026-09-24)
+Marco lo avvia lui ("domani sera quando te lo dico io"): NON partire da soli.
+- Motivo: con `backtest.limit_order_fill_buffer_pct` 0,0005 il dd delle config live sale a 74-79% (uscita trailing del 2025-04-02 mancata di un soffio, vedi live_deployment.md). A 0,0001 nessun effetto.
+- Piano: optimize **senza HSL** sul codice di `~/passivbot-up` (branch `upstream-merge-20260924`, l'unico con il buffer), suite con scenari a buffer diversi (0 / 0,0001 / 0,0005) e scelta sul dd peggiore fra gli scenari; poi il solito gate sulle partizioni spostate. La config risultante gira sul live attuale senza merge (il buffer è solo backtest). Se il dd resta alto → secondo giro con HSL acceso (richiede merge sul live).
+- Da fare prima di lanciare: (1) verificare che gli override di scenario (`suite_runner.py`, `overrides` con percorso puntato) accettino `backtest.limit_order_fill_buffer_pct` e che l'optimizer lo rispetti per scenario (in `optimize.py` è trattato come impostazione fissa di simulazione: potrebbe valere solo globale); (2) sbloccare l'errore "Optimizer evaluation identity requires a source-stamped Rust extension" su `~/passivbot-up` (fallisce anche `tests/test_limit_order_fill_buffer.py::test_resume_requires_same_fill_assumption`); (3) nessun backtest/optimize già in corsa su debian.
+- Ambiente `~/passivbot-up`: esportare `PATH=$HOME/.cargo/bin:$HOME/passivbot-up/venv/bin:$PATH VIRTUAL_ENV=$HOME/passivbot-up/venv`, altrimenti il bot vede l'estensione "stale" e fallisce la ricompilazione.
