@@ -188,6 +188,7 @@ The code-owned registries live in `src/live/event_bus.py`. Payload and emission 
 - `forager_eligibility_membership_changed`
 - `fresh_entry_eligibility`
 - `hsl_balance_override_account_level_replay_unsafe`
+- `hsl_episode_evidence_unavailable`
 - `hsl_held_protective_ready`
 - `hsl_history_balance_unavailable`
 - `hsl_history_empty`
@@ -199,6 +200,7 @@ The code-owned registries live in `src/live/event_bus.py`. Payload and emission 
 - `hsl_raw_red_pending_ema_confirmation`
 - `hsl_red_finalized_without_exchange_order`
 - `hsl_replay_pending`
+- `hsl_signal_unavailable`
 - `hsl_timeline_replay_completed`
 - `hsl_timeline_replay_started`
 - `length_mismatch`

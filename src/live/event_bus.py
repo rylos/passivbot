@@ -318,6 +318,8 @@ class EventTags:
 class ReasonCodes:
     CURRENT_BALANCE_UNAVAILABLE = "current_balance_unavailable"
     HSL_HISTORY_BALANCE_UNAVAILABLE = "hsl_history_balance_unavailable"
+    HSL_EPISODE_EVIDENCE_UNAVAILABLE = "hsl_episode_evidence_unavailable"
+    HSL_SIGNAL_UNAVAILABLE = "hsl_signal_unavailable"
     AUTHORITATIVE_CONFIRMATION = "authoritative_confirmation"
     AUTHORITATIVE_CONFIRMATION_TIMEOUT = "authoritative_confirmation_timeout"
     BALANCE_CHANGED = "balance_changed"
@@ -2449,6 +2451,11 @@ def _format_console_ratio(value: Any) -> str | None:
 
 def _console_hsl_status_summary(event: LiveEvent) -> list[str]:
     data = event.data if isinstance(event.data, Mapping) else {}
+    if data.get("engine") == "revised":
+        counts = data.get("counts", {})
+        return ["engine=revised", f"mode={data.get('signal_mode', '-')}",
+                f"observation={data.get('observation_status', '-')}",
+                *(f"{key}={counts.get(key, 0)}" for key in ("green", "red", "inactive", "unavailable", "estimated"))]
     parts: list[str] = []
     signal_mode = _data_str(data, "signal_mode")
     if signal_mode:

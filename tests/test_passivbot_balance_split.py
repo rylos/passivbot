@@ -1152,6 +1152,11 @@ async def test_hyperliquid_live_market_snapshot_uses_symbol_fallback_for_hip3():
     assert snap.last == pytest.approx(73.455)
 
 
+def _hostile_market_unavailable(detail):
+    from live.market_snapshot import MarketSnapshotUnavailable
+    return type("ApiKeySecretError", (MarketSnapshotUnavailable,), {})(detail)
+
+
 @pytest.mark.asyncio
 async def test_hyperliquid_live_market_snapshot_fallback_logs_are_redacted(caplog):
     bot = Passivbot.__new__(Passivbot)
@@ -1159,10 +1164,10 @@ async def test_hyperliquid_live_market_snapshot_fallback_logs_are_redacted(caplo
     bot.symbol_ids = {}
 
     async def fail_primary(*_args, **_kwargs):
-        raise _hostile_runtime_error("primary token=secret-primary")
+        raise _hostile_market_unavailable("primary token=secret-primary")
 
     async def fail_all_mids(*_args, **_kwargs):
-        raise _hostile_runtime_error("allMids token=secret-mid")
+        raise _hostile_market_unavailable("allMids token=secret-mid")
 
     async def fetch_symbol_tickers(symbols):
         assert symbols == ["BTC/USDC:USDC"]
@@ -1186,8 +1191,8 @@ async def test_hyperliquid_live_market_snapshot_fallback_logs_are_redacted(caplo
 
     assert snapshots["BTC/USDC:USDC"].last == pytest.approx(100.5)
     messages = "\n".join(record.getMessage() for record in caplog.records)
-    assert "error_type=RuntimeError action=try_all_mids" in messages
-    assert "error_type=RuntimeError action=try_symbol_tickers" in messages
+    assert "error_type=MarketSnapshotUnavailable action=try_all_mids" in messages
+    assert "error_type=MarketSnapshotUnavailable action=try_symbol_tickers" in messages
     assert "ApiKeySecretError" not in messages
     assert "secret-primary" not in messages
     assert "secret-mid" not in messages
@@ -1206,7 +1211,7 @@ async def test_hyperliquid_symbol_ticker_failure_log_is_redacted(caplog):
     bot._log_symbols = lambda symbols, limit=12: ",".join(symbols[:limit])
 
     async def fail_symbol_tickers(_symbols):
-        raise _hostile_runtime_error("symbol ticker token=secret-symbol")
+        raise _hostile_market_unavailable("symbol ticker token=secret-symbol")
 
     bot.fetch_tickers_for_symbols = fail_symbol_tickers
 
@@ -1217,7 +1222,7 @@ async def test_hyperliquid_symbol_ticker_failure_log_is_redacted(caplog):
             )
 
     messages = "\n".join(record.getMessage() for record in caplog.records)
-    assert "error_type=RuntimeError action=fail_if_incomplete" in messages
+    assert "error_type=MarketSnapshotUnavailable action=fail_if_incomplete" in messages
     assert "ApiKeySecretError" not in messages
     assert "secret-symbol" not in messages
 
@@ -1230,9 +1235,9 @@ async def test_hyperliquid_orchestrator_fallback_preserves_redacted_cause(caplog
     bot._log_symbols = lambda symbols, limit=12: ",".join(symbols[:limit])
 
     async def fail_primary(*_args, **_kwargs):
-        raise _hostile_runtime_error("primary token=secret-primary")
+        raise _hostile_market_unavailable("primary token=secret-primary")
 
-    fallback_error = _hostile_runtime_error("fallback token=secret-fallback")
+    fallback_error = _hostile_market_unavailable("fallback token=secret-fallback")
 
     async def fail_fallback(*_args, **_kwargs):
         raise fallback_error
@@ -1245,14 +1250,33 @@ async def test_hyperliquid_orchestrator_fallback_preserves_redacted_cause(caplog
             await bot._get_orchestrator_market_snapshots(["BTC/USDC:USDC"])
 
     assert raised.value.__cause__ is fallback_error
-    assert str(raised.value).endswith("fallback_error=RuntimeError")
+    assert str(raised.value).endswith("fallback_error=MarketSnapshotUnavailable")
     rendered = f"{raised.value}\n" + "\n".join(
         record.getMessage() for record in caplog.records
     )
-    assert "error_type=RuntimeError action=try_explicit_fallback" in rendered
+    assert "error_type=MarketSnapshotUnavailable action=try_explicit_fallback" in rendered
     assert "ApiKeySecretError" not in rendered
     assert "secret-primary" not in rendered
     assert "secret-fallback" not in rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["all_mids", "symbol_tickers"])
+@pytest.mark.parametrize("error_type", [ValueError, TypeError, RuntimeError])
+async def test_hyperliquid_fallback_preserves_deterministic_failures(stage, error_type):
+    bot = Passivbot.__new__(Passivbot)
+    bot.exchange = "hyperliquid"
+    bot.symbol_ids = {}
+    bot.market_snapshot_provider = SimpleNamespace(get_snapshots=AsyncMock(return_value={}))
+    original = error_type("invalid connector metadata")
+    bot.cca = SimpleNamespace(fetch=AsyncMock(return_value={}))
+    bot.fetch_tickers_for_symbols = AsyncMock(return_value={})
+    operation = bot.cca.fetch if stage == "all_mids" else bot.fetch_tickers_for_symbols
+    operation.side_effect = original
+    bot._hl_info_url = lambda: "https://example.invalid/info"
+    with pytest.raises(error_type) as caught:
+        await bot._get_live_market_snapshots(["A"], context="test")
+    assert caught.value is original
 
 
 @pytest.mark.asyncio
@@ -2915,7 +2939,7 @@ async def test_start_bot_treats_hsl_value_error_as_terminal_startup_failure(
     bot.user = "test_user"
     bot.quote = "USDT"
     bot.start_time_ms = 1_000_000
-    bot.config = {"live": {"boot_stagger_seconds": 0, "risk_input_max_attempts": 10}}
+    bot.config = {"live": {"boot_stagger_seconds": 0, "risk_input_max_attempts": 10, "execution_delay_seconds": 5.0, "hsl_unavailable_grace_seconds": 120.0}}
     bot.debug_mode = False
     bot.stop_signal_received = False
     bot._shutdown_in_progress = False
@@ -4145,7 +4169,9 @@ async def test_update_pnls_completed_refresh_timing_trigger_cases_stay_debug(
     ],
     ids=["mixed_new_source", "same_source_structural_change", "fee_only_change"],
 )
+@pytest.mark.parametrize("previous_status", ["pending", "complete", "two_phase"])
 async def test_update_pnls_confirms_only_structural_enrichment(
+    previous_status,
     current_source_ids,
     current_id,
     current_qty,
@@ -4167,8 +4193,10 @@ async def test_update_pnls_confirms_only_structural_enrichment(
         position_side="long",
         client_order_id="pb-close",
         pnl=0.0,
-        pnl_status="pending",
-        pnl_source=fem.PNL_SOURCE_PENDING,
+        pnl_status="pending" if previous_status == "pending" else "complete",
+        pnl_source=(fem.PNL_SOURCE_PENDING if previous_status == "pending" else
+                    "synthetic_fill_reconstruction_degraded" if previous_status == "two_phase" else
+                    fem.PNL_SOURCE_AUTHORITATIVE),
     )
     current = SimpleNamespace(
         **{
@@ -4186,6 +4214,9 @@ async def test_update_pnls_confirms_only_structural_enrichment(
     class _Manager:
         def __init__(self):
             self._events = [previous]
+
+        async def refresh_degraded_pnl_events(self, **_kwargs):
+            self._events = [SimpleNamespace(**{**vars(previous), "pnl_source": fem.PNL_SOURCE_AUTHORITATIVE})]
 
         async def refresh_latest(self, **_kwargs):
             self._events = [current]
@@ -4220,9 +4251,19 @@ async def test_update_pnls_confirms_only_structural_enrichment(
     bot.logging_level = 0
     bot._health_rate_limits = 0
 
+    ledger = bot._ensure_freshness_ledger()
+    ledger.begin_epoch()
+    ledger.stamp("positions", now_ms=bot.get_exchange_time())
+    observation = (ledger.epoch, ledger.surfaces["positions"].revision)
     assert await bot.update_pnls(source="staged_blocking") is True
+    assert bot._hsl_fill_tail_observation == (None if expect_confirmation else observation)
 
-    bot._log_enriched_fill_events.assert_called_once_with([(previous, current)])
+    if previous_status == "pending":
+        bot._log_enriched_fill_events.assert_called_once_with([(previous, current)])
+    elif previous_status == "two_phase":
+        bot._log_enriched_fill_events.assert_called_once()
+    else:
+        bot._log_enriched_fill_events.assert_not_called()
     # A mixed aggregate is already accounted by the enrichment path, so it
     # requests confirmation without counting the aggregate as a second fill.
     bot._log_new_fill_events.assert_not_called()
@@ -5558,10 +5599,12 @@ async def test_update_pnls_all_lookback_uses_incremental_refresh_when_cache_is_f
     assert bot._pnls_manager.history_scope == "all"
     assert bot._trailing_fill_fetch_generation == 5
     assert bot._trailing_fill_refresh_generation == 5
+    assert bot._hsl_fill_tail_observation is None  # No preceding position observation.
 
 
 @pytest.mark.asyncio
-async def test_update_pnls_pending_enrichment_advances_only_trailing_fetch_generation():
+@pytest.mark.parametrize('observation_change', ['unchanged', 'epoch', 'position', 'concurrent'])
+async def test_update_pnls_pending_enrichment_advances_only_trailing_fetch_generation(observation_change):
     bot = Passivbot.__new__(Passivbot)
     bot._live_risk_uses_authoritative_pnl = lambda: True
     cached_events = [
@@ -5607,6 +5650,19 @@ async def test_update_pnls_pending_enrichment_advances_only_trailing_fetch_gener
     bot._trailing_fill_refresh_started_generation = 4
     bot._trailing_fill_fetch_generation = 4
     bot._trailing_fill_refresh_generation = 4
+    ledger = bot._ensure_freshness_ledger()
+    ledger.begin_epoch()
+    if observation_change != 'concurrent':
+        ledger.stamp('positions', now_ms=1_700_000_060_000)
+    started_observation = ((ledger.epoch, ledger.surfaces['positions'].revision)
+                           if observation_change != 'concurrent' else None)
+    if observation_change == 'epoch':
+        bot._pnls_manager.refresh_latest.side_effect = lambda **kwargs: ledger.begin_epoch()
+    elif observation_change in {'position', 'concurrent'}:
+        def observe_positions(**kwargs):
+            ledger.stamp('positions', now_ms=1_700_000_060_000)
+            # A completed refresh returns None, not stamp's unchanged=False.
+        bot._pnls_manager.refresh_latest.side_effect = observe_positions
 
     result = await bot.update_pnls()
 
@@ -5617,6 +5673,8 @@ async def test_update_pnls_pending_enrichment_advances_only_trailing_fetch_gener
     )
     assert bot._trailing_fill_fetch_generation == 5
     assert bot._trailing_fill_refresh_generation == 4
+    assert bot._hsl_fill_tail_observation == started_observation
+    assert (bot._hsl_fill_tail_observation == (ledger.epoch, ledger.surfaces['positions'].revision)) is (observation_change == 'unchanged')
 
 
 @pytest.mark.asyncio
@@ -5987,8 +6045,8 @@ async def test_update_pnls_window_lookback_stays_blocked_when_known_gap_persists
     bot._pnls_manager.refresh_for_lookback.assert_awaited_once_with(start_ms=start_ms)
     bot._pnls_manager.refresh.assert_not_awaited()
     bot._pnls_manager.refresh_latest.assert_not_awaited()
-    assert bot._last_fill_refresh_pending_pnl_count == 0
-    assert bot._last_fill_refresh_block_reason == "fill_history_coverage"
+    assert bot._hsl_revised_fill_capture_interval is None
+    assert bot._last_fill_refresh_block_reason == "fill_refresh_skipped"
     ledger = getattr(bot, "freshness_ledger", None)
     assert ledger is None or ledger.surface_signature("fills") is None
     assert bot._trailing_fill_fetch_generation == 7
@@ -5998,6 +6056,8 @@ async def test_update_pnls_window_lookback_stays_blocked_when_known_gap_persists
     assert result is False
     assert bot._pnls_manager.refresh_for_lookback.await_count == 2
     assert bot._trailing_fill_fetch_generation == 7
+    assert getattr(bot, '_hsl_fill_tail_observation', None) is None
+    assert bot._hsl_revised_fill_capture_interval is None  # Cache-only repair did not fetch.
 
 
 @pytest.mark.asyncio
@@ -7454,7 +7514,8 @@ async def test_refresh_authoritative_state_staged_uses_generic_staged_fetch_for_
 
 
 @pytest.mark.asyncio
-async def test_refresh_protective_authoritative_state_uses_account_critical_surfaces():
+@pytest.mark.parametrize("require_balance", [True, False])
+async def test_refresh_protective_authoritative_state_uses_account_critical_surfaces(require_balance):
     bot = Passivbot.__new__(Passivbot)
     bot.config = {"live": {}}
     _disable_entry_cooldown_delta_guard_for_staged_refresh_test(bot)
@@ -7525,33 +7586,32 @@ async def test_refresh_protective_authoritative_state_uses_account_critical_surf
     )
     bot.update_pnls = AsyncMock(side_effect=AssertionError("fills not required"))
 
-    ok = await bot.refresh_protective_authoritative_state()
+    if not require_balance:
+        bot._prepare_balance_snapshot = lambda *_: pytest.fail("exit must not consume balance")
+    ok = await bot.refresh_protective_authoritative_state(require_balance=require_balance)
+    expected_plan = {"positions", "open_orders"} | ({"balance"} if require_balance else set())
 
     assert ok is True
     bot._fetch_authoritative_state_staged_snapshot.assert_awaited_once_with(
-        {"balance", "positions", "open_orders"}
+        expected_plan
     )
     bot._apply_open_orders_snapshot.assert_awaited_once_with(
         fetched_orders,
         allow_followup_positions_refresh=False,
         reconcile_balance=False,
     )
-    assert recorded == [
-        (
-            "balance",
-            123.45,
-        ),
+    assert recorded == ([("balance", 123.45)] if require_balance else []) + [
         (
             "positions",
             (("BTC/USDT:USDT", "long", 0.1, 100.0),),
         )
     ]
-    assert bot.balance_raw == pytest.approx(123.45)
+    assert bot.balance_raw == pytest.approx(123.45 if require_balance else 0.0)
     assert cooldown_updates == [(("BTC/USDT:USDT",), 1_700_000_000_000)]
-    assert finalized == [{"balance", "positions", "open_orders"}]
+    assert finalized == [expected_plan]
 
 
-def test_protective_planning_snapshot_requires_balance_not_fills_or_candles():
+def test_protective_planning_snapshot_requires_positions_orders_and_prices_only():
     import passivbot as pb_mod
 
     symbol = "BTC/USDT:USDT"
@@ -7578,7 +7638,6 @@ def test_protective_planning_snapshot_requires_balance_not_fills_or_candles():
     ledger.begin_epoch(now_ms=now_ms)
     ledger.stamp("positions", (symbol, "long", 0.1), now_ms=now_ms)
     ledger.stamp("open_orders", (), now_ms=now_ms)
-    ledger.stamp("balance", 100.0, now_ms=now_ms)
     ledger.stamp("market_snapshot", (symbol, 99.5, 100.5), now_ms=now_ms)
     bot.freshness_ledger = ledger
     snapshots = {
@@ -7599,7 +7658,6 @@ def test_protective_planning_snapshot_requires_balance_not_fills_or_candles():
 
     assert snapshot.account_invalidation_generation == 7
     assert set(snapshot.required_surfaces) == {
-        "balance",
         "positions",
         "open_orders",
         "market_snapshot",
@@ -7607,7 +7665,6 @@ def test_protective_planning_snapshot_requires_balance_not_fills_or_candles():
     assert "fills" not in snapshot.required_surfaces
     assert "completed_candles" not in snapshot.required_surfaces
     assert {surface.name: surface.min_epoch for surface in snapshot.surfaces} == {
-        "balance": 1,
         "positions": 1,
         "open_orders": 1,
         "market_snapshot": 1,
@@ -7668,7 +7725,8 @@ async def test_fetch_authoritative_state_staged_snapshot_cleans_up_on_cancelled_
 
 
 @pytest.mark.asyncio
-async def test_refresh_authoritative_state_staged_does_not_publish_when_fills_fail():
+@pytest.mark.parametrize("degraded", [0, 1])
+async def test_refresh_authoritative_state_staged_does_not_publish_when_fills_fail(degraded):
     bot = Passivbot.__new__(Passivbot)
     bot._live_risk_uses_authoritative_pnl = lambda: True
     plan = {"balance", "positions", "open_orders", "fills"}
@@ -7680,7 +7738,7 @@ async def test_refresh_authoritative_state_staged_does_not_publish_when_fills_fa
             "open_orders": [],
             "pnls_ok": False,
             "pending_pnl_count": 0,
-            "degraded_pnl_count": 1,
+            "degraded_pnl_count": degraded,
         }
     )
     bot._apply_positions_snapshot = MagicMock()
@@ -7697,9 +7755,9 @@ async def test_refresh_authoritative_state_staged_does_not_publish_when_fills_fa
     bot._apply_open_orders_snapshot.assert_not_awaited()
     bot.handle_balance_update.assert_not_awaited()
     bot._finalize_authoritative_refresh_consistency.assert_not_called()
-    assert bot._last_authoritative_block_reason == "degraded_pnl"
+    assert bot._last_authoritative_block_reason == ("degraded_pnl" if degraded else "fills_unavailable")
     assert bot._last_authoritative_pending_pnl_count == 0
-    assert bot._last_authoritative_degraded_pnl_count == 1
+    assert bot._last_authoritative_degraded_pnl_count == degraded
 
 
 @pytest.mark.asyncio
@@ -7707,7 +7765,6 @@ async def test_refresh_authoritative_state_staged_does_not_blame_nonblocking_pnl
     bot = Passivbot.__new__(Passivbot)
     bot._live_risk_uses_authoritative_pnl = lambda: False
     bot._authoritative_staged_refresh_plan = lambda: {
-        "balance",
         "positions",
         "open_orders",
         "fills",
@@ -7737,7 +7794,6 @@ async def test_refresh_authoritative_state_staged_classifies_unproven_fill_cover
     bot._live_risk_uses_authoritative_pnl = lambda: False
     bot._last_fill_refresh_block_reason = "fill_history_coverage"
     bot._authoritative_staged_refresh_plan = lambda: {
-        "balance",
         "positions",
         "open_orders",
         "fills",
@@ -8361,8 +8417,8 @@ async def test_protective_panic_orchestrator_payload_omits_ema_dependencies(monk
     class FakeBot:
         exchange = "binance"
         user = "tester"
-        balance = 120.0
-        balance_raw = 120.0
+        balance = float("nan")
+        balance_raw = float("nan")
         positions = {
             symbol: {
                 "long": {"size": 1.0, "price": 100.0},
@@ -8430,11 +8486,7 @@ async def test_protective_panic_orchestrator_payload_omits_ema_dependencies(monk
             raise AssertionError("protective panic path must not load EMA bundles")
 
         def _bot_params_to_rust_dict(self, pside, sym):
-            return {
-                "n_positions": 1,
-                "total_wallet_exposure_limit": 1.0,
-                "wallet_exposure_limit": 1.0,
-            }
+            raise AssertionError("protective exit must not read strategy parameters")
 
         def _strategy_params_to_rust_dict(self, pside, sym):
             return {}
@@ -8456,10 +8508,8 @@ async def test_protective_panic_orchestrator_payload_omits_ema_dependencies(monk
 
     def fake_compute(json_str):
         captured["input"] = json.loads(json_str)
-        output = json.loads(
-            _empty_orchestrator_output(captured["input"], {"warnings": []})
-        )
-        output["orders"].append(
+        output = []
+        output.append(
             {
                 "symbol_idx": 0,
                 "pside": "long",
@@ -8484,14 +8534,14 @@ async def test_protective_panic_orchestrator_payload_omits_ema_dependencies(monk
     monkeypatch.setattr(
         pb_mod.Passivbot,
         "_equity_hard_stop_enabled",
-        lambda self, pside=None: True,
+        lambda self, pside=None, symbol=None: True,
     )
     monkeypatch.setattr(
         pb_mod.Passivbot,
         "_equity_hard_stop_panic_close_order_type",
-        lambda self, pside: "market",
+        lambda self, pside, symbol=None: "limit",
     )
-    monkeypatch.setattr(pb_mod.pbr, "compute_ideal_orders_json", fake_compute)
+    monkeypatch.setattr(pb_mod.pbr, "compute_protective_closes_json", fake_compute, raising=False)
 
     out = await pb_mod.Passivbot.calc_protective_panic_ideal_orders_orchestrator(
         FakeBot()
@@ -8501,17 +8551,11 @@ async def test_protective_panic_orchestrator_payload_omits_ema_dependencies(monk
     assert len(out[symbol]) == 1
     assert out[symbol][0][:3] == (-1.0, 100.4, "close_panic_long")
     assert out[symbol][0][4:] == ("limit", "risk_critical")
-    rust_symbol = captured["input"]["symbols"][0]
-    assert rust_symbol["long"]["mode"] == "panic"
-    assert rust_symbol["short"]["mode"] == "manual"
-    assert captured["input"]["global"]["panic_close_market"] is False
-    assert len(captured["input"]["symbols"]) == 1
-    assert rust_symbol["emas"] == {
-        "m1": {"close": [], "log_range": [], "volume": []},
-        "h1": {"close": [], "log_range": [], "volume": []},
-    }
-    assert "unstuck_allowance_long" not in captured["input"]["global"]
-    assert captured["input"]["global"]["realized_pnl_cumsum_last"] == 0.0
+    assert captured["input"] == [{
+        "symbol_idx": 0, "pside": "long", "position_size": 1.0,
+        "order_book": {"bid": 99.5, "ask": 100.5}, "price_step": 0.1,
+        "execution_type": "limit",
+    }]
     assert pb_mod.Passivbot._protective_panic_target_psides_by_symbol(FakeBot()) == {
         symbol: {"long"}
     }
@@ -11566,9 +11610,15 @@ async def test_run_execution_loop_keeps_latched_hsl_supervision_during_coverage_
     signal_mode,
 ):
     bot = Passivbot.__new__(Passivbot)
+    bot.positions = {}
+    bot.open_orders = {}
+    bot.refresh_protective_authoritative_state = AsyncMock(return_value=True)
+    bot.config = {"live": {"risk_input_max_attempts": 10, "hsl_unavailable_grace_seconds": 120.0}}
+    bot._monitor_flush_snapshot = AsyncMock()
+    bot._run_halted_hsl_protection_if_active = AsyncMock(return_value=False)
     bot.balance = 100.0
 
-    async def stop_after_supervision():
+    async def stop_after_supervision(**kwargs):
         bot.stop_signal_received = True
 
     async def fake_refresh_authoritative_state():
@@ -11613,7 +11663,9 @@ async def test_run_execution_loop_keeps_latched_hsl_supervision_during_coverage_
         if signal_mode == "coin"
         else bot._equity_hard_stop_run_coin_red_supervisor
     )
-    selected.assert_awaited_once_with()
+    selected.assert_awaited_once()
+    assert selected.await_args.kwargs["single_pass"]
+    assert callable(selected.await_args.kwargs["after_close"])
     unselected.assert_not_awaited()
     bot._sleep_unless_shutdown.assert_not_awaited()
 
@@ -13523,6 +13575,11 @@ async def test_execution_loop_defers_unavailable_hsl_boundaries_and_keeps_protec
     from live.state_refresh import AuthoritativeSurfaceUnavailable
 
     bot = Passivbot.__new__(Passivbot)
+    bot.positions = {}
+    bot.open_orders = {}
+    bot.refresh_protective_authoritative_state = AsyncMock(return_value=True)
+    bot.config = {"live": {"risk_input_max_attempts": 10, "hsl_unavailable_grace_seconds": 120.0}}
+    bot._monitor_flush_snapshot = AsyncMock()
     bot.balance = 100.0
     bot.stop_signal_received = False
     bot.execution_scheduled = False
@@ -13542,7 +13599,13 @@ async def test_execution_loop_defers_unavailable_hsl_boundaries_and_keeps_protec
     bot._emit_live_cycle_degraded = MagicMock()
     bot.refresh_authoritative_state = AsyncMock(return_value=True)
     bot.prepare_planning_universe = AsyncMock()
-    bot.execute_to_exchange = AsyncMock()
+    bot.execute_to_exchange = AsyncMock(return_value=None)
+    bot._authoritative_execution_barrier_state = lambda: (False, {})
+    bot._staged_execution_ready_state = lambda **kwargs: (True, {})
+    bot._maybe_log_health_summary = lambda: None
+    bot._maybe_log_unstuck_status = lambda: None
+    bot.refresh_market_state_if_needed = AsyncMock(return_value=True)
+    bot.live_value = lambda key: 0.0 if key == "execution_delay_seconds" else False
 
     async def stop(*args, **kwargs):
         bot.stop_signal_received = True
@@ -13550,10 +13613,10 @@ async def test_execution_loop_defers_unavailable_hsl_boundaries_and_keeps_protec
     bot._sleep_unless_shutdown = AsyncMock(side_effect=stop)
     bot._equity_hard_stop_run_coin_red_supervisor = AsyncMock(side_effect=stop)
     assert await bot.run_execution_loop() is None
-    bot.prepare_planning_universe.assert_not_awaited()
-    bot.execute_to_exchange.assert_not_awaited()
+    assert bot.prepare_planning_universe.await_count == int(not latched)
+    assert bot.execute_to_exchange.await_count == int(not latched)
     assert bot._equity_hard_stop_run_coin_red_supervisor.await_count == int(latched)
-    assert bot._sleep_unless_shutdown.await_count == int(not latched)
+    bot._sleep_unless_shutdown.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -13562,7 +13625,10 @@ async def test_execution_loop_defers_unavailable_hsl_boundaries_and_keeps_protec
 async def test_execution_loop_risk_inputs_wait_without_planning_or_restart(monkeypatch, failure, permanent):
     from live import risk_input_recovery as recovery
     bot = Passivbot.__new__(Passivbot)
-    bot.config = {"live": {"risk_input_max_attempts": 3}}
+    bot.positions = {}
+    bot.open_orders = {}
+    bot.refresh_protective_authoritative_state = AsyncMock(return_value=True)
+    bot.config = {"live": {"risk_input_max_attempts": 3, "hsl_signal_mode": "coin", "hsl_unavailable_grace_seconds": 120.0}}
     bot.balance = bot.balance_raw = 100.0
     bot.stop_signal_received = False
     bot.debug_mode = True
@@ -13594,13 +13660,16 @@ async def test_execution_loop_risk_inputs_wait_without_planning_or_restart(monke
 
     async def sleep(seconds, *, stage):
         clock[0] += seconds
-        assert cycle[0] < 6
+        if permanent and failure == "history" and cycle[0] >= 6:
+            bot.stop_signal_received = True
+        else:
+            assert cycle[0] < 6
 
     async def execute(*, prepare_cycle):
         if failure == "late_balance" and (permanent or cycle[0] == 1):
             # Models a refreshed account losing its positive balance during planning.
             recovery.validate_balances(0.0, 0.0)
-        assert cycle[0] >= (2 if failure == "late_balance" else 4)
+        assert cycle[0] >= (1 if failure == "history" else 2 if failure == "late_balance" else 4)
         return {"executed_cycle": cycle[0]}
 
     bot.refresh_authoritative_state = refresh
@@ -13609,6 +13678,13 @@ async def test_execution_loop_risk_inputs_wait_without_planning_or_restart(monke
     bot.prepare_planning_universe = AsyncMock()
     bot.refresh_market_state_if_needed = AsyncMock(return_value=True)
     bot.execute_to_exchange = AsyncMock(side_effect=execute)
+    if failure == "history":
+        result = await asyncio.wait_for(bot.run_execution_loop(), timeout=10)
+        assert result == {"executed_cycle": 1}
+        assert bot._risk_input_recovery is not None
+        bot.execute_to_exchange.assert_awaited_once()
+        bot.restart_bot_on_too_many_errors.assert_not_awaited()
+        return
     if permanent:
         with pytest.raises(FatalBotException, match="3/3"):
             await asyncio.wait_for(bot.run_execution_loop(), timeout=10)
@@ -13626,11 +13702,14 @@ async def test_execution_loop_risk_inputs_wait_without_planning_or_restart(monke
 async def test_start_bot_waits_for_risk_before_ready_and_maintainers(monkeypatch):
     from live import risk_input_recovery as recovery
     bot = Passivbot.__new__(Passivbot)
+    bot.positions = {}
+    bot.open_orders = {}
+    bot.refresh_protective_authoritative_state = AsyncMock(return_value=True)
     bot.runtime_identity = TEST_RUNTIME_IDENTITY
     bot._runtime_manifest_written = True
     bot.exchange, bot.user, bot.quote = "fake", "test", "USDT"
     bot.start_time_ms = 1_000_000
-    bot.config = {"live": {"boot_stagger_seconds": 0, "risk_input_max_attempts": 10}}
+    bot.config = {"live": {"boot_stagger_seconds": 0, "risk_input_max_attempts": 10, "execution_delay_seconds": 5.0, "hsl_unavailable_grace_seconds": 120.0}}
     bot.user_info = {"exchange": "fake"}
     bot.stop_signal_received = False
     bot.debug_mode = True
@@ -13643,6 +13722,7 @@ async def test_start_bot_waits_for_risk_before_ready_and_maintainers(monkeypatch
     bot._equity_hard_stop_enabled = lambda: True
     bot._equity_hard_stop_signal_mode = lambda: "coin"
     bot._equity_hard_stop_start_coin_history_replay = AsyncMock()
+    bot._equity_hard_stop_check = AsyncMock()
     bot.start_data_maintainers = AsyncMock()
     bot.start_background_candle_warmup = AsyncMock()
     bot.run_execution_loop = AsyncMock()
@@ -13670,3 +13750,99 @@ async def test_start_bot_waits_for_risk_before_ready_and_maintainers(monkeypatch
     bot.start_data_maintainers.assert_awaited_once()
     bot._equity_hard_stop_start_coin_history_replay.assert_awaited_once()
     bot.run_execution_loop.assert_not_awaited()  # debug mode
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('source', ['direct', 'hsl_emergency'])
+@pytest.mark.parametrize('failure', ['fetched_value', 'config_value', 'runtime', 'type', 'overflow', 'fatal'])
+async def test_optional_fill_refresh_classifies_only_fetched_value_errors(source, failure):
+    from live.state_refresh import AuthoritativeSurfaceUnavailable
+    from passivbot_exceptions import FatalBotException
+    error = (FatalBotException('producer failure') if failure == 'fatal' else
+             TypeError('programming error') if failure == 'type' else
+             OverflowError('programming error') if failure == 'overflow' else
+             RuntimeError('unexpected failure') if failure == 'runtime' else
+             ValueError('malformed fetched fill'))
+    event = SimpleNamespace(timestamp=1_700_000_000_000, id='fill-1', source_ids=['fill-1'])
+    manager = SimpleNamespace(
+        get_events=lambda: [event], get_history_scope=lambda: 'all',
+        refresh_latest=AsyncMock(side_effect=error),
+    )
+    bot = Passivbot.__new__(Passivbot)
+    bot.stop_signal_received = False
+    bot._live_risk_uses_authoritative_pnl = lambda: True
+    bot.config = {'live': {'fills_recent_overlap_minutes': 10.0, 'pnls_max_lookback_days': 'all'}}
+    if failure == 'config_value':
+        bot.config['live']['pnls_max_lookback_days'] = 'invalid'
+    bot._pnls_manager = _with_fill_coverage_api(manager)
+    bot.init_pnls = AsyncMock()
+    bot.live_value = lambda key: bot.config['live'][key]
+    bot.get_exchange_time = lambda: 1_700_000_060_000
+    bot._monitor_record_event = lambda *args, **kwargs: None
+    bot._monitor_record_error = lambda *args, **kwargs: None
+    bot._emit_fills_refresh_summary_event = lambda **kwargs: None
+    bot._maybe_recover_exchange_time_sync = AsyncMock(return_value=False)
+    bot._shutdown_requested = lambda: False
+    bot.logging_level = 0
+    bot._health_rate_limits = 0
+    classified = failure == 'fetched_value' and source == 'hsl_emergency'
+    with pytest.raises(AuthoritativeSurfaceUnavailable if classified else type(error)) as caught:
+        await bot.update_pnls(source=source)
+    if classified:
+        assert caught.value.__cause__ is error
+    elif failure != 'config_value':
+        assert caught.value is error
+    else:
+        manager.refresh_latest.assert_not_awaited()
+    assert bot._hsl_fill_tail_observation is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('result_kind', ['complete', 'pending', 'failed'])
+@pytest.mark.parametrize('engine', ['legacy', 'revised'])
+async def test_fill_capture_interval_records_io_even_when_pnl_readiness_is_pending(monkeypatch, result_kind, engine):
+    from test_hsl_revised_inputs import event as make_event
+    clock = [1_700_000_060_000]
+    monkeypatch.setattr(passivbot_module, 'utc_ms', lambda: clock[0])
+    event = make_event(timestamp=clock[0]-60_000, id='fill', source_ids=['fill'],
+                       pnl_status='pending' if result_kind == 'pending' else 'complete')
+    bot = Passivbot.__new__(Passivbot)
+    async def remote(**kwargs):
+        assert bot._hsl_revised_fill_capture_interval is None
+        clock[0] += 75
+        if result_kind == 'failed':
+            raise ValueError('synthetic invalid fill payload')
+    manager = SimpleNamespace(get_events=lambda **kwargs: [event], get_history_scope=lambda: 'all',
+                              refresh=AsyncMock(), refresh_latest=AsyncMock(side_effect=remote))
+    bot._pnls_manager = _with_fill_coverage_api(manager)
+    bot.stop_signal_received = False
+    bot.config = {'live': {'fills_recent_overlap_minutes': 10., 'pnls_max_lookback_days': 1., 'hsl_engine': engine}}
+    bot.c_mults = {event.symbol: event.c_mult}
+    bot.live_value = lambda key: bot.config['live'][key]
+    bot.get_exchange_time = lambda: clock[0]
+    bot._live_risk_uses_authoritative_pnl = lambda: True
+    async def local_initialization():
+        clock[0] += 50
+    bot.init_pnls = AsyncMock(side_effect=local_initialization)
+    bot._log_new_fill_events = lambda *a: None
+    bot._monitor_record_event = lambda *a, **kw: None
+    bot._monitor_record_error = lambda *a, **kw: None
+    bot._maybe_recover_exchange_time_sync = AsyncMock(return_value=False)
+    bot.logging_level = 0
+    bot._health_rate_limits = 0
+    bot._hsl_revised_fill_capture_interval = (123, 456)
+    if result_kind == 'failed':
+        with pytest.raises(ValueError, match='synthetic invalid'):
+            await bot.update_pnls()
+        assert bot._hsl_revised_fill_capture_interval is None
+    else:
+        assert await bot.update_pnls() is (result_kind == 'complete')
+        assert bot._hsl_revised_fill_capture_interval == (1_700_000_060_050, 1_700_000_060_125)
+        if engine == 'revised':
+            observed = bot._hsl_revised_fill_observation
+            assert observed.manager is bot._pnls_manager
+            assert observed.interval == bot._hsl_revised_fill_capture_interval
+            assert observed.tape.pairs[0].fills[0].delta == event.qty
+            from dataclasses import replace
+            event = replace(event, qty=999.)
+            assert observed.tape.pairs[0].fills[0].delta != event.qty

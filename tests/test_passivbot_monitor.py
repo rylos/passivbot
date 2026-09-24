@@ -5626,6 +5626,9 @@ async def test_execute_cancellations_parent_emits_ambiguous_confirmation_events(
             assert context["action"] == "cancel"
             assert context["orders"][0] is orders[0]
             assert context["wave"] is self._order_wave_in_progress
+            # Model the connector's actual admission, not batch scheduling.
+            from live.executor import record_cancel_connector_admission
+            record_cancel_connector_admission(self, orders[0])
             return [
                 {
                     "status": "success",
@@ -7686,3 +7689,28 @@ def test_unstuck_monitor_renderer_uses_independent_bounds(pside, strategy_availa
     rendered = "\n".join(_render_unstuck_panel({"unstuck": {"sides": hints}}))
     assert "band=110..120" in rendered
     assert "trigger=122.4" in rendered
+
+
+def test_coin_hsl_snapshot_reports_actual_cooldown_and_input_recovery():
+    from passivbot_monitor import _monitor_hsl_payload
+    from live.risk_input_recovery import RecoveryState
+    bot = SimpleNamespace(
+        _equity_hard_stop_enabled=lambda side: True,
+        _hsl_state=lambda side: {},
+        _equity_hard_stop_signal_mode=lambda: 'coin',
+        _equity_hard_stop_coin={'short': {'A': {
+            'halted': True, 'cooldown_until_ms': 900_000,
+            'last_metrics': {'tier': 'red', 'timestamp_ms': 60_000},
+        }}},
+        _risk_input_recovery=RecoveryState(reason='hsl_episode_evidence_unavailable', attempts=12),
+    )
+    from live.hsl_protection import ProtectionHealth, Scope, Health
+    bot._hsl_protection_health = ProtectionHealth()
+    bot._hsl_protection_health.scopes[Scope('coin', 'short', 'A')] = Health(exit_committed=True)
+    bot.config = {'live': {'hsl_unavailable_grace_seconds': 120.0}}
+    bot.get_exchange_time = lambda: 1_000_000
+    payload = _monitor_hsl_payload(bot, 'short')
+    assert payload['tier'] == 'red' and payload['halted']
+    assert payload['coins']['A']['cooldown_until_ms'] == 900_000
+    assert payload['coins']['A']['last_metrics']['timestamp_ms'] == 60_000
+    assert payload['input_recovery']['protective_exit_pending']

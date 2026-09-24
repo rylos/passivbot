@@ -26,6 +26,8 @@ def _validate_fixed_runtime_overrides(config: dict) -> None:
     overrides = config.get("optimize", {}).get("fixed_runtime_overrides")
     if not isinstance(overrides, dict):
         raise TypeError("config.optimize.fixed_runtime_overrides must be a dict")
+    from .hsl_revised import validate_override_paths
+    validate_override_paths(config, overrides)
     resolved_sources: dict[tuple[str, ...], str] = {}
     for dotted_path in overrides:
         if not isinstance(dotted_path, str):
@@ -77,12 +79,31 @@ def _validate_startup_phase_budgets(live_config: dict) -> None:
                 raise ValueError(f"{value_path} must be >= 0")
 
 
+def validate_limit_order_fill_buffer_pct(value) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or not 0.0 <= value < 1.0
+    ):
+        raise ValueError("backtest.limit_order_fill_buffer_pct must be finite and in [0, 1)")
+    return float(value)
+
+
 def validate_config(
     config: dict, *, raw_optimize=None, verbose: bool = True, tracker=None
 ) -> None:
     from analysis_visibility import validate_visible_metrics_config
     from optimization.config_adapter import validate_optimize_bounds_against_bot_config
 
+    from .hsl_revised import normalize_revised
+    from .schema import get_template_config
+    normalize_revised(config, get_template_config(), verbose=verbose)
+    if not isinstance(config["backtest"]["hsl_detailed_report"], bool):
+        raise ValueError("backtest.hsl_detailed_report must be a boolean")
+    if not isinstance(config.get("backtest", {}).get("offline", False), bool):
+        raise ValueError("backtest.offline must be a boolean")
+    validate_limit_order_fill_buffer_pct(config["backtest"]["limit_order_fill_buffer_pct"])
     require_config_dict(config, "monitor")
     _validate_fixed_runtime_overrides(config)
     strategy_kind = normalize_strategy_kind(config["live"].get("strategy_kind"))
@@ -145,9 +166,10 @@ def validate_config(
                         ),
                     )
     normalize_hsl_signal_mode(config["live"]["hsl_signal_mode"])
-    normalize_hsl_cooldown_position_policy(
-        config["live"]["hsl_position_during_cooldown_policy"]
-    )
+    if config["live"].get("hsl_engine", "legacy") != "revised":
+        normalize_hsl_cooldown_position_policy(
+            config["live"]["hsl_position_during_cooldown_policy"]
+        )
     _validate_startup_phase_budgets(config["live"])
     ticker_strategy = str(
         config["live"].get("market_snapshot_ticker_strategy", "auto")
@@ -262,6 +284,13 @@ def validate_config(
         raise TypeError("config.live.fee_conversion_max_age_ms must be an integer")
     if fee_conversion_max_age_ms < 0:
         raise ValueError("config.live.fee_conversion_max_age_ms must be >= 0")
+    hsl_grace = config["live"]["hsl_unavailable_grace_seconds"]
+    if isinstance(hsl_grace, bool) or not isinstance(hsl_grace, (int, float)):
+        raise TypeError("config.live.hsl_unavailable_grace_seconds must be numeric")
+    if not math.isfinite(hsl_grace) or hsl_grace < 0.0:
+        raise ValueError("config.live.hsl_unavailable_grace_seconds must be finite and >= 0")
+    if hsl_grace >= 2**64 / 1000:
+        raise ValueError("config.live.hsl_unavailable_grace_seconds must fit unsigned milliseconds")
     risk_attempts = config["live"]["risk_input_max_attempts"]
     if isinstance(risk_attempts, bool) or not isinstance(risk_attempts, int):
         raise TypeError("config.live.risk_input_max_attempts must be an integer")

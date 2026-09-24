@@ -2,6 +2,7 @@ from exchanges.ccxt_bot import CCXTBot, format_exchange_config_response
 from live.balance_composition import normalize_okx_balance_composition
 from live.diagnostic_safety import bounded_exception_type
 from passivbot import logging
+from live import hsl_revised_live
 import passivbot_rust as pbr
 
 import asyncio
@@ -28,10 +29,13 @@ class OKXBot(CCXTBot):
         Inspect account configuration to detect portfolio margin (PM) and position mode.
         Startup must know whether OKX is in dual-side or net mode before building orders.
         """
+        self.okx_dual_side = False
         try:
             cfg = await self.cca.private_get_account_config()
-            data = cfg.get("data", [{}])
-            data0 = data[0] if data else {}
+            data = cfg.get("data")
+            if not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], dict):
+                raise ValueError("OKX account configuration requires one explicit mode row")
+            data0 = data[0]
             pos_mode = str(data0.get("posMode", "")).lower()  # "long_short_mode" or "net_mode"
             acct_lv = str(data0.get("acctLv", "")).lower()  # "pm" for portfolio margin accounts
             if pos_mode == "net_mode":
@@ -43,7 +47,9 @@ class OKXBot(CCXTBot):
                 )
             elif pos_mode == "long_short_mode":
                 self.okx_dual_side = True
-            # If unknown, keep default True and let later failures flip it off.
+                self.hedge_mode = True
+            else:
+                raise ValueError("OKX account configuration missing explicit position mode")
             self.okx_pm_account = acct_lv == "pm"
             if self.okx_pm_account:
                 logging.info(
@@ -254,6 +260,7 @@ class OKXBot(CCXTBot):
             fetched[i]["position_side"] = fetched[i]["info"]["posSide"]
         return sorted(fetched, key=lambda x: x["timestamp"])
 
+    @hsl_revised_live.connector_write("cancel")
     async def execute_cancellation(self, order: dict) -> dict:
         """OKX: Cancel order with special handling for 51400 (already cancelled/filled)."""
         try:
@@ -398,6 +405,11 @@ class OKXBot(CCXTBot):
                     logging.debug(f"{log_symbol}: {to_print}")
                 else:
                     logging.info(f"{log_symbol}: {to_print}")
+
+    async def _prepare_protective_account(self):
+        await self._detect_account_config()
+        if not self.okx_dual_side:
+            raise RuntimeError("OKX protective startup requires existing hedge position mode")
 
     async def update_exchange_config(self):
         # Detect current account mode; adjust expectations before attempting changes.

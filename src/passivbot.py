@@ -57,7 +57,7 @@ from fill_events_manager import (
 )
 from live import candle_ws, executor, market_data, planning_gates, reconciler, state_refresh
 from live.diagnostic_safety import bounded_traceback_detail as _bounded_traceback_detail
-from live import risk_input_recovery
+from live import risk_input_recovery, hsl_protection, hsl_revised_live
 from live.order_churn_gate import (
     ORDER_CHURN_GATE_SUPPORTED_EXCHANGES,
     OrderChurnGateState,
@@ -103,7 +103,8 @@ from live.event_bus import (
 import live.event_emitters as live_event_emitters
 from monitor_publisher import MonitorPublisher
 from runtime_identity import build_runtime_identity, write_runtime_manifest
-from live.market_snapshot import MarketSnapshot, MarketSnapshotProvider
+from live.market_snapshot import (MarketSnapshot, MarketSnapshotProvider, MarketSnapshotUnavailable,
+                                  SHARED_QUOTE_CLEANUP_SECONDS, SHARED_QUOTE_CANCEL_GRACE_SECONDS)
 from live.planning_snapshot import PlanningSnapshot
 from passivbot_exceptions import RestartBotException, FatalBotException
 import passivbot_hsl as pb_hsl
@@ -167,6 +168,8 @@ from sortedcontainers import SortedDict
 # The execution loop may wait this long for a websocket-triggered replan after
 # its configured execution delay. Churn-history cadence checks must include
 # this normal quiet-period wait or ordinary live operation breaks provenance.
+# Preserve the existing client-close allowance after bounded shared-quote teardown.
+BOT_CLOSE_TIMEOUT_SECONDS = SHARED_QUOTE_CLEANUP_SECONDS + SHARED_QUOTE_CANCEL_GRACE_SECONDS + 3.0
 EXECUTION_SCHEDULED_WAIT_SECONDS = 30
 
 
@@ -849,6 +852,9 @@ def compute_live_warmup_windows(
     return per_symbol_win, per_symbol_h1_hours, per_symbol_skip_historical
 
 
+_HSL_COOLDOWN_HISTORY_TIMEOUT_SECONDS = 5.0
+
+
 class Passivbot:
     UNSTUCK_ALLOWANCE_MATERIALITY_RELATIVE_DELTA = 0.05
     TRAILING_RATIO_MATERIALITY_ABSOLUTE_DELTA = 0.0005
@@ -1196,6 +1202,9 @@ class Passivbot:
         """Log bounded fallbacks and preserve restart-budget handling."""
         if not failures:
             return
+        for _action, _order, error in failures:
+            if isinstance(error, FatalBotException):
+                raise error
         for action, order, error in failures:
             symbol = order.get("symbol") if isinstance(order, dict) else None
             if symbol:
@@ -1266,6 +1275,8 @@ class Passivbot:
 
     def __init__(self, config: dict):
         """Initialise the bot with configuration, user context, and runtime caches."""
+        from config.hsl_revised import require_runtime_support
+        require_runtime_support(config, supported_modes=("coin", "pside", "unified"))
         self.config = config
         try:
             lvl_raw = get_optional_config_value(config, "logging.level", 1)
@@ -1725,7 +1736,7 @@ class Passivbot:
         self._min_effective_cost_summary_log_interval_ms = 60 * 60 * 1000
         self._orchestrator_prev_close_ema = {}
         self._orchestrator_close_ema_fallback_counts = {}
-        self.hsl = self._parse_hsl_config()
+        self.hsl = {} if hsl_revised_live.selected(self) else self._parse_hsl_config()
         self._runtime_forced_modes = {"long": {}, "short": {}}
         self._equity_hard_stop_supervisor_running = False
         self._equity_hard_stop_status_log_interval_ms = 15 * 60 * 1000
@@ -3451,13 +3462,16 @@ class Passivbot:
                 return
             # Minimal trading-ready warmup first; broad approved-coin catch-up runs in background.
             boot_stage = "warmup_trading_ready_candles"
-            try:
-                await self.warmup_trading_ready_candles()
-            except Exception as e:
-                logging.info(
-                    "[boot] trading-ready candle warmup skipped | error_type=%s",
-                    bounded_exception_type(e),
-                )
+            if hsl_revised_live.selected(self):
+                await hsl_revised_live.owner(self).during_preparation(hsl_revised_live.owner(self).warmup())
+            else:
+                try:
+                    await self.warmup_trading_ready_candles()
+                except Exception as e:
+                    logging.info(
+                        "[boot] trading-ready candle warmup skipped | error_type=%s",
+                        bounded_exception_type(e),
+                    )
             Passivbot._startup_timing_mark(self, "active-candle")
             if self.stop_signal_received:
                 self._monitor_emit_stop(
@@ -3825,10 +3839,72 @@ class Passivbot:
         decision["cold_path_required"] = False
         return decision
 
+    def _validate_protective_position_snapshot(self, positions):
+        """Connector checks on the exact captured positions used by a close wave."""
+        return None
+
+    async def _prepare_protective_account(self):
+        """Read-only connector preflight for restored protective execution.
+
+        Connectors override this where routing or hedge mode must be discovered.
+        Ordinary configuration writes remain behind their existing readiness gate.
+        """
+        return None
+
+    async def _load_market_metadata(self, *, verbose=True):
+        """Initialize symbol and execution metadata without account/history refresh."""
+        # Reuse existing ccxt session when available (ensures shared options such as fetchMarkets types).
+        cc_instance = getattr(self, "cca", None)
+        self.markets_dict = await load_markets(
+            self.exchange, 0, verbose=False, cc=cc_instance, quote=self.quote
+        )
+        if hasattr(self, "refresh_and_log_user_abstraction_state"):
+            await self.refresh_and_log_user_abstraction_state()
+        # ineligible symbols cannot open new positions
+        eligible, _, reasons = filter_markets(
+            self.markets_dict, self.exchange, quote=self.quote, verbose=verbose
+        )
+        self.eligible_symbols = set(eligible)
+        self.ineligible_symbols = reasons
+        # for prettier printing
+        self.max_len_symbol = max([len(s) for s in self.markets_dict])
+        self.sym_padding = max(self.sym_padding, self.max_len_symbol + 1)
+        # await self.init_flags()
+        self.init_coin_overrides()
+        # await self.update_tickers()
+        self.refresh_approved_ignored_coins_lists()
+        self.set_market_specific_settings()
+        self._assert_supported_live_state()
+        # self.set_live_configs()
+        self.set_wallet_exposure_limits()
+
     async def init_markets(self, verbose=True):
         """Load exchange market metadata and refresh approval lists."""
         # called at bot startup and once an hour thereafter
         self.init_markets_last_update_ms = utc_ms()
+        if hsl_revised_live.selected(self) and not getattr(self, "_bot_ready", False):
+            await self._load_market_metadata(verbose=verbose)
+            await self._prepare_protective_account()
+            return await hsl_revised_live.owner(self).during_preparation(
+                self._init_markets_account_config(verbose=verbose, metadata_loaded=True))
+        # A journal commitment needs no new balance or equity reconstruction.
+        # Load only execution metadata before servicing it, even on a cold start.
+        protection_bootstrap = (not hsl_revised_live.selected(self)
+                                and not getattr(self, "_bot_ready", False)
+                                and bool(hsl_protection.manager(self).pending_exits()))
+        if protection_bootstrap:
+            await self._load_market_metadata(verbose=verbose)
+            hsl_protection.reconcile_config(self)
+            if hsl_protection.manager(self).pending_exits():
+                await self._prepare_protective_account()
+                await risk_input_recovery.drain_startup_commitments(self)
+                if self.stop_signal_received:
+                    return
+        return await self._init_markets_account_config(
+            verbose=verbose, metadata_loaded=protection_bootstrap)
+
+    async def _init_markets_account_config(self, *, verbose, metadata_loaded):
+        """Ordinary startup/maintenance work supervised by the selected protection owner."""
         readiness_network_attempt = 0
         while True:
             try:
@@ -3882,30 +3958,8 @@ class Passivbot:
                     5 * _attempt,
                 )
                 await asyncio.sleep(5 * _attempt)
-        # Reuse existing ccxt session when available (ensures shared options such as fetchMarkets types).
-        cc_instance = getattr(self, "cca", None)
-        self.markets_dict = await load_markets(
-            self.exchange, 0, verbose=False, cc=cc_instance, quote=self.quote
-        )
-        if hasattr(self, "refresh_and_log_user_abstraction_state"):
-            await self.refresh_and_log_user_abstraction_state()
-        # ineligible symbols cannot open new positions
-        eligible, _, reasons = filter_markets(
-            self.markets_dict, self.exchange, quote=self.quote, verbose=verbose
-        )
-        self.eligible_symbols = set(eligible)
-        self.ineligible_symbols = reasons
-        # for prettier printing
-        self.max_len_symbol = max([len(s) for s in self.markets_dict])
-        self.sym_padding = max(self.sym_padding, self.max_len_symbol + 1)
-        # await self.init_flags()
-        self.init_coin_overrides()
-        # await self.update_tickers()
-        self.refresh_approved_ignored_coins_lists()
-        self.set_market_specific_settings()
-        self._assert_supported_live_state()
-        # self.set_live_configs()
-        self.set_wallet_exposure_limits()
+        if not metadata_loaded:
+            await self._load_market_metadata(verbose=verbose)
         authoritative_ready = await self.refresh_authoritative_state()
         while (
             authoritative_ready is False
@@ -6195,7 +6249,7 @@ class Passivbot:
         await asyncio.sleep(1.0)
         return True
 
-    async def _run_halted_hsl_protection_if_active(self) -> bool:
+    async def _run_halted_hsl_protection_if_active(self, *, pace: bool = True) -> bool:
         """Protect proven cooldown scopes while unrelated episode evidence is unavailable."""
         coin_mode = self._equity_hard_stop_signal_mode() == "coin"
         scopes = []
@@ -6218,9 +6272,8 @@ class Passivbot:
             ]
         if not scopes:
             return False
-        if not await self.refresh_protective_authoritative_state():
-            return False
-        risk_input_recovery.validate_current_balances(self)
+        if not await self.refresh_protective_authoritative_state(require_balance=False):
+            return not pace  # Recovery must pace an attempted protective owner.
         now_ms = int(self.get_exchange_time())
         panic_needed = False
         cooldown_entry_cancels = []
@@ -6249,15 +6302,16 @@ class Passivbot:
             ledger = getattr(self, "freshness_ledger", None)
             epoch = int(getattr(ledger, "epoch", 0))
             generation = int(getattr(self, "_account_invalidation_generation", 0) or 0)
-            await self.update_pnls(source="hsl_cooldown_protection")
+            await asyncio.wait_for(self.update_pnls(source="hsl_cooldown_protection"),
+                                   timeout=_HSL_COOLDOWN_HISTORY_TIMEOUT_SECONDS if not pace else None)
             pending = getattr(self, "_authoritative_pending_confirmations", {})
             if (
                 int(getattr(ledger, "epoch", 0)) != epoch
                 or int(getattr(self, "_account_invalidation_generation", 0) or 0) != generation
                 or any(int(pending.get(surface, 0)) > epoch for surface in ACCOUNT_SURFACES)
             ):
-                if not await self.refresh_protective_authoritative_state():
-                    return False
+                if not await self.refresh_protective_authoritative_state(require_balance=False):
+                    return not pace
             now_ms = int(self.get_exchange_time())
         for pside, symbol, state in scopes:
             cooldown_until_ms = state["cooldown_until_ms"]
@@ -6273,7 +6327,7 @@ class Passivbot:
                 for candidate in symbols
                 if self._equity_hard_stop_has_open_position_symbol(pside, candidate)
             ]
-            if symbols and coin_mode and not terminal:
+            if symbols and coin_mode and not terminal and policy != "normal":
                 await self._equity_hard_stop_handle_coin_position_during_cooldown(
                     pside, symbol, now_ms
                 )
@@ -6281,7 +6335,7 @@ class Passivbot:
                     state["halted"]
                     and self._runtime_forced_modes.get(pside, {}).get(symbol) == "panic"
                 )
-            elif symbols and not terminal:
+            elif symbols and not terminal and policy != "normal":
                 await self._equity_hard_stop_handle_position_during_cooldown(pside, now_ms)
                 panic_needed |= bool(
                     state["halted"]
@@ -6290,8 +6344,11 @@ class Passivbot:
                         for item in symbols
                     )
                 )
-            # Flat cooldown scopes still prohibit initials. Held normal scopes
-            # may have resumed above; graceful_stop preserves their existing adds.
+            # Normal-policy reopening belongs to the ordinary HSL evaluator,
+            # whose caller supplies a fresh validated balance. This reduced
+            # protection owner never releases a halt through balance-less replay.
+            # Flat cooldown scopes still prohibit initials; held normal and
+            # graceful-stop scopes retain their existing entry policy.
             if not state["halted"]:
                 # Canonical restart may already prove RED in the new episode.
                 # Keep that current risk in this wave even when another scope
@@ -6344,13 +6401,14 @@ class Passivbot:
                 to_cancel.append(order)
                 cancel_keys.add(key)
         await self.execute_order_plan_to_exchange(to_cancel, to_create, configure_creations=False)
-        await self._sleep_unless_shutdown(
-            float(self.live_value("execution_delay_seconds")), stage="hsl_cooldown_protection"
-        )
+        if pace:
+            await self._sleep_unless_shutdown(
+                float(self.live_value("execution_delay_seconds")), stage="hsl_cooldown_protection"
+            )
         return True
 
     async def _run_latched_hsl_supervisor_if_active(
-        self, *, cycle_id: object, loop_timings_ms: dict[str, int]
+        self, *, cycle_id: object, loop_timings_ms: dict[str, int], single_pass: bool = False, after_close=None
     ) -> bool:
         """Run already-latched RED supervision without requiring fill readiness."""
         if not self._equity_hard_stop_enabled():
@@ -6370,13 +6428,15 @@ class Passivbot:
                 return False
             reason_code = "hsl_red_supervisor"
             supervisor = self._equity_hard_stop_run_red_supervisor
-        risk_input_recovery.validate_current_balances(self)
         self._emit_live_cycle_degraded(
             cycle_id=cycle_id,
             reason_code=reason_code,
             data={"timings_ms": dict(loop_timings_ms)},
         )
-        await supervisor()
+        if single_pass:
+            await supervisor(single_pass=True, **({"after_close": after_close} if after_close else {}))
+        else:
+            await supervisor()
         return True
 
     async def run_execution_loop(self):
@@ -6386,6 +6446,12 @@ class Passivbot:
         self._execution_loop_task = current_task
         self._execution_loop_task_is_inline = True
         self._execution_loop_stopped = execution_loop_stopped
+        if hsl_revised_live.selected(self):
+            try:
+                return await hsl_revised_live.owner(self).run()
+            finally:
+                self._execution_loop_task = None
+                execution_loop_stopped.set()
         failed_update_pos_oos_pnls_ohlcvs_count = 0
         authoritative_fill_retry_count = 0
         authoritative_fill_retry_reason = None
@@ -6407,6 +6473,10 @@ class Passivbot:
 
                 self.execution_scheduled = False
                 self.state_change_detected_by_symbol = set()
+                if await risk_input_recovery.protect_before_history_refresh(
+                    self, cycle_id=cycle_id, loop_timings_ms=loop_timings_ms,
+                ):
+                    continue
                 self._set_log_silence_watchdog_context(
                     phase="runtime", stage="refresh_authoritative_state"
                 )
@@ -6445,6 +6515,11 @@ class Passivbot:
                     authoritative_block_reason = getattr(
                         self, "_last_authoritative_block_reason", None
                     )
+                    if risk_input_recovery.defer_authoritative_hsl(self):
+                        await risk_input_recovery.protect_and_wait(
+                            self, cycle_id=cycle_id, loop_timings_ms=loop_timings_ms,
+                        )
+                        continue
                     if authoritative_block_reason in {
                         "pending_pnl",
                         "degraded_pnl",
@@ -6579,31 +6654,14 @@ class Passivbot:
                         data={"timings_ms": dict(loop_timings_ms)},
                     )
                     break
-                try:
-                    risk_ready = await risk_input_recovery.ensure_ready(self)
-                except state_refresh.AuthoritativeSurfaceUnavailable as exc:
-                    if exc.surface != "hsl_episode_boundaries":
-                        raise
-                    self._emit_live_cycle_degraded(
-                        cycle_id=cycle_id,
-                        reason_code="hsl_episode_boundaries_unavailable",
-                        data={"reason": exc.reason},
-                    )
-                    if not (
-                        await self._run_halted_hsl_protection_if_active()
-                        or await self._run_latched_hsl_supervisor_if_active(
-                            cycle_id=cycle_id,
-                            loop_timings_ms=loop_timings_ms,
-                        )
-                    ):
-                        await self._sleep_unless_shutdown(
-                            0.5, stage="hsl_episode_boundaries_retry"
-                        )
-                    continue
+                risk_ready = await risk_input_recovery.ensure_ready(self)
                 if not risk_ready:
                     await risk_input_recovery.protect_and_wait(
                         self, cycle_id=cycle_id, loop_timings_ms=loop_timings_ms,
                     )
+                    continue
+                if (getattr(self, "_risk_input_recovery", None) is not None
+                        and await self._run_halted_hsl_protection_if_active()):
                     continue
                 if await self._run_latched_hsl_supervisor_if_active(
                     cycle_id=cycle_id,
@@ -7480,7 +7538,10 @@ class Passivbot:
             status="started",
             message="shutdown requested; closing background tasks and sessions",
         )
-        maintainer_tasks = []
+        snapshots = getattr(self, "market_snapshot_provider", None)
+        maintainer_tasks = list(snapshots.pending_tasks()) if snapshots is not None else []
+        if snapshots is not None:
+            snapshots.begin_shutdown()
         try:
             self.stop_data_maintainers(verbose=False)
             for task_map_name in ("maintainers", "WS_ohlcvs_1m_tasks"):
@@ -7549,7 +7610,12 @@ class Passivbot:
                     if task is not None and not task.done():
                         task.cancel()
                 try:
-                    await asyncio.wait_for(maintainer_gather, timeout=1.0)
+                    # wait_for() waits for cancellation acknowledgement and can
+                    # overrun forever when connector cleanup suppresses cancellation.
+                    done, _ = await asyncio.wait({maintainer_gather}, timeout=1.0)
+                    if not done:
+                        raise asyncio.TimeoutError()
+                    maintainer_gather.result()
                 except (asyncio.CancelledError, asyncio.TimeoutError):
                     self._emit_shutdown_stage(
                         "maintainers_cancel_timeout",
@@ -7577,6 +7643,14 @@ class Passivbot:
                         "task_count": len(maintainer_tasks),
                         "error_type": error_type,
                     },
+                )
+        if snapshots is not None:
+            try:
+                snapshots.raise_pending_failure()
+            except Exception as exc:
+                logging.error(
+                    "[shutdown] quote cleanup failed | error_type=%s action=continue_cleanup",
+                    bounded_exception_type(exc),
                 )
         execution_loop_stopped = getattr(self, "_execution_loop_stopped", None)
         execution_loop_task = getattr(self, "_execution_loop_task", None)
@@ -7809,9 +7883,9 @@ class Passivbot:
         """Refresh authoritative account state before planning/execution."""
         return await state_refresh.refresh_authoritative_state(self)
 
-    async def refresh_protective_authoritative_state(self) -> bool:
+    async def refresh_protective_authoritative_state(self, *, require_balance: bool = True) -> bool:
         """Refresh only account surfaces needed for protective order execution."""
-        return await state_refresh.refresh_protective_authoritative_state(self)
+        return await state_refresh.refresh_protective_authoritative_state(self, require_balance=require_balance)
 
     async def _refresh_authoritative_state_staged(self) -> bool:
         """Refresh live account state through the staged authoritative cohort."""
@@ -8062,10 +8136,11 @@ class Passivbot:
         )
 
     async def _filter_fresh_market_snapshot_creations(
-        self, orders: list[dict]
+        self, orders: list[dict], *, planning_snapshot=None,
     ) -> list[dict]:
         """Block staged order creations unless live market snapshots are still fresh."""
-        return await market_data.filter_fresh_market_snapshot_creations(self, orders)
+        return await market_data.filter_fresh_market_snapshot_creations(
+            self, orders, **({"planning_snapshot": planning_snapshot} if planning_snapshot is not None else {}))
 
     async def execute_orders_parent(self, orders: [dict]) -> [dict]:
         """Submit a batch of orders after throttling and bookkeeping."""
@@ -8666,6 +8741,9 @@ class Passivbot:
 
     def stop_data_maintainers(self, verbose=True):
         """Cancel background candle/orderbook tasks and log the outcome."""
+        revised_owner = getattr(self, "_hsl_revised_live", None)
+        if revised_owner is not None:
+            revised_owner.cancel_inputs()
         if not hasattr(self, "maintainers"):
             return
         res = {}
@@ -8708,9 +8786,12 @@ class Passivbot:
             getattr(self, "maintainers", None),
             getattr(self, "WS_ohlcvs_1m_tasks", None),
         )
+        snapshots = getattr(self, "market_snapshot_provider", None)
+        tasks: list[asyncio.Task] = list(snapshots.pending_tasks()) if snapshots is not None else []
+        if snapshots is not None:
+            snapshots.begin_shutdown()
         self.stop_data_maintainers(verbose=False)
-        tasks: list[asyncio.Task] = []
-        seen: set[int] = set()
+        seen: set[int] = {id(task) for task in tasks}
         for task_map in task_maps:
             if not isinstance(task_map, dict):
                 continue
@@ -8751,6 +8832,15 @@ class Passivbot:
             except Exception as exc:
                 logging.warning(
                     "[restart] maintainer cleanup failed | error_type=%s action=continue_cleanup",
+                    bounded_exception_type(exc),
+                )
+
+        if snapshots is not None:
+            try:
+                snapshots.raise_pending_failure()
+            except Exception as exc:
+                logging.error(
+                    "[restart] quote cleanup failed | error_type=%s action=continue_cleanup",
                     bounded_exception_type(exc),
                 )
 
@@ -11063,13 +11153,17 @@ class Passivbot:
 
     def get_forced_PB_mode(self, pside, symbol=None):
         """Return an explicitly forced mode for the side or symbol, if configured."""
+        if (not hsl_revised_live.selected(self) and symbol is not None
+                and hsl_protection.holds_after_emergency_exit(self, pside, symbol)):
+            return "panic"
         if self._equity_hard_stop_enabled(pside):
             state = self._hsl_state(pside)
             if (
                 self._equity_hard_stop_runtime_red_latched(pside)
                 and not state["halted"]
             ):
-                return "panic"
+                return ("panic" if (state.get("last_metrics") or {}).get("red_active_now", True)
+                        else "tp_only_with_active_entry_cancellation")
             if state["halted"]:
                 if symbol is None:
                     return "graceful_stop"
@@ -12958,8 +13052,12 @@ class Passivbot:
         """Fetch latest fills while holding the fill-cache single-flight lock."""
         if self.stop_signal_received:
             return False
-        self._last_fill_refresh_block_reason = None
+        from live import position_fill_sync
 
+        if not position_fill_sync.fetch_ready(self):
+            self._last_fill_refresh_block_reason = "position_fill_settling"
+            return False
+        self._last_fill_refresh_block_reason = None
         fill_refresh_attempt_generation = (
             max(
                 int(
@@ -12977,6 +13075,16 @@ class Passivbot:
             fill_refresh_attempt_generation
         )
         refresh_started_ms = utc_ms()
+        ledger = self._ensure_freshness_ledger()
+        position_observation = ledger.surfaces["positions"]
+        hsl_fill_observation = ((ledger.epoch, position_observation.revision)
+                                if position_observation.epoch == ledger.epoch else None)
+        self._hsl_fill_tail_observation = None
+        # Factual acquisition interval for the revised estimator. A local cache
+        # read, skipped fetch or failed attempt cannot renew this observation.
+        # It is not a readiness certificate or a persisted trading decision.
+        self._hsl_revised_fill_capture_interval = None
+        fill_capture_interval = None
         refresh_mode = "unknown"
         overlap_minutes: Optional[float] = None
         before_events_count = 0
@@ -12995,6 +13103,34 @@ class Passivbot:
 
         def flush_enriched_events() -> list[tuple[object, object]]:
             return []
+
+        async def refresh_evidence(operation, *, confirms_tail=True, **kwargs):
+            nonlocal fill_capture_interval
+            started_ms = int(utc_ms())
+            sync = position_fill_sync.state(self)
+            if not sync.fetch_ready():
+                raise position_fill_sync.Settling()
+            receipt = sync.begin_fetch()
+            try:
+                result = await operation(**kwargs)
+                if result is False:
+                    raise position_fill_sync.FetchSkipped()
+                if confirms_tail:
+                    sync.finish_fetch(receipt)
+                fill_capture_interval = (
+                    started_ms if fill_capture_interval is None else fill_capture_interval[0],
+                    int(utc_ms()),
+                )
+                return result
+            except ValueError as exc:
+                if source != "hsl_emergency":
+                    raise
+                # Only fetched-fill parsing belongs to this optional boundary.
+                # Configuration parsing and unrelated orchestration errors remain
+                # outside it and retain their normal propagation policy.
+                raise state_refresh.AuthoritativeSurfaceUnavailable(
+                    "fills", "optional fill refresh returned unusable evidence"
+                ) from exc
 
         await self.init_pnls()  # will do nothing if already initiated
 
@@ -13100,8 +13236,6 @@ class Passivbot:
                 structural_transition = False
                 for current in self._pnls_manager.get_events():
                     current_keys = event_identity_keys(current)
-                    if current_keys & handled_enrichment_keys:
-                        continue
                     previous = existing_by_id.get(
                         str(getattr(current, "id", "") or "")
                     )
@@ -13112,6 +13246,11 @@ class Passivbot:
                                 break
                     if previous is None:
                         continue
+                    # Completed rows can also be corrected under the same
+                    # identity. Their changed structure requires a new account
+                    # observation before optional HSL evidence can consume it.
+                    if event_structure(previous) != event_structure(current):
+                        structural_transition = True
                     previous_needs_enrichment = (
                         fill_event_pnl_pending(previous)
                         or bool(
@@ -13122,10 +13261,12 @@ class Passivbot:
                         not fill_event_pnl_pending(current)
                         and not FillEventsManager.synthetic_pnl_events([current])
                     )
-                    if previous_needs_enrichment and current_is_authoritative:
+                    if (
+                        previous_needs_enrichment
+                        and current_is_authoritative
+                        and not current_keys & handled_enrichment_keys
+                    ):
                         transitions.append((previous, current))
-                        if event_structure(previous) != event_structure(current):
-                            structural_transition = True
                         handled_enrichment_keys.update(current_keys)
                 if transitions:
                     self._log_enriched_fill_events(transitions)
@@ -13184,7 +13325,9 @@ class Passivbot:
             ):
                 degraded_repair_attempted = True
                 try:
-                    await repair_degraded(
+                    await refresh_evidence(
+                        repair_degraded,
+                        confirms_tail=False,
                         start_ms=(
                             None
                             if required_pnl_start_ms is None
@@ -13206,7 +13349,8 @@ class Passivbot:
             if needs_full_refresh:
                 # Full refresh with proper lookback window
                 refresh_mode = "full"
-                await self._pnls_manager.refresh(
+                await refresh_evidence(
+                    self._pnls_manager.refresh,
                     start_ms=None if age_limit is None else int(age_limit),
                     end_ms=None,
                 )
@@ -13233,10 +13377,11 @@ class Passivbot:
                 )
                 if age_limit is not None and callable(refresh_for_lookback):
                     fill_fetch_completed = bool(
-                        await refresh_for_lookback(start_ms=int(age_limit))
+                        await refresh_evidence(refresh_for_lookback, start_ms=int(age_limit))
                     )
                 else:
-                    await self._pnls_manager.refresh(
+                    await refresh_evidence(
+                    self._pnls_manager.refresh,
                         start_ms=None if age_limit is None else int(age_limit),
                         end_ms=None,
                     )
@@ -13263,7 +13408,8 @@ class Passivbot:
                 )
                 if since_ms is not None:
                     refresh_mode = "incremental_bounded"
-                    await self._pnls_manager.refresh(
+                    await refresh_evidence(
+                    self._pnls_manager.refresh,
                         start_ms=max(0, int(since_ms)),
                         end_ms=None,
                     )
@@ -13292,7 +13438,8 @@ class Passivbot:
                     overlap_minutes = max(0.0, overlap_minutes)
                     if recovery_start_ms is not None:
                         refresh_mode = "trailing_confirmation_recovery"
-                        await self._pnls_manager.refresh(
+                        await refresh_evidence(
+                    self._pnls_manager.refresh,
                             start_ms=int(recovery_start_ms),
                             end_ms=None,
                         )
@@ -13303,7 +13450,8 @@ class Passivbot:
                             int(exchange_time_ms)
                             - int(overlap_minutes * 60 * 1000),
                         )
-                        await self._pnls_manager.refresh(
+                        await refresh_evidence(
+                    self._pnls_manager.refresh,
                             start_ms=bounded_start_ms,
                             end_ms=None,
                         )
@@ -13313,13 +13461,22 @@ class Passivbot:
                             mark_covered_start(bounded_start_ms)
                         self._pnls_manager.set_history_scope("window")
                     else:
-                        await self._pnls_manager.refresh_latest(
+                        await refresh_evidence(
+                            self._pnls_manager.refresh_latest,
                             overlap=20,
                             last_refresh_overlap_ms=int(overlap_minutes * 60 * 1000),
                         )
                 fill_fetch_completed = True
             if degraded_repair_attempted:
                 refresh_mode = f"{refresh_mode}_with_degraded_pnl_repair"
+
+            if fill_fetch_completed:
+                self._hsl_revised_fill_capture_interval = fill_capture_interval
+                if hsl_revised_live.selected(self) and fill_capture_interval is not None:
+                    # Capture before yielding again. A later cache mutation or
+                    # replacement cannot inherit this remote observation time.
+                    self._hsl_revised_fill_observation = hsl_revised_live.runtime.observe_fills(
+                        self, fill_capture_interval)
 
             # Find and log new events (those not in cache before refresh)
             all_events = self._pnls_manager.get_events()
@@ -13363,6 +13520,10 @@ class Passivbot:
                 self._log_new_fill_events(new_events)
             if new_events or mixed_source_confirmation_required:
                 request_account_confirmation()
+            # Certify only an ordered post-position tail with no new or
+            # structurally corrected fills awaiting account confirmation.
+            if fill_fetch_completed and not account_confirmation_requested:
+                self._hsl_fill_tail_observation = hsl_fill_observation
             post_now_ms = self.get_exchange_time()
             post_pnl_required, post_pnl_start_ms = (
                 self._required_pnl_history_start_ms(
@@ -13497,6 +13658,14 @@ class Passivbot:
             )
 
             return fills_ready
+
+        except position_fill_sync.FetchSkipped:
+            self._last_fill_refresh_block_reason = "fill_refresh_skipped"
+            return False
+
+        except position_fill_sync.Settling:
+            self._last_fill_refresh_block_reason = "position_fill_settling"
+            return False
 
         except RateLimitExceeded as e:
             flush_enriched_events()
@@ -15894,9 +16063,9 @@ class Passivbot:
             for symbol, by_pside in positions_new.items()
             for pside, position in by_pside.items()
         }
-        previous_position_state = getattr(
-            self, "_trailing_authoritative_position_state", None
-        )
+        from live import position_fill_sync
+
+        previous_position_state = position_fill_sync.state(self).positions
         previous_snapshot_fill_epochs = dict(
             getattr(self, "_trailing_position_snapshot_fill_epochs", {}) or {}
         )
@@ -15904,7 +16073,7 @@ class Passivbot:
         current_fill_epochs = {
             key: str(anchor["epoch"]) for key, anchor in current_fill_anchors.items()
         }
-        self._trailing_authoritative_position_state = position_state
+        position_fill_sync.observe(self, position_state)
         if not hasattr(self, "trailing_prices"):
             self.trailing_prices = {}
         pending = dict(
@@ -16394,12 +16563,15 @@ class Passivbot:
                     targets.setdefault(symbol, set()).add(pside)
         return targets
 
-    async def calc_protective_panic_ideal_orders_orchestrator(self):
+    async def calc_protective_panic_ideal_orders_orchestrator(
+        self, *, target_psides_by_symbol=None, market_snapshots=None, execution_types=None,
+    ):
         """Compute panic-close ideal orders without normal EMA/candle/fill prerequisites."""
         self._current_planning_snapshot = None
-        target_psides_by_symbol = Passivbot._protective_panic_target_psides_by_symbol(
-            self
-        )
+        if not hasattr(self, "_hsl_protective_unavailable_symbols"):
+            self._hsl_protective_unavailable_symbols = set()
+        if target_psides_by_symbol is None:
+            target_psides_by_symbol = Passivbot._protective_panic_target_psides_by_symbol(self)
         self._protective_panic_reconcile_psides_by_symbol = {
             symbol: set(psides) for symbol, psides in target_psides_by_symbol.items()
         }
@@ -16421,13 +16593,77 @@ class Passivbot:
         reconcile_symbols = sorted(target_psides_by_symbol)
         self._protective_panic_reconcile_symbols = reconcile_symbols
         symbols = sorted(position_symbols)
+        self._hsl_protective_unavailable_symbols.difference_update(
+            symbol for symbol in set(reconcile_symbols) - position_symbols
+            if all(float(position.get("size", 0.0)) == 0.0
+                   for position in self.positions.get(symbol, {}).values())
+        )
         if not symbols:
             return {}
 
-        market_snapshots = await self._get_orchestrator_market_snapshots(symbols)
-        planning_snapshot = planning_gates.build_protective_planning_snapshot(
-            self, symbols, market_snapshots
-        )
+        try:
+            if market_snapshots is None:
+                market_snapshots = await self._get_orchestrator_market_snapshots(symbols)
+        except MarketSnapshotUnavailable as exc:
+            # A quote outage in one scope must not strand independently ready
+            # exits. Partition inputs before Rust; never discard part of its output.
+            market_snapshots = {}
+            if len(symbols) > 1:
+                async def fetch_one(symbol):
+                    try:
+                        return await self._get_orchestrator_market_snapshots([symbol])
+                    except MarketSnapshotUnavailable:
+                        return {}
+                # Reserve half the fetch-to-hard-TTL headroom for planning.
+                # A stalled probe must not age out independently ready quotes.
+                timeout = max(0.0, float(self._live_market_snapshot_max_age_ms())
+                              - float(self._live_market_snapshot_fetch_max_age_ms())) / 2000.0
+                tasks = [asyncio.create_task(fetch_one(symbol)) for symbol in symbols]
+                try:
+                    await asyncio.wait(tasks, timeout=timeout)
+                finally:
+                    overdue = {task for task in tasks if not task.done()}
+                    for task in overdue:
+                        task.cancel()
+                    # Drain before planning or propagating structural failures:
+                    # no orphaned reader may later mutate the freshness ledger.
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                for task, result in zip(tasks, results):
+                    if task in overdue and isinstance(result, asyncio.CancelledError):
+                        continue
+                    if isinstance(result, BaseException):
+                        raise result
+                    market_snapshots.update(result)
+            unavailable = set(symbols) - set(market_snapshots)
+            self._hsl_protective_unavailable_symbols.update(unavailable)
+            logging.warning("[risk] protective quote unavailable; retaining scoped orders | symbols=%s",
+                            ",".join(sorted(unavailable)))
+            if not market_snapshots:
+                raise state_refresh.AuthoritativeSurfaceUnavailable(
+                    "protective_planning_inputs", "current protective market unavailable"
+                ) from exc
+            symbols = sorted(set(symbols) - unavailable)
+            target_psides_by_symbol = {symbol: psides for symbol, psides in target_psides_by_symbol.items()
+                                       if symbol not in unavailable}
+            self._protective_panic_reconcile_symbols = sorted(target_psides_by_symbol)
+            self._protective_panic_reconcile_psides_by_symbol = {
+                symbol: set(psides) for symbol, psides in target_psides_by_symbol.items()
+            }
+            # Singleton quote reads replace the ledger signature. Record the exact
+            # combined input cohort, preserving each quote's original fetched time.
+            self._record_market_snapshot_surface(symbols, market_snapshots)
+        try:
+            planning_snapshot = planning_gates.build_protective_planning_snapshot(
+                self, symbols, market_snapshots
+            )
+        except RuntimeError as exc:
+            # Snapshot capture uses RuntimeError for unavailable/stale quotes
+            # and account epochs. Classify before entering Rust, whose output
+            # and validation failures must never become retryable input errors.
+            raise state_refresh.AuthoritativeSurfaceUnavailable(
+                "protective_planning_inputs", "current protective snapshot unavailable"
+            ) from exc
+        self._hsl_protective_unavailable_symbols.difference_update(symbols)
         self._current_planning_snapshot = planning_snapshot
         last_prices = planning_snapshot.last_prices()
         Passivbot._monitor_record_price_ticks(
@@ -16437,113 +16673,26 @@ class Passivbot:
             source="protective_panic_market_snapshot_staged",
         )
 
-        now_ms = int(self.get_exchange_time())
-        global_bp = {
-            "long": self._bot_params_to_rust_dict("long", None),
-            "short": self._bot_params_to_rust_dict("short", None),
-        }
-        effective_hedge_mode = self._config_hedge_mode and self.hedge_mode
-        config = getattr(self, "config", {})
-        strategy_kind = normalize_strategy_kind(config.get("live", {}).get("strategy_kind"))
-        input_dict = {
-            "timestamp_ms": now_ms,
-            "balance": self.get_hysteresis_snapped_balance(),
-            "balance_raw": self.get_raw_balance(),
-            "global": {
-                "filter_by_min_effective_cost": bool(
-                    self.live_value("filter_by_min_effective_cost")
-                ),
-                "market_orders_allowed": bool(self.live_value("market_orders_allowed")),
-                "market_order_near_touch_threshold": float(
-                    self.live_value("market_order_near_touch_threshold")
-                ),
-                "panic_close_market": False,
-                "auto_unstuck_allowed": False,
-                "max_realized_loss_pct": float(Passivbot._live_max_realized_loss_pct(self)),
-                "realized_pnl_cumsum_max": 0.0,
-                "realized_pnl_cumsum_last": 0.0,
-                "sort_global": True,
-                "global_bot_params": global_bp,
-                "hedge_mode": effective_hedge_mode,
-                "strategy_kind": strategy_kind,
-            },
-            "symbols": [],
-        }
-        symbol_to_idx: dict[str, int] = {s: i for i, s in enumerate(symbols)}
-        idx_to_symbol: dict[int, str] = {i: s for s, i in symbol_to_idx.items()}
-        input_dict.update(
-            Passivbot._build_orchestrator_runtime_hints(self, symbol_to_idx)
-        )
-
-        if not hasattr(self, "effective_min_cost") or self.effective_min_cost is None:
-            self.effective_min_cost = {}
-        for symbol in symbols:
-            idx = symbol_to_idx[symbol]
-            snap = market_snapshots.get(symbol)
-            mprice = float(last_prices.get(symbol, 0.0))
-            if not math.isfinite(mprice) or mprice <= 0.0:
-                raise RuntimeError(f"invalid market price for {symbol}: {mprice}")
-            bid = float(snap.bid) if snap is not None and snap.is_valid() else mprice
-            ask = float(snap.ask) if snap is not None and snap.is_valid() else mprice
-            active = bool(
-                (getattr(self, "markets_dict", {}) or {}).get(symbol, {}).get(
-                    "active", True
-                )
-            )
-            effective_min_cost = float(self.effective_min_cost.get(symbol, 0.0) or 0.0)
-            if effective_min_cost <= 0.0:
-                effective_min_cost = self._calc_effective_min_cost_at_price(
-                    symbol, mprice
-                )
-
-            def side_input(pside: str) -> dict:
-                pos = self.positions.get(symbol, {}).get(
-                    pside, {"size": 0.0, "price": 0.0}
-                )
-                trailing = _trailing_bundle_default_dict()
-                return {
-                    "mode": (
-                        "panic"
-                        if pside in target_psides_by_symbol.get(symbol, set())
-                        else "manual"
+        idx_to_symbol = dict(enumerate(symbols))
+        inputs = []
+        for idx, symbol in idx_to_symbol.items():
+            snap = market_snapshots[symbol]
+            for pside in sorted(target_psides_by_symbol[symbol]):
+                enabled = Passivbot._equity_hard_stop_enabled(self, pside, symbol=symbol)
+                inputs.append({
+                    "symbol_idx": idx,
+                    "pside": pside,
+                    "position_size": float(self.positions[symbol][pside]["size"]),
+                    "order_book": {"bid": float(snap.bid), "ask": float(snap.ask)},
+                    "price_step": float(self.price_steps[symbol]),
+                    "execution_type": (
+                        execution_types[symbol, pside] if execution_types is not None else
+                        (Passivbot._equity_hard_stop_panic_close_order_type(self, pside, symbol=symbol)
+                         if enabled else "limit")
                     ),
-                    "position": {
-                        "size": float(pos["size"]),
-                        "price": float(pos["price"]),
-                    },
-                    "trailing": {
-                        "min_since_open": float(trailing.get("min_since_open", 0.0)),
-                        "max_since_min": float(trailing.get("max_since_min", 0.0)),
-                        "max_since_open": float(trailing.get("max_since_open", 0.0)),
-                        "min_since_max": float(trailing.get("min_since_max", 0.0)),
-                    },
-                    "last_increase_fill_timestamp_ms": None,
-                    "bot_params": self._bot_params_to_rust_dict(pside, symbol),
-                    "strategy_params": self._strategy_params_to_rust_dict(pside, symbol),
-                }
-
-            input_dict["symbols"].append(
-                {
-                    "symbol_idx": int(idx),
-                    "order_book": {"bid": bid, "ask": ask},
-                    "exchange": Passivbot._orchestrator_exchange_params(self, symbol),
-                    "tradable": active,
-                    "next_candle": None,
-                    "effective_min_cost": float(effective_min_cost),
-                    "emas": {
-                        "m1": {"close": [], "log_range": [], "volume": []},
-                        "h1": {"close": [], "log_range": [], "volume": []},
-                    },
-                    "long": side_input("long"),
-                    "short": side_input("short"),
-                }
-            )
-
-        risk_input_recovery.validate_balances(input_dict["balance_raw"], input_dict["balance"])
-        out, orders = reconciler.parse_and_validate_rust_orchestrator_output(
-            pbr.compute_ideal_orders_json(json.dumps(input_dict)),
-            idx_to_symbol,
-            input_dict,
+                })
+        orders = reconciler.parse_and_validate_protective_closes(
+            pbr.compute_protective_closes_json(json.dumps(inputs)), inputs,
         )
         ideal_orders: dict[str, list] = {}
         for order in orders:
@@ -16765,6 +16914,13 @@ class Passivbot:
                     )
             else:
                 out[out_key] = float(val or 0.0)
+        if hsl_revised_live.selected(self):
+            policy = hsl_revised_live.policy(self, pside, symbol)
+            # The order kernel consumes only execution policy; the shared
+            # revised evaluator owns the signal and controller.
+            out.update(hsl_enabled=policy["enabled"],
+                       hsl_panic_close_order_type=policy["panic_close_order_type"])
+            return out
         hsl_cfg = (
             self._equity_hard_stop_config(pside, symbol)
             if symbol is not None and hasattr(self, "_equity_hard_stop_config")
@@ -17090,13 +17246,17 @@ class Passivbot:
         return set(due)
 
     def _orchestrator_mode_override(self, pside: str, symbol: str) -> Optional[str]:
+        if (not hsl_revised_live.selected(self)
+                and hsl_protection.holds_after_emergency_exit(self, pside, symbol)):
+            return "panic"
         if self._equity_hard_stop_enabled(pside):
             state = self._hsl_state(pside)
             if (
                 self._equity_hard_stop_runtime_red_latched(pside)
                 and not state["halted"]
             ):
-                return "panic"
+                return ("panic" if (state.get("last_metrics") or {}).get("red_active_now", True)
+                        else "tp_only_with_active_entry_cancellation")
             if state["halted"]:
                 return self._equity_hard_stop_halted_mode(pside, symbol)
             if self._equity_hard_stop_runtime_tier(pside) == "orange":
@@ -19631,6 +19791,8 @@ class Passivbot:
             )
         )
         if not symbols:
+            if hsl_revised_live.selected(self):
+                self._hsl_revised_planning_wave = hsl_revised_live.owner(self).capture()
             return {}
         mode_overrides = self._build_orchestrator_mode_overrides(symbols)
         exchange_unavailable_symbols = (
@@ -19684,6 +19846,17 @@ class Passivbot:
             getattr(self, "_orchestrator_trailing_unavailable_symbols", set())
         )
         market_snapshots = await self._get_orchestrator_market_snapshots(symbols)
+        if hsl_revised_live.selected(self):
+            revised = hsl_revised_live.owner(self)
+            wave = revised.capture(market_snapshots)
+            self._hsl_revised_planning_wave = wave
+            for side in ("long", "short"):
+                for symbol in symbols:
+                    action, _ = wave.permission(symbol, side)
+                    if action in {"panic", "halted"}:
+                        mode_overrides[side][symbol] = "panic"
+                    elif action == "unavailable":
+                        mode_overrides[side][symbol] = "manual"
         self._assert_staged_planner_preconditions(
             include_market_snapshot=True,
             context="rust order calculation",
@@ -20249,9 +20422,17 @@ class Passivbot:
         """Determine which existing orders to cancel and which new ones to place."""
         return await reconciler.calc_orders_to_cancel_and_create(self)
 
-    async def calc_protective_panic_orders_to_cancel_and_create(self):
+    async def calc_protective_panic_orders_to_cancel_and_create(
+        self, *, target_psides_by_symbol=None, market_snapshots=None, execution_types=None,
+    ):
         """Determine protective cancels/reduce-only creates for RED panic supervision."""
-        ideal_orders = await self.calc_protective_panic_ideal_orders_orchestrator()
+        ideal_orders = await self.calc_protective_panic_ideal_orders_orchestrator(
+            **({"target_psides_by_symbol": target_psides_by_symbol}
+               if target_psides_by_symbol is not None else {}),
+            **({"market_snapshots": market_snapshots, "execution_types": execution_types}
+               if market_snapshots is not None else {}),
+        )
+        protective_snapshot = getattr(self, "_current_planning_snapshot", None)
         actual_symbols = sorted(
             set(getattr(self, "_protective_panic_reconcile_symbols", []) or [])
             | set(ideal_orders)
@@ -20259,7 +20440,7 @@ class Passivbot:
         actual_psides_by_symbol = getattr(
             self, "_protective_panic_reconcile_psides_by_symbol", None
         )
-        return await reconciler.calc_orders_to_cancel_and_create_from_ideal(
+        plan = await reconciler.calc_orders_to_cancel_and_create_from_ideal(
             self,
             ideal_orders,
             actual_symbols=actual_symbols,
@@ -20267,6 +20448,8 @@ class Passivbot:
             apply_mode_filters=False,
             collect_fresh_entry_eligibility=False,
         )
+        self._current_planning_snapshot = protective_snapshot
+        return plan
 
     def _snapshot_actual_orders(
         self,
@@ -21572,7 +21755,7 @@ class Passivbot:
         """Spawn background tasks responsible for market metadata and order watching."""
         hsl_replay_task = getattr(self, "_equity_hard_stop_coin_replay_task", None)
         if hasattr(self, "maintainers"):
-            if self.maintainers.get("hsl_coin_replay") is hsl_replay_task:
+            if hsl_replay_task is not None and self.maintainers.get("hsl_coin_replay") is hsl_replay_task:
                 self.maintainers.pop("hsl_coin_replay")
             self.stop_data_maintainers()
         maintainer_names = ["maintain_hourly_cycle"]
@@ -21763,12 +21946,72 @@ class Passivbot:
     # Legacy file lock helpers removed
 
     async def close(self):
-        """Stop background tasks and close exchange clients."""
+        """Finish bounded quote cleanup and attempt all clients, preserving the first failure."""
         self.stop_data_maintainers()
-        await self.cca.close()
-        if self.ccp is not None:
-            await self.ccp.close()
-        self._close_live_event_pipeline(timeout=2.0)
+        first_error = None
+
+        def record_failure(exc):
+            nonlocal first_error
+            if first_error is None:
+                first_error = exc
+            elif exc is not first_error:
+                logging.warning(
+                    "[shutdown] additional close failure | error_type=%s action=preserve_first_failure",
+                    bounded_exception_type(exc),
+                )
+
+        snapshots = getattr(self, "market_snapshot_provider", None)
+        if snapshots is not None:
+            try:
+                snapshots.begin_shutdown()
+                # One bounded owner keeps its original deadline through repeated caller cancellation.
+                quote_cleanup = asyncio.create_task(snapshots.wait_pending())
+                while not quote_cleanup.done():
+                    try:
+                        await asyncio.wait({quote_cleanup})
+                    except (Exception, asyncio.CancelledError) as exc:
+                        record_failure(exc)
+                # Also retrieve an outcome completed concurrently with caller cancellation.
+                quote_cleanup.result()
+            except (Exception, asyncio.CancelledError) as exc:
+                record_failure(exc)
+        # Reserve two seconds for the synchronous pipeline flush. Run independent
+        # client closes together so one hung client cannot starve the other.
+        client_tasks = [asyncio.create_task(client.close())
+                        for client in (self.cca, self.ccp) if client is not None]
+        deadline = asyncio.get_running_loop().time() + 1.0
+        pending = set(client_tasks)
+        while pending and asyncio.get_running_loop().time() < deadline:
+            try:
+                _, pending = await asyncio.wait(
+                    pending, timeout=max(0.0, deadline - asyncio.get_running_loop().time())
+                )
+            except asyncio.CancelledError as exc:
+                record_failure(exc)
+        for task in client_tasks:
+            if task.done():
+                try:
+                    task.result()
+                except (Exception, asyncio.CancelledError) as exc:
+                    record_failure(exc)
+            else:
+                record_failure(asyncio.TimeoutError("client close deadline expired"))
+                task.cancel()
+                def finished(done):
+                    if not done.cancelled():
+                        failure = done.exception()
+                        if failure is not None:
+                            logging.warning(
+                                "[shutdown] abandoned client close failed | error_type=%s action=report_cleanup_failure",
+                                bounded_exception_type(failure),
+                            )
+                task.add_done_callback(finished)
+        try:
+            self._close_live_event_pipeline(timeout=2.0)
+        except (Exception, asyncio.CancelledError) as exc:
+            record_failure(exc)
+        if first_error is not None:
+            raise first_error
 
     def add_to_coins_lists(self, content, k_coins, log_psides=None):
         """Update approved/ignored coin sets from configuration content."""
@@ -22064,6 +22307,7 @@ class Passivbot:
         """
         return {}
 
+    @hsl_revised_live.connector_write("create")
     async def execute_order(self, order: dict) -> dict | executor.DeferredOrderCreation:
         """Place a single order via the exchange client."""
         params = {
@@ -22096,6 +22340,7 @@ class Passivbot:
         """Execute a batch of order creations using the helper pipeline."""
         return await self.execute_multiple(orders, "execute_order")
 
+    @hsl_revised_live.connector_write("cancel")
     async def execute_cancellation(self, order: dict) -> dict:
         """Cancel a single order via the exchange client."""
         executed = None
@@ -22206,11 +22451,10 @@ def setup_bot(config):
 async def shutdown_bot(bot):
     """Stop background tasks and close the exchange clients gracefully."""
     print("Shutting down bot...")
-    bot.stop_data_maintainers()
     try:
-        await asyncio.wait_for(bot.close(), timeout=3.0)
+        await asyncio.wait_for(bot.close(), timeout=BOT_CLOSE_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
-        print("Shutdown timed out after 3 seconds. Forcing exit.")
+        print(f"Shutdown timed out after {BOT_CLOSE_TIMEOUT_SECONDS:g} seconds. Forcing exit.")
     except Exception as e:
         print(f"Error during shutdown ({bounded_exception_type(e)}).")
 
@@ -22324,6 +22568,8 @@ async def _run_live(startup_context: dict):
         target="live",
         raw_snapshot=raw_snapshot,
     )
+    from config.hsl_revised import require_runtime_support
+    require_runtime_support(config, supported_modes=("coin", "pside", "unified"))
     config_logging_value = get_optional_config_value(config, "logging.level", None)
     effective_log_level = resolve_log_level(
         cli_log_level, config_logging_value, fallback=1

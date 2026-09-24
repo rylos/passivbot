@@ -2,7 +2,11 @@
 
 ## Contract
 
-1. Prefer existing local data before remote calls.
+1. Prefer existing local data before remote calls. Backtest/optimization `backtest.offline`
+   forbids every remote preparation path, including metadata and listing refreshes. Accept
+   valid stale metadata, preserve confirmed exchange-side coverage boundaries, and fail on
+   missing required local inputs. The task-local policy must never enable offline behavior
+   in live callers. Verified prepared datasets retain input provenance.
 2. For backtest preparation, use v2 OHLCV chunks first, legacy raw shards second, and targeted remote fetches last.
    For missing Binance futures 1m data in the current v2 path, remote source priority is Binance
    Vision monthly archives, Binance Vision daily archives, then CCXT. More than seven days of
@@ -302,7 +306,14 @@
     proof does not wait for the ordinary retry count to become persistent. Only when one successful
     raw payload returns both boundaries while omitting the intervening timestamps may that exact
     range be promoted to verified `no_trades` continuity. Empty, one-sided, terminal, or rejected
-    payloads do not prove the gap and start a separate seven-day contextual-proof cooldown. Ordinary
+    payloads do not prove the gap and start a separate five-minute contextual-proof cooldown. A
+    contiguous missing span may be covered by multiple adjacent retry records; verification requires
+    complete metadata coverage and every unverified fragment's contextual retry to be due. Verified
+    no-trade fragments may share the proof window, but terminal and uncovered fragments cannot.
+    Ordinary historical repair recognizes the union of deferred records without merging their
+    independent retry clocks or refetching the surrounding cached history. Coverage uses one sorted
+    metadata snapshot per check. Contextual proof is scheduled only when both real bounds and the
+    overlap fit one request page; wider gaps remain unavailable under ordinary retry policy. Ordinary
     missing-range retries retain their existing independent schedule.
 15. Urgent active-candle refresh records and reports incomplete symbol coverage but does not itself
     gate the whole planner cycle. Canonical EMA consumers determine symbol/order-class readiness;
@@ -360,3 +371,41 @@ Cache paths use `to_standard_exchange_name()` rather than raw CCXT identifiers s
 - `src/hlcv_preparation.py`
 - `src/tools/verify_hlcvs_data.py`
 - `exchange_integrations.md`
+
+## Source-resolution reads for revised HSL
+
+`get_candles(standardize=False)` retains normal source acquisition and caching but
+returns sparse source rows without the 1m gap-standardization or outside-range
+price seed. The 1m returned array is detached from the mutable cache. Native coarse
+cache reads remain native even with no exchange object; they must not relabel 1m
+rows as 5m/15m/1h. Existing callers retain standardization by default.
+
+The staged `live.hsl_revised_candles.CandleSourceReader.acquire` reader requests supported
+1m/5m/15m/1h sources over the full estimator window. A real 1m close at the inclusive
+left edge belongs to the window although its source bucket opened one minute earlier.
+Rust rejects earlier closes and coarse buckets straddling the boundary, selects the
+finest available source, and applies estimator-local gap carrying. Manager-persisted
+verified no-trade observations remain usable under the existing cache contract.
+
+Each source read has a caller-supplied deadline which does not await resistant
+cancellation. Expected exchange/transport/read failures retain type-only diagnostics
+and attempt a bounded cache-only read; independent resolutions survive. The caller
+reuses one `CandleSourceReader` per manager across scopes and cycles. It retains
+unfinished reads, refuses another read of the same symbol/timeframe/source kind,
+and caps total pending reads (eight by default, configurable on construction).
+A timed-out coroutine's return value is never consumed or allowed to extend its
+read deadline. Cache fallback is a separate fresh observation: it may include
+canonical cache updates completed meanwhile, including an update from the timed-out
+fetch. Rows are copied and stamped at that actual cache capture time. There is no
+shared atomic cutoff across resolutions; Rust rejects sources unavailable at the
+chosen evaluation time, and the eventual runtime caller owns final snapshot
+revalidation. Freezing a pre-fetch cache is not required. Pending-read count is
+diagnostic; it never supplies a trading decision.
+
+Invalid producer shapes, programming errors and cancellation propagate. Acquisition
+wrappers are cancelled and awaited; underlying cancellation-resistant reads remain
+tracked within the fixed capacity until completion. Late exceptions are consumed;
+unexpected late programming failures are raised on the next acquisition instead of
+silently hidden. No source projection is written into factual caches. The caller owns
+background scheduling and coherent current-state capture; this staged reader alone
+does not activate revised trading.

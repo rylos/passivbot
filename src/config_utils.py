@@ -31,6 +31,7 @@ from config.coerce import (
     normalize_hsl_restart_after_red_policy,
     normalize_hsl_signal_mode,
 )
+from config.gpu import parse_screening_scenarios
 from config.hydrate import (
     PARTIALLY_OPEN_CONFIG_PATHS,
     apply_non_live_adjustments as staged_apply_non_live_adjustments,
@@ -225,6 +226,12 @@ HSL_PSIDE_KEYS = (
     "hsl_tier_ratios",
 )
 FIELD_RUNTIME_RULES = {
+    "backtest.offline": {
+        "owner": "backtest",
+        "consumed_by": {"backtest", "optimize"},
+        "cli_exposed_on": {"backtest", "optimize"},
+        "help_group": {"backtest": "Backtest Runtime", "optimize": "Backtest Runtime"},
+    },
     "live.approved_coins": {
         "owner": "live",
         "consumed_by": {"live", "backtest", "optimize"},
@@ -373,6 +380,16 @@ FIELD_RUNTIME_RULES = {
         "cli_exposed_on": {"live"},
         "help_group": {
             "live": "Behavior",
+        },
+    },
+    "live.hsl_engine": {
+        "owner": "live",
+        "consumed_by": {"live", "backtest", "optimize"},
+        "cli_exposed_on": {"live", "backtest", "optimize"},
+        "help_group": {
+            "live": "Behavior",
+            "backtest": "Backtest Runtime",
+            "optimize": "Backtest Runtime",
         },
     },
     "live.hsl_signal_mode": {
@@ -815,8 +832,33 @@ def clean_config(config: dict) -> dict:
     Return a sanitized config aligned with the template structure, stripped of helper keys,
     with dictionaries sorted recursively.
     """
-    template = get_template_config()
-    cleaned = _clean_with_template(template, config or {})
+    from config.hsl_revised import FIELDS, engine, normalization_template
+    from config.migrations.gpu_screening import migrate_gpu_screening
+
+    source = config or {}
+    optimize_section = source.get("optimize")
+    legacy_gpu = optimize_section.get("gpu") if isinstance(optimize_section, dict) else None
+    if isinstance(legacy_gpu, dict) and "successive_halving" in legacy_gpu:
+        source = deepcopy(source)
+        migrate_gpu_screening(source)
+    template = normalization_template(get_template_config(), source)
+    if engine(source) == "revised" and "hsl" in source.get("bot", {}):
+        portfolio = source["bot"]["hsl"]
+        if not isinstance(portfolio, dict):
+            raise TypeError("bot.hsl must be a mapping")
+        # Preserve only explicitly supplied portfolio fields. Cleaning/export is
+        # not authorization to hydrate a missing unified policy or restart choice.
+        template["bot"]["hsl"] = {key: None for key in FIELDS if key in portfolio}
+    if engine(source) == "revised" and "hsl" in source.get("optimize", {}).get("bounds", {}):
+        from config.optimize_bounds import SHARED_OPTIMIZE_LOCAL_TO_FLAT_KEY
+
+        bounds = source["optimize"]["bounds"]["hsl"]
+        if not isinstance(bounds, dict):
+            raise TypeError("optimize.bounds.hsl must be a mapping")
+        template["optimize"]["bounds"]["hsl"] = {
+            key: None for key in SHARED_OPTIMIZE_LOCAL_TO_FLAT_KEY["hsl"] if key in bounds
+        }
+    cleaned = _clean_with_template(template, source)
     prune_inactive_strategy_subtrees(cleaned)
     prune_inactive_optimize_strategy_bounds(cleaned)
     return sort_dict_keys(cleaned)
@@ -1251,6 +1293,20 @@ RESERVED_CLI_ARGS = {
             "values persisted in config files are ignored."
         ),
     },
+    "live.hsl_engine": {
+        "visible": ["--hsl-engine"],
+        "hidden": ["--live.hsl_engine", "--live_hsl_engine"],
+        "type": str,
+        "metavar": "ENGINE",
+        "choices": ("legacy", "revised"),
+        "commands": {"live", "backtest", "optimize"},
+        "group": {
+            "live": "Behavior",
+            "backtest": "Backtest Runtime",
+            "optimize": "Backtest Runtime",
+        },
+        "help": "HSL implementation: legacy or revised. Defaults to the config value (legacy when omitted).",
+    },
     "live.hsl_signal_mode": {
         "visible": ["--hsl-signal-mode"],
         "hidden": ["--live.hsl_signal_mode", "--live_hsl_signal_mode"],
@@ -1337,6 +1393,14 @@ RESERVED_CLI_ARGS = {
             "optimize": "Date Range",
         },
         "help": "Backtest candle interval in minutes.",
+    },
+    "backtest.offline": {
+        "visible": ["--offline"],
+        "hidden": ["--backtest.offline", "--backtest_offline"],
+        "type": str2bool,
+        "metavar": "BOOL",
+        "commands": {"backtest", "optimize"},
+        "help": "Use local simulation data only; never refresh metadata or download candles.",
     },
     "backtest.hlcvs_data_dir": {
         "visible": ["--hlcvs-data-dir"],
@@ -1673,6 +1737,10 @@ CLI_HELP_OVERRIDES = {
     "backtest.liquidation_threshold": (
         "Early-stop equity floor as a fraction of starting balance. Must "
         "satisfy 0 <= x < 1; 0.05 stops once equity is <= 5 percent of start."
+    ),
+    "backtest.limit_order_fill_buffer_pct": (
+        "Backtest-only required crossing beyond a limit price as part-per-one "
+        "(0.0001 = 0.01%%). Strict crossing; fills retain the limit price. Default 0.0."
     ),
     "backtest.market_order_slippage_pct": (
         "Backtest-only simulated market-order slippage as part-per-one. Applies "
@@ -2173,6 +2241,9 @@ def add_arguments_recursively(
             elif "scoring" in full_name:
                 type_ = comma_separated_values
                 appendix = "Examples: adg,sharpe_ratio; mdg,sortino_ratio; ..."
+            elif full_name == "optimize.gpu.screening.scenarios":
+                type_ = parse_screening_scenarios
+                appendix = "Comma-separated labels or JSON array; [] disables screening."
             elif isinstance(value, list) and "bounds" not in full_name:
                 type_ = comma_separated_values
             elif value is None:
@@ -2300,6 +2371,10 @@ def update_config_with_args(
 ):
     transform_root = config
     config = effective_config_payload(config)
+    from config.hsl_revised import validate_override_paths
+    supplied = {key: value for key, value in vars(args).items()
+                if value is not None and (key in allowed_keys if allowed_keys is not None else "." in key)}
+    validate_override_paths(config, supplied, allow_engine=True)
     changed_keys = []
     diffs = []
     for key, value in vars(args).items():

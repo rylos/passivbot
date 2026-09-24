@@ -10,7 +10,8 @@ from typing import Iterable
 from config.access import get_optional_live_value
 from live.diagnostic_safety import bounded_exception_type
 from live.event_bus import EventTypes, ReasonCodes
-from live.market_snapshot import MarketSnapshot
+from live.market_snapshot import MarketSnapshot, MarketSnapshotUnavailable
+from ccxt.base.errors import NetworkError
 from utils import utc_ms
 
 
@@ -146,11 +147,15 @@ def market_snapshot_ticker_strategy(bot) -> str:
         return "symbols"
     if str(getattr(bot, "exchange", "") or "").lower() == "kucoin":
         return "symbols"
+    if str(getattr(bot, "exchange", "") or "").lower() == "bitunix":
+        # Its bulk websocket reader waits for every active market, including
+        # unrelated quiet markets. Refresh only the quotes this action needs.
+        return "symbols"
     return "bulk"
 
 
 async def filter_fresh_market_snapshot_creations(
-    bot, orders: list[dict]
+    bot, orders: list[dict], *, planning_snapshot=None,
 ) -> list[dict]:
     """Block staged order creations unless live market snapshots are still fresh."""
     if not orders:
@@ -158,9 +163,13 @@ async def filter_fresh_market_snapshot_creations(
     symbols = sorted({str(order["symbol"]) for order in orders if order.get("symbol")})
     if not symbols:
         return orders
-    planning_snapshot_invalid = bot._current_planning_snapshot_invalid_for_creations(
-        symbols
-    )
+    if planning_snapshot is None:
+        planning_snapshot_invalid = bot._current_planning_snapshot_invalid_for_creations(symbols)
+    else:
+        from live import planning_gates
+        planning_snapshot_invalid = planning_gates.current_planning_snapshot_invalid_for_creations(
+            bot, symbols, snapshot=planning_snapshot)
+
     if planning_snapshot_invalid:
         refreshable_reasons = {
             ("market_snapshot", "snapshot_too_old"),
@@ -246,6 +255,9 @@ async def filter_fresh_market_snapshot_creations(
             bot, orders, "pre_create_market_snapshot_unavailable"
         )
         return []
+    from live import hsl_revised_live
+    if hsl_revised_live.selected(bot):
+        hsl_revised_live.owner(bot).quotes.update(snapshots)
     orders = _filter_limit_order_creations_by_market_distance(bot, orders, snapshots)
     return orders
 
@@ -444,7 +456,7 @@ async def get_live_market_snapshots(
             snapshots = await provider.get_snapshots(
                 ordered_symbols, max_age_ms=max_age_ms
             )
-        except RuntimeError as exc:
+        except MarketSnapshotUnavailable as exc:
             if str(getattr(bot, "exchange", "") or "").lower() != "hyperliquid":
                 raise
             logging.debug(
@@ -486,7 +498,7 @@ async def get_live_market_snapshots(
                 )
                 if snap.is_valid():
                     snapshots[sym] = snap
-        except Exception as exc:
+        except (MarketSnapshotUnavailable, NetworkError, OSError) as exc:
             logging.debug(
                 "[market] hyperliquid allMids snapshot failed | "
                 "context=%s symbols=%s error_type=%s action=try_symbol_tickers",
@@ -525,7 +537,7 @@ async def get_live_market_snapshots(
                     )
                     if snap.is_valid():
                         snapshots[symbol] = snap
-            except Exception as exc:
+            except (MarketSnapshotUnavailable, NetworkError, OSError) as exc:
                 logging.debug(
                     "[market] hyperliquid symbol ticker snapshot failed | "
                     "context=%s symbols=%s error_type=%s action=fail_if_incomplete",
@@ -565,7 +577,7 @@ async def get_live_market_snapshots(
         if symbol not in snapshots or not snapshots[symbol].is_valid()
     ]
     if missing:
-        raise RuntimeError(
+        raise MarketSnapshotUnavailable(
             f"missing live market snapshots for {context}: {bot._log_symbols(missing, limit=12)}"
         )
     return {symbol: snapshots[symbol] for symbol in ordered_symbols}
@@ -586,7 +598,7 @@ async def get_orchestrator_market_snapshots(
         )
         try:
             snapshots = await provider.get_snapshots(symbols, max_age_ms=fetch_ttl_ms)
-        except RuntimeError as exc:
+        except MarketSnapshotUnavailable as exc:
             if str(getattr(bot, "exchange", "") or "").lower() != "hyperliquid":
                 raise
             logging.debug(
@@ -630,13 +642,13 @@ async def get_orchestrator_market_snapshots(
                     ",".join(f"{k}:{v}" for k, v in sorted(sources.items())),
                 )
                 return snapshots
-            except RuntimeError as exc:
-                raise RuntimeError(
+            except MarketSnapshotUnavailable as exc:
+                raise MarketSnapshotUnavailable(
                     "staged market snapshots incomplete after hyperliquid fallback "
                     f"| missing={bot._log_symbols(invalid, limit=12)} "
                     f"| fallback_error={bounded_exception_type(exc)}"
                 ) from exc
-        raise RuntimeError(
+        raise MarketSnapshotUnavailable(
             "staged market snapshots incomplete "
             f"| exchange={getattr(bot, 'exchange', '')} "
             f"| symbols={len(symbols)} "

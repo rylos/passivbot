@@ -17,6 +17,7 @@ from typing import Any
 
 import numpy as np
 
+from config.gpu import GPU_SCREENING_DEFAULTS, resolve_gpu_screening
 from config.metrics import resolve_metric_value
 from config.pnl_lookback import parse_pnls_max_lookback_days
 from limit_utils import compute_limit_violation
@@ -29,6 +30,7 @@ from optimization.bounds import Bound, enforce_bounds
 from optimization.callback import build_pymoo_record_entry
 from optimization.evaluation_contract import CONTRACT_KEY, recorded_evaluation_contract
 from optimization.fine_tune_anchors import ANCHOR_GENE_KEY, get_anchor_plan
+from optimization.gpu.replay_progress import suite_replay_context
 from optimization.gpu.metric_registry import (
     reject_configured_exact_only_gpu_metrics,
 )
@@ -65,18 +67,15 @@ GPU_DEFAULTS = {
     "drift_window": 128,
     "drift_min_samples": 32,
     "drift_halt": 0.60,
+    "drift_rank_halt": None,
+    "drift_objective_tolerance": 1.0e-6,
     "exact_workers": 0,
     "max_pending_exact": 0,
     "seed_bootstrap": {
         "mode": "auto",
         "max_exact": 128,
     },
-    "successive_halving": {
-        "enabled": False,
-        "history_fractions": [0.25, 0.5, 1.0],
-        "survival_fraction": 0.5,
-        "min_survivors": 64,
-    },
+    "screening": GPU_SCREENING_DEFAULTS,
 }
 
 GPU_SEED_BOOTSTRAP_MODES = frozenset({"auto", "exact", "screened", "legacy"})
@@ -393,6 +392,11 @@ GPU_SUPPORTED_SUITE_NON_BOT_OVERRIDE_PATHS = {
 def _validate_gpu_static_scope(config: dict) -> str:
     """Reject immutable GPU limitations without touching data or optional runtime state."""
 
+    if config.get("backtest", {}).get("limit_order_fill_buffer_pct", 0.0) != 0.0:
+        raise ValueError(
+            "GPU optimization does not support nonzero "
+            "backtest.limit_order_fill_buffer_pct; use the CPU backend"
+        )
     strategy_kind = (
         str(config.get("live", {}).get("strategy_kind", "")).strip().lower()
     )
@@ -475,7 +479,7 @@ def _validate_gpu_data_independent_scope(
             field_name="live.pnls_max_lookback_days",
         )
         for side in hsl_enabled_sides:
-            hsl = config["bot"][side].get("hsl", {})
+            hsl = _gpu_hsl_policy(config, side)
             panic_order_type = str(
                 hsl.get("panic_close_order_type", "limit")
             ).strip().lower()
@@ -513,8 +517,11 @@ def _validate_gpu_suite_override_paths(
             and resolved[0] == "bot"
             and resolved[1] in {"long", "short"}
         )
+        from config.hsl_revised import engine
+        portfolio_override = (engine(proxy_config) == "revised"
+                              and resolved[:2] == ("bot", "hsl"))
         if (
-            not bot_side_override
+            not bot_side_override and not portfolio_override
             and resolved not in GPU_SUPPORTED_SUITE_NON_BOT_OVERRIDE_PATHS
         ):
             raise ValueError(
@@ -526,6 +533,31 @@ def _validate_gpu_suite_override_paths(
             )
 
 
+def _validate_revised_gpu_inputs(config: dict) -> None:
+    from config.hsl_revised import engine
+    if engine(config) == "revised":
+        interval = float(config.get("backtest", {}).get("candle_interval_minutes", 1))
+        if interval != 1:
+            raise ValueError("Revised GPU HSL requires 1m candles")
+
+
+def _gpu_hsl_policy(config: dict, side: str) -> dict:
+    from config.hsl_revised import engine
+    if engine(config) == "revised" and config["live"]["hsl_signal_mode"] == "unified":
+        return config["bot"]["hsl"]
+    return config.get("bot", {}).get(side, {}).get("hsl", {})
+
+
+def _gpu_hsl_bound_map(config: dict, bound_map: dict) -> dict:
+    from config.hsl_revised import engine
+    result = dict(bound_map)
+    if engine(config) == "revised" and config["live"]["hsl_signal_mode"] == "unified":
+        result = {k: v for k, v in result.items() if not any(
+            k.startswith(f"{side}_hsl_") for side in ("long", "short"))}
+        result.update({key: key for key in _SINGLE_COIN_HSL_BOUND_SUFFIXES})
+    return result
+
+
 def validate_gpu_preparation_scope(
     config: dict,
     suite_cfg: dict | None = None,
@@ -534,6 +566,7 @@ def validate_gpu_preparation_scope(
 ) -> None:
     """Fail before historical-data preparation when immutable MPS scope is invalid."""
 
+    _validate_revised_gpu_inputs(config)
     reject_configured_exact_only_gpu_metrics(config)
     suite_cfg = suite_cfg or {}
     suite_enabled = bool(suite_cfg.get("enabled"))
@@ -543,19 +576,16 @@ def validate_gpu_preparation_scope(
             allow_suite=suite_enabled,
         )
     )
-    halving_config = (
-        config.get("optimize", {}).get("gpu", {}).get("successive_halving", {})
-        or {}
-    )
-    if not isinstance(halving_config, dict):
-        raise TypeError("optimize.gpu.successive_halving must be an object")
-    if bool(halving_config.get("enabled")) and (
-        strategy_kind != "trailing_martingale" or suite_enabled
-    ):
-        raise ValueError(
-            "optimize.gpu.successive_halving currently requires a non-suite, "
-            "single-coin trailing_martingale optimization"
-        )
+    screening = _resolve_options(config)["screening"]
+    if screening["scenarios"] and not suite_enabled:
+        raise ValueError("GPU screening.scenarios requires backtest.suite_enabled")
+    available_labels = {
+        str(item.get("label") or f"scenario_{index + 1:02d}")
+        for index, item in enumerate(suite_cfg.get("scenarios") or [])
+    }
+    unknown = set(screening["scenarios"]) - available_labels
+    if unknown:
+        raise ValueError(f"GPU screening.scenarios contains unknown labels: {sorted(unknown)}")
     if bool(suite_cfg.get("enabled")):
         from optimization.warmup import _apply_config_overrides
 
@@ -949,13 +979,52 @@ _GPU_SUITE_VIOLATION_KEY = "__gpu_suite_constraint_violation__"
 _GPU_SUITE_METRICS_KEY = "__gpu_suite_metrics__"
 
 
-def _evaluate_gpu_suite_proxies(suite_evaluator, scenario_proxies, candidates) -> list[dict]:
+def _validate_gpu_screening_scenarios(labels, available_labels, suite_evaluator):
+    """A partial suite must retain explicitly selected scoring/limit scenarios."""
+    unknown = set(labels) - set(available_labels)
+    if unknown:
+        raise ValueError(f"GPU screening.scenarios contains unknown labels: {sorted(unknown)}")
+    required = {
+        basis.scenario
+        for basis in suite_evaluator.objective_bases
+        if basis.scenario is not None
+    }
+    required.update(
+        check["scenario"] for check in suite_evaluator.base.limit_checks
+        if check.get("scenario") is not None
+    )
+    missing = required - set(labels)
+    if missing:
+        raise ValueError(
+            "GPU screening.scenarios must include scenarios explicitly selected by "
+            f"objectives or limits: {sorted(missing)}"
+        )
+
+
+def _evaluate_gpu_suite_proxies(
+    suite_evaluator, scenario_proxies, candidates, *,
+    batch_compatible_scenarios=False, screening_scenarios=(), evaluation_stage="full",
+) -> list[dict]:
     """Screen one candidate batch across suite scenarios with canonical reducers."""
 
     from metrics_schema import build_scenario_metrics
     from suite_runner import ScenarioResult, SuiteScenario
 
+    if screening_scenarios:
+        _validate_gpu_screening_scenarios(
+            screening_scenarios, [ctx.label for ctx, _, _ in scenario_proxies],
+            suite_evaluator,
+        )
+    # Clear excluded scenarios too: full seed screens may have left profiles behind.
+    for _, exchange_proxies, _ in scenario_proxies:
+        for _, proxy in exchange_proxies:
+            if hasattr(proxy, "last_profile"):
+                proxy.last_profile = {}
+    if screening_scenarios:
+        selected = set(screening_scenarios)
+        scenario_proxies = [item for item in scenario_proxies if item[0].label in selected]
     scenario_rows = []
+    groups = {}
     for ctx, exchange_proxies, parameter_overrides in scenario_proxies:
         scenario_candidates = (
             [dict(candidate, **parameter_overrides) for candidate in candidates]
@@ -964,19 +1033,46 @@ def _evaluate_gpu_suite_proxies(suite_evaluator, scenario_proxies, candidates) -
         )
         exchange_rows = []
         for exchange, proxy in exchange_proxies:
-            rows = proxy.evaluate(scenario_candidates)
-            if len(rows) != len(candidates):
-                raise RuntimeError(
-                    f"GPU suite scenario {ctx.label!r} exchange {exchange!r} "
-                    "returned an unexpected proxy row count: "
-                    f"expected {len(candidates)}, got {len(rows)}"
-                )
+            key = (
+                proxy.suite_batch_key()
+                if batch_compatible_scenarios and hasattr(proxy, "suite_batch_key")
+                else None
+            )
+            group_key = ("shared", key) if key is not None else ("separate", len(groups))
+            rows = []
             exchange_rows.append((exchange, rows))
+            groups.setdefault(group_key, []).append(
+                (ctx, exchange, proxy, scenario_candidates, rows)
+            )
         if not exchange_rows:
             raise ValueError(
                 f"GPU suite scenario {ctx.label!r} has no prepared proxy datasets"
             )
         scenario_rows.append((ctx, exchange_rows))
+    for pass_index, tasks in enumerate(groups.values(), start=1):
+        ctx, exchange, proxy, stage_candidates, _ = tasks[0]
+        if len(tasks) > 1:
+            stage_candidates = [
+                candidate
+                for _, _, task_proxy, task_candidates, _ in tasks
+                for candidate in task_proxy.materialize_suite_candidates(task_candidates)
+            ]
+        with suite_replay_context(
+            pass_index=pass_index, pass_count=len(groups),
+            labels=[task[0].label for task in tasks],
+            exchanges=[task[1] for task in tasks], evaluation_stage=evaluation_stage,
+        ):
+            rows = proxy.evaluate(stage_candidates)
+        if len(rows) != len(stage_candidates):
+            raise RuntimeError(
+                f"GPU suite scenario {ctx.label!r} exchange {exchange!r} "
+                "returned an unexpected proxy row count: "
+                f"expected {len(stage_candidates)}, got {len(rows)}"
+            )
+        offset = 0
+        for _, _, _, task_candidates, target in tasks:
+            target.extend(rows[offset:offset + len(task_candidates)])
+            offset += len(task_candidates)
     results = []
     for index in range(len(candidates)):
         scenario_results = []
@@ -1036,16 +1132,24 @@ def _resolve_max_pending_exact(options: dict, workers: int) -> int:
 
 
 def _resolve_options(config: dict) -> dict:
+    from config.migrations.gpu_screening import migrate_gpu_screening
+
+    legacy_gpu = config.get("optimize", {}).get("gpu")
+    if isinstance(legacy_gpu, dict) and "successive_halving" in legacy_gpu:
+        config = deepcopy(config)
+        migrate_gpu_screening(config)
     options = dict(GPU_DEFAULTS)
     configured = config.get("optimize", {}).get("gpu", {})
     if configured is not None and not isinstance(configured, dict):
         raise TypeError("optimize.gpu must be an object")
-    nested_options = {"seed_bootstrap", "successive_halving"}
+    nested_options = {"seed_bootstrap", "screening"}
     for key, default in GPU_DEFAULTS.items():
         if key in nested_options:
             continue
         if key in (configured or {}) and configured[key] is not None:
-            options[key] = type(default)(configured[key])
+            options[key] = (float if key == "drift_rank_halt" else type(default))(
+                configured[key]
+            )
     seed_bootstrap = dict(GPU_DEFAULTS["seed_bootstrap"])
     configured_seed_bootstrap = (configured or {}).get("seed_bootstrap")
     if configured_seed_bootstrap is not None and not isinstance(
@@ -1074,58 +1178,9 @@ def _resolve_options(config: dict) -> dict:
             "optimize.gpu.seed_bootstrap.max_exact must be greater than zero"
         )
     options["seed_bootstrap"] = seed_bootstrap
-    halving = dict(GPU_DEFAULTS["successive_halving"])
-    configured_halving = (configured or {}).get("successive_halving")
-    if configured_halving is not None and not isinstance(configured_halving, dict):
-        raise TypeError("optimize.gpu.successive_halving must be an object")
-    halving.update(configured_halving or {})
-    unknown_halving = sorted(
-        set(halving) - set(GPU_DEFAULTS["successive_halving"])
-    )
-    if unknown_halving:
-        raise ValueError(
-            "unknown optimize.gpu.successive_halving settings: "
-            + ", ".join(unknown_halving)
-        )
-    halving["enabled"] = bool(halving["enabled"])
-    try:
-        fractions = [float(value) for value in halving["history_fractions"]]
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            "optimize.gpu.successive_halving.history_fractions must be an array "
-            "of finite fractions"
-        ) from exc
-    if (
-        not fractions
-        or any(
-            not math.isfinite(value) or value <= 0.0 or value > 1.0
-            for value in fractions
-        )
-        or any(right <= left for left, right in zip(fractions, fractions[1:]))
-        or not math.isclose(fractions[-1], 1.0, rel_tol=0.0, abs_tol=1.0e-12)
-    ):
-        raise ValueError(
-            "optimize.gpu.successive_halving.history_fractions must be strictly "
-            "increasing finite values in (0, 1] ending at 1.0"
-        )
-    fractions[-1] = 1.0
-    survival_fraction = float(halving["survival_fraction"])
-    if not math.isfinite(survival_fraction) or not 0.0 < survival_fraction <= 1.0:
-        raise ValueError(
-            "optimize.gpu.successive_halving.survival_fraction must be greater "
-            "than zero and at most one"
-        )
-    min_survivors = int(halving["min_survivors"])
-    if min_survivors <= 0:
-        raise ValueError(
-            "optimize.gpu.successive_halving.min_survivors must be greater than zero"
-        )
-    halving.update(
-        history_fractions=fractions,
-        survival_fraction=survival_fraction,
-        min_survivors=min_survivors,
-    )
-    options["successive_halving"] = halving
+    screening = resolve_gpu_screening((configured or {}).get("screening"))
+    min_survivors = screening["min_survivors"]
+    options["screening"] = screening
     for key in (
         "population_size",
         "batch_size",
@@ -1146,6 +1201,17 @@ def _resolve_options(config: dict) -> dict:
         raise ValueError(
             "optimize.gpu.drift_halt must be greater than zero and at most one"
         )
+    if options["drift_rank_halt"] is not None and not (
+        0.0 < options["drift_rank_halt"] <= 1.0
+    ):
+        raise ValueError(
+            "optimize.gpu.drift_rank_halt must be greater than zero and at most one"
+        )
+    tolerance = options["drift_objective_tolerance"]
+    if not math.isfinite(tolerance) or tolerance < 0.0:
+        raise ValueError(
+            "optimize.gpu.drift_objective_tolerance must be finite and non-negative"
+        )
     if int(options["drift_min_samples"]) > int(options["drift_window"]):
         raise ValueError(
             "optimize.gpu.drift_min_samples must be less than or equal to "
@@ -1159,11 +1225,11 @@ def _resolve_options(config: dict) -> dict:
             "optimize.gpu.validate_per_generation so proxy-front safety evidence "
             "is always collected"
         )
-    if halving["enabled"] and min(
+    if screening["scenarios"] and min(
         min_survivors, int(options["population_size"])
     ) < validations:
         raise ValueError(
-            "optimize.gpu.successive_halving.min_survivors must be at least "
+            "optimize.gpu.screening.min_survivors must be at least "
             "optimize.gpu.validate_per_generation"
         )
     exact_workers = int(options["exact_workers"]) or int(
@@ -1868,11 +1934,13 @@ def _validate_gpu_coin_overrides(
                 hsl_patch = side_patch.get("hsl", {}) or {}
                 if not isinstance(hsl_patch, dict):
                     continue
-                validate_hsl_override_patch(
-                    config.get("bot", {}).get(side, {}).get("hsl", {}) or {},
-                    hsl_patch,
-                    field_name=f"coin_overrides.{coin}.bot.{side}.hsl",
-                )
+                from config.hsl_revised import engine
+                if engine(config) == "legacy":
+                    validate_hsl_override_patch(
+                        config.get("bot", {}).get(side, {}).get("hsl", {}) or {},
+                        hsl_patch,
+                        field_name=f"coin_overrides.{coin}.bot.{side}.hsl",
+                    )
     if unsupported:
         supported_risk = (
             "risk.entry_cooldown_minutes, risk.we_excess_allowance_pct"
@@ -1974,7 +2042,10 @@ def _gpu_suite_scenario_inputs(proxy_config: dict, suite_evaluator) -> list[dict
             hlcvs, btc, coin_indices = get_data(ctx, exchange)
             values = np.asarray(hlcvs)
             if coin_indices is not None:
-                values = np.take(values, list(coin_indices), axis=1)
+                indices = list(coin_indices)
+                # Keep full, ordered selections as views across suite scenarios.
+                if indices != list(range(values.shape[1])):
+                    values = np.take(values, indices, axis=1)
             values = np.ascontiguousarray(values)
             coin_count = int(values.shape[1])
             _validate_scope_config(
@@ -2227,25 +2298,78 @@ class _ObjectiveScale:
         fallback = np.maximum(np.abs(self.median) * 0.1, 1.0e-9)
         self.spread = np.where(q75 - q25 > 1.0e-12, q75 - q25, fallback)
 
-    def score(self, objectives: np.ndarray) -> np.ndarray:
+    def normalize(self, objectives: np.ndarray) -> np.ndarray:
         if self.median is None or self.spread is None:
             raise RuntimeError("GPU objective scale has not been fitted")
-        values = (np.asarray(objectives, dtype=np.float64) - self.median) / self.spread
+        return (np.asarray(objectives, dtype=np.float64) - self.median) / self.spread
+
+    def score(self, objectives: np.ndarray) -> np.ndarray:
+        values = self.normalize(objectives)
         values[~np.isfinite(values)] = 1.0e6
         return values.mean(axis=1)
+
+
+def _drift_objective_pair(
+    proxy, exact, *, objective_count: int | None, allow_nonfinite: bool = False
+) -> tuple[list[float] | None, list[float] | None]:
+    """Validate normalized, ordered objectives before using or recovering evidence."""
+    if objective_count is None or objective_count <= 0:
+        raise ValueError("GPU drift objectives require a configured objective count")
+    proxy = np.asarray(proxy, dtype=np.float64)
+    exact = np.asarray(exact, dtype=np.float64)
+    if proxy.shape != (objective_count,) or exact.shape != (objective_count,):
+        raise ValueError("GPU drift objectives must match the configured objective count")
+    if not np.all(np.isfinite(proxy)) or not np.all(np.isfinite(exact)):
+        if allow_nonfinite:
+            # Some supported metrics use infinity for insufficient samples.
+            # Keep their existing conservative scalar score, without granting
+            # the new per-objective continuation exception.
+            return None, None
+        raise ValueError("GPU drift objectives must be finite")
+    return proxy.tolist(), exact.tolist()
+
+
+def _recover_drift_objectives(metadata: dict, objective_count: int | None) -> tuple:
+    # Schema 2 did not retain objective evidence. Never infer it from scalar means.
+    if metadata["schema_version"] == 2:
+        return ()
+    try:
+        proxy, exact = metadata["proxy_objectives"], metadata["exact_objectives"]
+        if proxy is None and exact is None:
+            return ()
+        return _drift_objective_pair(
+            proxy, exact, objective_count=objective_count
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("GPU resume found invalid per-objective drift evidence") from exc
+
+
+def _drift_agreement(proxy: np.ndarray, exact: np.ndarray) -> dict:
+    return {
+        "rho": _spearman(proxy, exact),
+        "proxy_spread": float(np.ptp(proxy)),
+        "exact_spread": float(np.ptp(exact)),
+        "max_abs_error": float(np.max(np.abs(proxy - exact))),
+    }
 
 
 class _DriftMonitor:
     MIN_PROBES = MIN_DRIFT_PROBES
     MIN_FRONT_SAMPLES = MIN_DRIFT_PROBES
 
-    def __init__(self, options: dict):
+    def __init__(self, options: dict, *, objective_count: int | None = None):
         self.window = int(options["drift_window"])
         self.minimum = int(options["drift_min_samples"])
-        self.halt = float(options["drift_halt"])
-        self.pairs: deque[tuple[float, float, bool, bool, bool]] = deque(
-            maxlen=self.window
+        self.constraint_halt = float(options["drift_halt"])
+        rank_halt = options.get("drift_rank_halt")
+        self.halt = self.constraint_halt if rank_halt is None else float(rank_halt)
+        self.objective_tolerance = float(
+            options.get(
+                "drift_objective_tolerance", GPU_DEFAULTS["drift_objective_tolerance"]
+            )
         )
+        self.pairs: deque[tuple] = deque(maxlen=self.window)
+        self.objective_count = objective_count
 
     def add(
         self,
@@ -2255,11 +2379,18 @@ class _DriftMonitor:
         probe: bool,
         proxy_front: bool,
         constraint_mismatch: bool = False,
+        proxy_objectives=None,
+        exact_objectives=None,
     ) -> None:
         if bool(probe) == bool(proxy_front):
             raise ValueError(
                 "GPU validation evidence must be exactly one of proxy-front "
                 "or broad/off-front"
+            )
+        objectives = ()
+        if proxy_objectives is not None or exact_objectives is not None:
+            objectives = _drift_objective_pair(
+                proxy_objectives, exact_objectives, objective_count=self.objective_count
             )
         self.pairs.append(
             (
@@ -2268,6 +2399,7 @@ class _DriftMonitor:
                 bool(probe),
                 bool(constraint_mismatch),
                 bool(proxy_front),
+                *objectives,
             )
         )
 
@@ -2290,6 +2422,9 @@ class _DriftMonitor:
             "front_constraint_mismatches": 0,
             "halt_reason": None,
             "warn_reason": None,
+            "probe_score_agreement": None,
+            "probe_objective_agreement": [],
+            "probe_objective_samples": 0,
         }
         if len(self.pairs) < self.minimum:
             return result
@@ -2328,6 +2463,46 @@ class _DriftMonitor:
         result["front_rho"] = _spearman(
             proxy[front_rank_eligible], exact[front_rank_eligible]
         )
+        objective_rows = []
+        for row, eligible in zip(self.pairs, probe_rank_eligible):
+            if len(row) not in (5, 7):
+                raise ValueError("GPU drift evidence has an invalid objective layout")
+            if len(row) == 7:
+                pair = _drift_objective_pair(
+                    row[5], row[6], objective_count=self.objective_count
+                )
+                if eligible:
+                    objective_rows.append(pair)
+        if np.any(probe_rank_eligible):
+            result["probe_score_agreement"] = _drift_agreement(
+                proxy[probe_rank_eligible], exact[probe_rank_eligible]
+            )
+        result["probe_objective_samples"] = len(objective_rows)
+        objectives_sound = False
+        if objective_rows:
+            objective_proxy = np.asarray([row[0] for row in objective_rows])
+            objective_exact = np.asarray([row[1] for row in objective_rows])
+            result["probe_objective_agreement"] = [
+                _drift_agreement(objective_proxy[:, i], objective_exact[:, i])
+                for i in range(objective_proxy.shape[1])
+            ]
+            # Rescue a low/undefined scalar rank only with complete evidence for
+            # EVERY objective of EVERY rank-comparable probe in this window.
+            # Cancellation or a subset of good objectives cannot conceal drift.
+            objectives_sound = (
+                len(objective_rows) == result["probe_rank_samples"]
+                and len(objective_rows) >= self.MIN_PROBES
+                and all(
+                    item["max_abs_error"] <= self.objective_tolerance
+                    or (
+                        item["proxy_spread"] > self.objective_tolerance
+                        and item["exact_spread"] > self.objective_tolerance
+                        and np.isfinite(item["rho"])
+                        and item["rho"] >= self.halt
+                    )
+                    for item in result["probe_objective_agreement"]
+                )
+            )
         result["constraint_agreement"] = 1.0 - (
             result["constraint_mismatches"] / result["samples"]
         )
@@ -2346,8 +2521,8 @@ class _DriftMonitor:
                 result["front_constraint_mismatches"] / result["front_samples"]
             )
         detail = (
-            f"rho={result['rho']:.3f}, probe_rho={result['probe_rho']:.3f}, "
-            f"front_rho={result['front_rho']:.3f}, samples={result['samples']}, "
+            f"rho={result['rho']:.6f}, probe_rho={result['probe_rho']:.6f}, "
+            f"front_rho={result['front_rho']:.6f}, samples={result['samples']}, "
             f"constraint_agreement={result['constraint_agreement']:.3f}, "
             f"probes={result['probes']}, "
             f"probe_rank_samples={result['probe_rank_samples']}, "
@@ -2355,21 +2530,26 @@ class _DriftMonitor:
             f"front_samples={result['front_samples']}, "
             f"front_rank_samples={result['front_rank_samples']}, "
             f"front_constraint_agreement={result['front_constraint_agreement']:.3f}"
+            f", rank_halt={self.halt:.6g}, constraint_halt={self.constraint_halt:.6g}"
+            f", objective_tolerance={self.objective_tolerance:.6g}"
+            f", probe_score_agreement={result['probe_score_agreement']}"
+            f", probe_objective_samples={result['probe_objective_samples']}"
+            f", probe_objective_agreement={result['probe_objective_agreement']}"
         )
-        if result["constraint_agreement"] < self.halt:
+        if result["constraint_agreement"] < self.constraint_halt:
             result["halt_reason"] = (
                 "GPU proxy/exact rolling constraint agreement fell below "
                 f"safety threshold ({detail})"
             )
         elif result["probes"] >= self.MIN_PROBES and (
-            result["probe_constraint_agreement"] < self.halt
+            result["probe_constraint_agreement"] < self.constraint_halt
         ):
             result["halt_reason"] = (
                 "GPU proxy/exact broad-probe constraint agreement fell below "
                 f"safety threshold ({detail})"
             )
         elif result["front_samples"] >= self.MIN_FRONT_SAMPLES and (
-            result["front_constraint_agreement"] < self.halt
+            result["front_constraint_agreement"] < self.constraint_halt
         ):
             result["halt_reason"] = (
                 "GPU proxy/exact proxy-front constraint agreement fell below "
@@ -2379,9 +2559,15 @@ class _DriftMonitor:
             not np.isfinite(result["probe_rho"])
             or result["probe_rho"] < self.halt
         ):
-            result["halt_reason"] = (
-                f"GPU proxy/exact broad-probe rank drift exceeded safety threshold ({detail})"
-            )
+            if objectives_sound:
+                result["warn_reason"] = (
+                    "GPU scalar rank is inconclusive but per-objective broad probes "
+                    f"remain sound ({detail})"
+                )
+            else:
+                result["halt_reason"] = (
+                    f"GPU proxy/exact broad-probe rank drift exceeded safety threshold ({detail})"
+                )
         elif np.isfinite(result["rho"]) and result["rho"] >= self.halt:
             return result
         elif result["probe_rank_samples"] < self.MIN_PROBES:
@@ -2423,20 +2609,20 @@ def _normalized_farthest_indices(values: np.ndarray, count: int) -> list[int]:
     return chosen
 
 
-def _successive_halving_survivor_indices(
+def _screening_survivor_indices(
     objectives: np.ndarray,
     violations: np.ndarray,
     *,
     count: int,
 ) -> np.ndarray:
-    """Select a deterministic constraint-aware, Pareto-diverse rung subset."""
+    """Select a deterministic constraint-aware, Pareto-diverse screening subset."""
 
     from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
 
     objectives = np.asarray(objectives, dtype=np.float64)
     violations = np.asarray(violations, dtype=np.float64)
     if objectives.ndim != 2 or len(objectives) != len(violations):
-        raise ValueError("successive-halving objectives and violations must align")
+        raise ValueError("screening objectives and violations must align")
     count = min(max(0, int(count)), len(objectives))
     if count == 0:
         return np.empty(0, dtype=np.int64)
@@ -2477,7 +2663,7 @@ def _successive_halving_survivor_indices(
     return np.asarray(selected, dtype=np.int64)
 
 
-def _evaluate_successive_halving(
+def _evaluate_scenario_screening(
     candidates: list[dict],
     *,
     policy: dict,
@@ -2486,77 +2672,38 @@ def _evaluate_successive_halving(
     interrupt_check: InterruptCheck,
     stage_callback=None,
 ) -> tuple[list[dict], np.ndarray, np.ndarray, np.ndarray, list[dict]]:
-    """Evaluate progressively longer history windows and return full-rung eligibility."""
-
-    active = np.arange(len(candidates), dtype=np.int64)
-    metric_rows: list[dict | None] = [None] * len(candidates)
-    objectives = None
-    violations = np.full(len(candidates), np.inf, dtype=np.float64)
-    trace: list[dict] = []
-    fractions = list(policy["history_fractions"])
-    for rung, fraction in enumerate(fractions):
-        interrupt_check()
-        stage_candidates = [candidates[int(index)] for index in active]
-        stage_metrics = evaluate_proxy(
-            stage_candidates,
-            history_fraction=float(fraction),
-        )
-        stage_objectives, stage_violations = proxy_fitness(stage_metrics)
-        if stage_callback is not None:
-            stage_callback(rung + 1, float(fraction), len(active))
-        if objectives is None:
-            objectives = np.full(
-                (len(candidates), stage_objectives.shape[1]),
-                np.nan,
-                dtype=np.float64,
-            )
-        objectives[active] = stage_objectives
-        violations[active] = stage_violations
-        for local_index, source_index in enumerate(active):
-            metric_rows[int(source_index)] = dict(stage_metrics[local_index])
-
-        final_rung = rung == len(fractions) - 1
-        survivor_count = len(active)
-        if not final_rung:
-            survivor_count = min(
-                len(active),
-                max(
-                    int(policy["min_survivors"]),
-                    int(math.ceil(len(active) * float(policy["survival_fraction"]))),
-                ),
-            )
-        trace.append(
-            {
-                "rung": rung + 1,
-                "history_fraction": float(fraction),
-                "candidate_count": int(len(active)),
-                "survivor_count": int(survivor_count),
-            }
-        )
-        if final_rung:
-            break
-        local_survivors = _successive_halving_survivor_indices(
-            stage_objectives,
-            stage_violations,
-            count=survivor_count,
-        )
-        active = active[local_survivors]
-
-    if objectives is None or any(row is None for row in metric_rows):
-        raise RuntimeError("successive-halving proxy evaluation produced incomplete rows")
-    full_rung_indices = active.copy()
-    rejected = np.ones(len(candidates), dtype=bool)
-    rejected[full_rung_indices] = False
-    # Partial-history rows remain useful as weak proposal evidence, but must
-    # never outrank or masquerade as full-history proxy evidence.
-    violations[rejected] = np.inf
-    return (
-        [dict(row) for row in metric_rows if row is not None],
-        objectives,
-        violations,
-        full_rung_indices,
-        trace,
-    )
+    """Screen a scenario subset, then rescore survivors against the complete suite."""
+    interrupt_check()
+    metric_rows = evaluate_proxy(candidates, screening=True)
+    if len(metric_rows) != len(candidates):
+        raise RuntimeError("scenario screening proxy evaluation produced incomplete rows")
+    objectives, violations = proxy_fitness(metric_rows)
+    objectives = np.array(objectives, dtype=np.float64, copy=True)
+    violations = np.array(violations, dtype=np.float64, copy=True)
+    survivor_count = min(len(candidates), max(
+        int(policy["min_survivors"]),
+        int(math.ceil(len(candidates) * float(policy["survival_fraction"]))),
+    ))
+    survivors = _screening_survivor_indices(objectives, violations, count=survivor_count)
+    if stage_callback is not None:
+        stage_callback("screening", len(candidates))
+    interrupt_check()
+    full_rows = evaluate_proxy([candidates[int(i)] for i in survivors])
+    if len(full_rows) != len(survivors):
+        raise RuntimeError("scenario screening proxy evaluation produced incomplete rows")
+    full_objectives, full_violations = proxy_fitness(full_rows)
+    objectives[survivors] = full_objectives
+    # Subset scores must never outrank or masquerade as full-suite evidence.
+    violations[:] = np.inf
+    violations[survivors] = full_violations
+    for index, metrics in zip(survivors, full_rows):
+        metric_rows[int(index)] = dict(metrics)
+    if stage_callback is not None:
+        stage_callback("full", len(survivors))
+    return metric_rows, objectives, violations, survivors, [
+        {"stage": "screening", "candidate_count": len(candidates), "survivor_count": len(survivors)},
+        {"stage": "full", "candidate_count": len(survivors), "survivor_count": len(survivors)},
+    ]
 
 
 def _select_validation_indices(
@@ -2837,7 +2984,7 @@ def _select_seed_population_indices(
     return list(
         map(
             int,
-            _successive_halving_survivor_indices(
+            _screening_survivor_indices(
                 objectives,
                 violations,
                 count=count,
@@ -3230,7 +3377,8 @@ def _gpu_unstuck_checkpoint_contract(config: dict) -> dict:
 
 
 def _gpu_hsl_checkpoint_contract(config: dict) -> dict:
-    return {
+    from config.hsl_revised import engine
+    result = {
         "signal_mode": str(
             config.get("live", {}).get("hsl_signal_mode", "unified")
         )
@@ -3255,25 +3403,27 @@ def _gpu_hsl_checkpoint_contract(config: dict) -> dict:
         },
     }
 
+    if engine(config) == "revised":
+        result.update(engine="revised", portfolio=deepcopy(config.get("bot", {}).get("hsl")))
+    return result
+
 
 def _gpu_pinned_hsl_bound_contract(bound_by_key) -> dict[str, float]:
     return {
         key: float(bound.low)
         for key, bound in sorted(bound_by_key.items())
-        if "_hsl_" in key
+        if ("_hsl_" in key or key.startswith("hsl_"))
         and math.isclose(
             float(bound.low), float(bound.high), rel_tol=0.0, abs_tol=1.0e-12
         )
     }
 
 
-def _gpu_hsl_side_enabled(config: dict, side: str) -> bool:
-    globally_enabled = bool(
-        config.get("bot", {})
-        .get(side, {})
-        .get("hsl", {})
-        .get("enabled", False)
-    )
+def _gpu_hsl_side_enabled(config: dict, side: str, markets_by_exchange=None) -> bool:
+    from config.hsl_revised import engine, _side_has_enabled_policy
+    if engine(config) == "revised" and config["live"]["hsl_signal_mode"] == "coin":
+        return _side_has_enabled_policy(config, side, markets_by_exchange)
+    globally_enabled = bool(_gpu_hsl_policy(config, side).get("enabled", False))
     if globally_enabled:
         return True
     for patch in (config.get("coin_overrides") or {}).values():
@@ -3291,15 +3441,14 @@ def _validate_hsl_bound_contracts(bound_by_key, config: dict) -> None:
     float32_below_one = float(
         np.nextafter(np.float32(1.0), np.float32(0.0))
     )
-    for side in ("long", "short"):
-        globally_enabled = bool(
-            config.get("bot", {})
-            .get(side, {})
-            .get("hsl", {})
-            .get("enabled", False)
-        )
-        enabled = _gpu_hsl_side_enabled(config, side)
-        enabled_bound = bound_by_key.get(f"{side}_hsl_enabled")
+    from config.hsl_revised import engine
+    revised = engine(config) == "revised"
+    unified = revised and config["live"]["hsl_signal_mode"] == "unified"
+    for side in (("portfolio",) if unified else ("long", "short")):
+        prefix = "" if unified else f"{side}_"
+        globally_enabled = bool(_gpu_hsl_policy(config, side).get("enabled", False))
+        enabled = globally_enabled if unified else _gpu_hsl_side_enabled(config, side)
+        enabled_bound = bound_by_key.get(f"{prefix}hsl_enabled")
         if enabled_bound is not None:
             expected = float(globally_enabled)
             endpoints = (float(enabled_bound.low), float(enabled_bound.high))
@@ -3315,27 +3464,30 @@ def _validate_hsl_bound_contracts(bound_by_key, config: dict) -> None:
                 )
         if not enabled:
             continue
-        red_bound = bound_by_key.get(f"{side}_hsl_red_threshold")
+        red_bound = bound_by_key.get(f"{prefix}hsl_red_threshold")
         if red_bound is not None and float(red_bound.low) <= 0.0:
             raise ValueError(
                 f"GPU HSL {side}_hsl_red_threshold bounds must remain greater "
                 f"than zero, got {(float(red_bound.low), float(red_bound.high))}"
             )
         cooldown_bound = bound_by_key.get(
-            f"{side}_hsl_cooldown_minutes_after_red"
+            f"{prefix}hsl_cooldown_minutes_after_red"
         )
         if cooldown_bound is not None and float(cooldown_bound.low) < 0.0:
             raise ValueError(
                 "GPU HSL "
-                f"{side}_hsl_cooldown_minutes_after_red bounds must remain "
+                f"{prefix}hsl_cooldown_minutes_after_red bounds must remain "
                 "non-negative, got "
                 f"{(float(cooldown_bound.low), float(cooldown_bound.high))}"
             )
-        for suffix in (
-            "hsl_red_threshold",
-            "hsl_no_restart_drawdown_threshold",
-        ):
-            bound = bound_by_key.get(f"{side}_{suffix}")
+        if revised:
+            span = bound_by_key.get(f"{prefix}hsl_ema_span_minutes")
+            if span is not None and float(span.low) < 1:
+                raise ValueError("Revised GPU HSL EMA span bounds must remain >= 1")
+        for suffix in (("hsl_red_threshold",) if revised else (
+            "hsl_red_threshold", "hsl_no_restart_drawdown_threshold",
+        )):
+            bound = bound_by_key.get(f"{prefix}{suffix}")
             if bound is None:
                 continue
             low, high = float(bound.low), float(bound.high)
@@ -3348,28 +3500,38 @@ def _validate_hsl_bound_contracts(bound_by_key, config: dict) -> None:
 
 
 def _gpu_hsl_search_sides(
-    proxy_config: dict, suite_inputs, overrides: set[str] | None = None
+    proxy_config: dict, suite_inputs, overrides: set[str] | None = None,
+    *, markets_by_exchange=None,
 ) -> set[str]:
-    configs = (
-        [item["config"] for item in suite_inputs]
-        if suite_inputs
-        else [proxy_config]
-    )
+    from config.hsl_revised import engine
+
+    contexts = []
+    for item in suite_inputs or []:
+        config = item["config"]
+        markets = markets_by_exchange
+        if "coins" in item and "exchange" in item:
+            config = deepcopy(config)
+            config.setdefault("backtest", {})["coins"] = {item["exchange"]: item["coins"]}
+            markets = {item["exchange"]: item["mss"]}
+        contexts.append((config, markets))
+    if not contexts:
+        contexts = [(proxy_config, markets_by_exchange)]
+    portfolio = any(engine(c) == "revised" and c["live"]["hsl_signal_mode"] == "unified"
+                    and bool(c["bot"]["hsl"]["enabled"]) for c, _ in contexts)
     target_sides = {
-        side
-        for side in ("long", "short")
-        if any(
-            gpu_side_enabled(item, side)
-            and _gpu_hsl_side_enabled(item, side)
-            for item in configs
-        )
+        side for side in ("long", "short")
+        if any(gpu_side_enabled(c, side) and _gpu_hsl_side_enabled(c, side, markets)
+               and not (engine(c) == "revised" and c["live"]["hsl_signal_mode"] == "unified")
+               for c, markets in contexts)
     }
-    return _gpu_candidate_source_sides(target_sides, overrides or set())
+    return _gpu_candidate_source_sides(target_sides, overrides or set()) | ({"portfolio"} if portfolio else set())
 
 
 def _gpu_hsl_parameter_active(
     parameter: str, hsl_search_sides: set[str]
 ) -> bool:
+    if parameter.startswith("hsl_"):
+        return "portfolio" in hsl_search_sides
     for side in ("long", "short"):
         if parameter.startswith(f"{side}_hsl_"):
             return side in hsl_search_sides
@@ -3973,11 +4135,12 @@ def _recover_durable_validations(
     stop_index: int,
     vector_from_entry,
     hash_vector,
-) -> tuple[set[str], list[tuple[float, float, bool, bool, bool]]]:
+    objective_count: int | None = None,
+) -> tuple[set[str], list[tuple]]:
     """Recover candidate identities and safety evidence after a stale checkpoint."""
 
     recovered: set[str] = set()
-    drift_pairs: list[tuple[float, float, bool, bool, bool]] = []
+    drift_pairs: list[tuple] = []
     consumed = 0
     for index, entry in enumerate(entries):
         if index < start_index:
@@ -3991,7 +4154,7 @@ def _recover_durable_validations(
                 "GPU resume cannot recover proxy/exact safety evidence from "
                 f"durable result {index}"
             )
-        if metadata.get("schema_version") != 2:
+        if metadata.get("schema_version") not in (2, 3):
             raise RuntimeError(
                 "GPU resume found unsupported proxy/exact safety evidence in "
                 f"durable result {index}"
@@ -4029,6 +4192,7 @@ def _recover_durable_validations(
                 probe,
                 classification_mismatch,
                 proxy_front,
+                *_recover_drift_objectives(metadata, objective_count),
             )
         )
         consumed += 1
@@ -4048,16 +4212,17 @@ def _recover_durable_seed_bootstrap(
     stop_index: int,
     vector_from_entry,
     hash_vector,
+    objective_count: int | None = None,
 ) -> tuple[
     dict[str, dict[str, Any]],
     set[str],
-    list[tuple[float, float, bool, bool, bool]],
+    list[tuple],
 ]:
     """Recover exact seed payloads flushed after a stale bootstrap checkpoint."""
 
     payloads: dict[str, dict[str, Any]] = {}
     recovered: set[str] = set()
-    drift_pairs: list[tuple[float, float, bool, bool, bool]] = []
+    drift_pairs: list[tuple] = []
     consumed = 0
     for index, entry in enumerate(entries):
         if index < start_index:
@@ -4113,7 +4278,7 @@ def _recover_durable_seed_bootstrap(
         if validation is not None:
             if (
                 not isinstance(validation, dict)
-                or validation.get("schema_version") != 2
+                or validation.get("schema_version") not in (2, 3)
                 or validation.get("phase") != "seed_bootstrap"
             ):
                 raise RuntimeError(
@@ -4144,7 +4309,10 @@ def _recover_durable_seed_bootstrap(
                     f"in durable result {index}"
                 )
             drift_pairs.append(
-                (proxy_score, exact_score, probe, mismatch, proxy_front)
+                (
+                    proxy_score, exact_score, probe, mismatch, proxy_front,
+                    *_recover_drift_objectives(validation, objective_count),
+                )
             )
         consumed += 1
     expected = max(0, stop_index - start_index)
@@ -4180,6 +4348,8 @@ def run_backend(
     resume: bool = False,
     interrupt_check: InterruptCheck | None = None,
 ) -> dict[str, Any]:
+    _validate_revised_gpu_inputs(config)
+
     del duplicate_counter
     del constraint_fitness_cls
     del record_individual_result
@@ -4274,15 +4444,18 @@ def run_backend(
             evaluator.shared_hlcvs_np[exchange].shape[1]
         )
         suite_multicoin_sides = None
-    halving_policy = options["successive_halving"]
-    if halving_policy["enabled"] and (
-        suite_enabled
-        or max_coin_count != 1
-        or strategy_kind != "trailing_martingale"
-    ):
-        raise ValueError(
-            "optimize.gpu.successive_halving currently requires a non-suite, "
-            "single-coin trailing_martingale optimization"
+    screening_policy = options["screening"]
+    screening_scenarios = screening_policy["scenarios"]
+    if screening_scenarios:
+        if not suite_enabled:
+            raise ValueError("GPU screening.scenarios requires backtest.suite_enabled")
+        _validate_gpu_screening_scenarios(
+            screening_scenarios, [item["ctx"].label for item in suite_inputs],
+            evaluator_for_pool,
+        )
+        logging.info(
+            "GPU partial-suite screening | screening_scenarios=%s full_scenarios=%d",
+            screening_scenarios, scenario_count,
         )
     if max_coin_count > 1:
         multicoin_sides = (
@@ -4308,6 +4481,8 @@ def run_backend(
             bound_map.update(mapper(multicoin_side, gpu_optimizer_overrides))
     else:
         bound_map = GPU_STRATEGY_BOUND_MAPS[strategy_kind]
+
+    bound_map = _gpu_hsl_bound_map(proxy_config, bound_map)
 
     if "couple_unstuck_ema_spans" in gpu_optimizer_overrides:
         from optimizer_overrides import COUPLED_UNSTUCK_EMA_BOUND_KEYS
@@ -4421,12 +4596,13 @@ def run_backend(
         proxy_config, suite_inputs, gpu_optimizer_overrides
     )
     hsl_search_sides = _gpu_hsl_search_sides(
-        proxy_config, suite_inputs, gpu_optimizer_overrides
+        proxy_config, suite_inputs, gpu_optimizer_overrides,
+        markets_by_exchange=getattr(evaluator, "msss", None),
     )
     mapped = {
         name: value
         for name, value in mapped_all.items()
-        if name.split("_", 1)[0] in candidate_source_sides
+        if name.split("_", 1)[0] in candidate_source_sides or name.startswith("hsl_")
     }
     active = [
         (name, index, bound)
@@ -4673,17 +4849,14 @@ def run_backend(
             for _exchange, proxy in exchange_proxies
         ]
 
-        def evaluate_proxy(candidates, *, history_fraction=1.0):
-            if not math.isclose(
-                float(history_fraction), 1.0, rel_tol=0.0, abs_tol=1.0e-12
-            ):
-                raise ValueError(
-                    "GPU suite proxy evaluation does not support partial history"
-                )
+        def evaluate_proxy(candidates, *, screening=False):
             return _evaluate_gpu_suite_proxies(
                 evaluator_for_pool,
                 scenario_proxies,
                 candidates,
+                batch_compatible_scenarios=bool(screening_scenarios),
+                screening_scenarios=screening_scenarios if screening else (),
+                evaluation_stage="screening" if screening else "full",
             )
 
     else:
@@ -4704,16 +4877,7 @@ def run_backend(
         )
         profile_proxies = [proxy]
 
-        def evaluate_proxy(candidates, *, history_fraction=1.0):
-            if float(history_fraction) < 1.0:
-                history_start, trade_start = (
-                    proxy.recent_window_for_history_fraction(history_fraction)
-                )
-                return proxy.evaluate(
-                    candidates,
-                    history_start_step=history_start,
-                    trade_start_step=trade_start,
-                )
+        def evaluate_proxy(candidates, *, screening=False):
             return proxy.evaluate(candidates)
 
     def proxy_fitness(metric_rows: list[dict]) -> tuple[np.ndarray, np.ndarray]:
@@ -4988,7 +5152,7 @@ def run_backend(
     completed_hashes: set[str] = set()
     seed_bootstrap_payloads = {}
     seed_bootstrap_complete = seed_bootstrap_mode in {"none", "legacy"}
-    drift_monitor = _DriftMonitor(options)
+    drift_monitor = _DriftMonitor(options, objective_count=len(specs))
     persisted_halt_reason = None
     signature = _checkpoint_signature(
         active,
@@ -5022,12 +5186,8 @@ def run_backend(
             sig_digits=sig_digits,
             algorithm_contract=algorithm_contract,
             proxy_evaluation_policy=(
-                {
-                    **halving_policy,
-                    "history_window": "recent_suffix_v1",
-                }
-                if halving_policy["enabled"]
-                else None
+                {"kind": "scenario_screening_v1", **screening_policy}
+                if screening_scenarios else None
             ),
             seed_bootstrap_contract=seed_bootstrap_contract,
         ),
@@ -5108,6 +5268,7 @@ def run_backend(
                     stop_index=recorded_exact,
                     vector_from_entry=vector_from_entry,
                     hash_vector=vector_hash,
+                    objective_count=len(specs),
                 )
                 exact_done += recorded_exact - checkpoint_exact_total
             else:
@@ -5121,6 +5282,7 @@ def run_backend(
                     stop_index=recorded_exact,
                     vector_from_entry=vector_from_entry,
                     hash_vector=vector_hash,
+                    objective_count=len(specs),
                 )
                 seed_bootstrap_payloads.update(recovered_seed_payloads)
                 seed_exact_done += recorded_exact - checkpoint_exact_total
@@ -5313,7 +5475,7 @@ def run_backend(
         )
         seed_candidates = parameter_dicts(seed_rows)
         base_candidate = (
-            parameter_dicts(sampling[:1])[0] if not halving_policy["enabled"] else None
+            parameter_dicts(sampling[:1])[0] if not screening_scenarios else None
         )
         proxy_metric_rows, base_proxy_row, extra_base = _screen_seed_proxy_candidates(
             seed_candidates, base_candidate, evaluate_proxy
@@ -5347,7 +5509,7 @@ def run_backend(
             seed_proxy_violations,
             count=min(len(starting_vectors), population_size - 1),
         )
-        if not halving_policy["enabled"]:
+        if not screening_scenarios:
             # Exact preference can reorder the initial population, so retain
             # the union of both bounded selection sets, never the whole archive.
             reuse_indices = set(seed_population_indices) | set(seed_proxy_metrics)
@@ -5453,8 +5615,18 @@ def run_backend(
                                 proxy_violation, payload
                             )
                         )
+                        proxy_objectives, exact_objectives = _drift_objective_pair(
+                            objective_scale.normalize(
+                                _proxy_drift_objectives([seed_proxy_metrics[source_index]], specs)
+                            )[0],
+                            objective_scale.normalize(_exact_drift_objectives(payload))[0],
+                            objective_count=len(specs),
+                            allow_nonfinite=True,
+                        )
                         validation_metadata = {
-                            "schema_version": 2,
+                            "schema_version": 3,
+                            "proxy_objectives": proxy_objectives,
+                            "exact_objectives": exact_objectives,
                             "phase": "seed_bootstrap",
                             "proxy_score": proxy_score,
                             "exact_score": exact_score,
@@ -5475,6 +5647,8 @@ def run_backend(
                             probe=is_probe,
                             proxy_front=is_proxy_front,
                             constraint_mismatch=classification_mismatch,
+                            proxy_objectives=proxy_objectives,
+                            exact_objectives=exact_objectives,
                         )
                     seed_metadata = {
                         "schema_version": 1,
@@ -5630,11 +5804,19 @@ def run_backend(
             persistence_started = (
                 time.perf_counter() if profile_enabled else 0.0
             )
+            proxy_objectives, exact_objectives = _drift_objective_pair(
+                objective_scale.normalize(_proxy_drift_objectives([proxy_metrics], specs))[0],
+                objective_scale.normalize(_exact_drift_objectives(payload))[0],
+                objective_count=len(specs),
+                allow_nonfinite=True,
+            )
             record_exact(
                 vector,
                 payload,
                 validation_metadata={
-                    "schema_version": 2,
+                    "schema_version": 3,
+                    "proxy_objectives": proxy_objectives,
+                    "exact_objectives": exact_objectives,
                     "proxy_score": float(proxy_score),
                     "exact_score": exact_score,
                     "probe": bool(is_probe),
@@ -5669,6 +5851,8 @@ def run_backend(
                 probe=is_probe,
                 proxy_front=is_proxy_front,
                 constraint_mismatch=classification_mismatch,
+                proxy_objectives=proxy_objectives,
+                exact_objectives=exact_objectives,
             )
             status = drift_monitor.evaluate()
             if status["warn_reason"] and status["warn_reason"] != last_warning:
@@ -5724,33 +5908,34 @@ def run_backend(
             proxy_started = time.perf_counter() if profile_enabled else 0.0
             proxy_profile_records = []
 
-            def capture_halving_profile(rung, history_fraction, candidate_count):
+            def capture_screening_profile(stage, candidate_count):
                 if not profile_enabled:
                     return
                 for item in profile_proxies:
                     record = deepcopy(getattr(item, "last_profile", {}))
+                    if not record:
+                        continue
                     record.update(
-                        successive_halving_rung=int(rung),
-                        history_fraction=float(history_fraction),
-                        rung_candidate_count=int(candidate_count),
+                        evaluation_stage=stage,
+                        stage_candidate_count=int(candidate_count),
                     )
                     proxy_profile_records.append(record)
 
             seed_proxy_reused = 0
-            if halving_policy["enabled"]:
+            if screening_scenarios:
                 (
                     metric_rows,
                     proxy_objectives,
                     proxy_violations,
-                    full_rung_indices,
-                    halving_trace,
-                ) = _evaluate_successive_halving(
+                    full_suite_indices,
+                    screening_trace,
+                ) = _evaluate_scenario_screening(
                     proxy_candidates,
-                    policy=halving_policy,
+                    policy=screening_policy,
                     evaluate_proxy=evaluate_proxy,
                     proxy_fitness=proxy_fitness,
                     interrupt_check=interrupt_check,
-                    stage_callback=capture_halving_profile,
+                    stage_callback=capture_screening_profile,
                 )
             else:
                 if initial_seed_proxy_rows:
@@ -5764,31 +5949,31 @@ def run_backend(
                 else:
                     metric_rows = evaluate_proxy(proxy_candidates)
                 proxy_objectives, proxy_violations = proxy_fitness(metric_rows)
-                full_rung_indices = np.arange(len(rows), dtype=np.int64)
-                halving_trace = []
+                full_suite_indices = np.arange(len(rows), dtype=np.int64)
+                screening_trace = []
             proxy_seconds = (
                 time.perf_counter() - proxy_started if profile_enabled else 0.0
             )
             proxy_evaluations += (
-                sum(int(item["candidate_count"]) for item in halving_trace)
-                if halving_trace
+                sum(int(item["candidate_count"]) for item in screening_trace)
+                if screening_trace
                 else len(rows) - seed_proxy_reused
             )
-            if halving_trace:
+            if screening_trace:
                 logging.info(
-                    "GPU successive halving | gen=%d rungs=%s full_history=%d/%d",
+                    "GPU scenario screening | gen=%d stages=%s full_suite=%d/%d",
                     generation + 1,
                     ",".join(
-                        f"{item['history_fraction']:.0%}:{item['candidate_count']}"
-                        for item in halving_trace
+                        f"{item['stage']}:{item['candidate_count']}"
+                        for item in screening_trace
                     ),
-                    len(full_rung_indices),
+                    len(full_suite_indices),
                     len(rows),
                 )
             if objective_scale.median is None:
                 objective_scale.fit(
                     _proxy_drift_objectives(
-                        [metric_rows[i] for i in full_rung_indices], specs
+                        [metric_rows[i] for i in full_suite_indices], specs
                     )
                 )
             proxy_scores = objective_scale.score(
@@ -5822,16 +6007,16 @@ def run_backend(
                 int(options["validate_per_generation"]),
                 int(options["drift_probes"]),
             )
-            full_rung_selections = _select_validation_indices(
-                proxy_objectives[full_rung_indices],
-                proxy_scores[full_rung_indices],
-                proxy_violations[full_rung_indices],
+            full_suite_selections = _select_validation_indices(
+                proxy_objectives[full_suite_indices],
+                proxy_scores[full_suite_indices],
+                proxy_violations[full_suite_indices],
                 total=validation_count,
                 probes=probe_count,
             )
             selections = [
-                (int(full_rung_indices[index]), is_probe, is_proxy_front)
-                for index, is_probe, is_proxy_front in full_rung_selections
+                (int(full_suite_indices[index]), is_probe, is_proxy_front)
+                for index, is_probe, is_proxy_front in full_suite_selections
             ]
             while True:
                 try:
@@ -5890,7 +6075,7 @@ def run_backend(
                 generation_wall_seconds = (
                     time.perf_counter() - generation_profile_started
                 )
-                if not halving_policy["enabled"] and seed_proxy_reused < len(rows):
+                if not screening_scenarios and seed_proxy_reused < len(rows):
                     proxy_profile_records = [
                         deepcopy(getattr(item, "last_profile", {}))
                         for item in profile_proxies
@@ -5910,8 +6095,8 @@ def run_backend(
                     generation=generation,
                     population_size=len(rows),
                     seed_proxy_reused=seed_proxy_reused,
-                    successive_halving=halving_trace,
-                    full_history_candidate_count=len(full_rung_indices),
+                    screening=screening_trace,
+                    full_suite_candidate_count=len(full_suite_indices),
                     proxy_profiles=proxy_profile_records,
                     timings_seconds={
                         "nsga_ask": ask_seconds,

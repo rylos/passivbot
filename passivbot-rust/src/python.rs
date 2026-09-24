@@ -547,6 +547,19 @@ pub fn hsl_no_restart_triggered(
 }
 
 #[pyfunction]
+#[pyo3(signature = (enabled, balance, budget_divisor, upnl, threshold, unavailable_ms, grace_ms, missing_execution_history, realized_loss_since_peak=None))]
+pub fn hsl_emergency_signal(
+    enabled: bool, balance: f64, budget_divisor: usize, upnl: f64, threshold: f64,
+    unavailable_ms: u64, grace_ms: u64, missing_execution_history: bool,
+    realized_loss_since_peak: Option<f64>,
+) -> PyResult<(f64, f64, bool, bool)> {
+    let signal = ehsl::emergency_signal(enabled, balance, budget_divisor, upnl,
+        realized_loss_since_peak, threshold, unavailable_ms, grace_ms, missing_execution_history)
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    Ok((signal.budget, signal.drawdown_raw, signal.grace_elapsed, signal.should_exit))
+}
+
+#[pyfunction]
 #[pyo3(signature = (*, balance, n_positions, peak_realized, last_realized, current_upnl))]
 pub fn hsl_coin_drawdown_signal(
     py: Python<'_>,
@@ -1491,7 +1504,7 @@ fn run_backtest_core<'py>(
         let dict = item
             .downcast::<PyDict>()
             .map_err(|_| PyValueError::new_err("each bot_params element must be a dict"))?;
-        bot_params_vec.push(bot_params_pair_from_dict(dict)?);
+        bot_params_vec.push(bot_params_pair_from_dict(dict, backtest_params.equity_hard_stop_loss.revised.is_some())?);
     }
 
     let strategy_params_py_list_bound = strategy_params.downcast::<PyList>().map_err(|_| {
@@ -1853,6 +1866,12 @@ fn run_backtest_core<'py>(
         analysis_btc.calmar_ratio_strategy_eq_w = strategy.overall.calmar_ratio_strategy_eq_w;
         analysis_btc.sterling_ratio_strategy_eq_w = strategy.overall.sterling_ratio_strategy_eq_w;
 
+        if backtest_params.equity_hard_stop_loss.revised.is_some() {
+            for analysis in [&mut analysis_usd, &mut analysis_btc] {
+                analysis.drawdown_worst_ema_strategy_eq = strategy.overall.drawdown_worst_ema_strategy_eq;
+                analysis.drawdown_worst_mean_1pct_ema_strategy_eq = strategy.overall.drawdown_worst_mean_1pct_ema_strategy_eq;
+            }
+        }
         let analysis_dict_start = profile_start(profile_enabled);
         let py_analysis_usd = struct_to_py_dict(py, &analysis_usd)?;
         let py_analysis_btc = if skip_btc_analysis {
@@ -1860,16 +1879,33 @@ fn run_backtest_core<'py>(
         } else {
             struct_to_py_dict(py, &analysis_btc)?
         };
+        let revised_hsl_report = revised_hsl_report_to_py(py, &backtest)?;
+        if revised_hsl_report.is_some() {
+            // Removed trading tiers are absent, never constant zero objectives.
+            for analysis in [&py_analysis_usd, &py_analysis_btc] {
+                let dict = analysis.bind(py);
+                for key in dict.keys().iter() {
+                    let name: String = key.extract()?;
+                    if matches!(name.as_str(), "hard_stop_time_in_yellow_pct" | "hard_stop_time_in_orange_pct") {
+                        dict.del_item(key)?;
+                    }
+                }
+            }
+        }
         profile_add(
             &mut rust_profile,
             "rust_analysis_py_dict_ms",
             analysis_dict_start,
         );
         if metrics_only {
-            let py_extra = if profile_enabled {
-                let py_profile = profile_to_py_dict(py, &rust_profile, profile_total_start)?;
+            let py_extra = if profile_enabled || revised_hsl_report.is_some() {
                 let py_extra = PyDict::new_bound(py);
-                py_extra.set_item(RUST_PROFILE_KEY, py_profile)?;
+                if profile_enabled {
+                    py_extra.set_item(RUST_PROFILE_KEY, profile_to_py_dict(py, &rust_profile, profile_total_start)?)?;
+                }
+                if let Some(report) = &revised_hsl_report {
+                    py_extra.set_item("revised", report)?;
+                }
                 py_extra.into_py(py)
             } else {
                 py.None().into_py(py)
@@ -1913,6 +1949,9 @@ fn run_backtest_core<'py>(
             py_events_short.append(py_event)?;
         }
         let py_hard_stop_plot = PyDict::new_bound(py);
+        if let Some(report) = revised_hsl_report {
+            py_hard_stop_plot.set_item("revised", report)?;
+        }
         py_hard_stop_plot.set_item("timestamps_ms", hard_stop_plot_data.timestamps_ms)?;
         py_hard_stop_plot.set_item("drawdown_raw", hard_stop_plot_data.drawdown_raw)?;
         py_hard_stop_plot.set_item("timestamps_ms_long", hard_stop_plot_data.timestamps_ms_long)?;
@@ -1958,15 +1997,18 @@ fn run_backtest_core<'py>(
         }
 
         let strategy_equity_series = backtest.strategy_equity_series_for_artifacts();
+        let revised = backtest_params.equity_hard_stop_loss.revised.is_some();
+        if revised && strategy_equity_series.len() != equities.timestamps_ms.len() {
+            return Err(PyValueError::new_err("revised strategy-equity observations do not match equity timestamps"));
+        }
         let equities_array =
             Array2::from_shape_fn((equities.timestamps_ms.len(), 4), |(i, j)| match j {
                 0 => equities.timestamps_ms[i] as f64,
                 1 => equities.usd_total_equity[i],
                 2 => equities.btc_total_equity[i],
-                3 => strategy_equity_series
-                    .get(i)
-                    .copied()
-                    .unwrap_or(equities.usd_total_equity[i]),
+                3 => if revised { strategy_equity_series[i] } else {
+                    strategy_equity_series.get(i).copied().unwrap_or(equities.usd_total_equity[i])
+                },
                 _ => 0.0,
             })
             .into_pyarray_bound(py)
@@ -1991,6 +2033,43 @@ fn run_backtest_core<'py>(
             py_hard_stop_plot.into_py(py),
         ))
     })
+}
+
+/// Preserve the public report schema while avoiding a huge intermediate JSON tree.
+/// Static field names and enum strings are shared; each row/list remains independent.
+pub(crate) fn revised_hsl_report_to_py(py: Python<'_>, backtest: &Backtest<'_>) -> PyResult<Option<PyObject>> {
+    let Some(metadata) = backtest.revised_hsl_report_metadata().map_err(PyValueError::new_err)? else {
+        return Ok(None);
+    };
+    let report = json_value_to_py(py, &metadata)?;
+    let report_dict = report.bind(py).downcast::<PyDict>()?;
+    macro_rules! fields {
+        ($dict:ident, $row:ident, $($field:ident),+ $(,)?) => {
+            $($dict.set_item(pyo3::intern!(py, stringify!($field)), &$row.$field)?;)+
+        };
+    }
+    let samples = PyList::empty_bound(py);
+    for row in backtest.revised_hsl_samples() {
+        let dict = PyDict::new_bound(py);
+        fields!(dict, row, sequence, timestamp, side, coin, raw, ema, red_at, flat_at, reasons);
+        dict.set_item(pyo3::intern!(py, "phase"), pyo3::types::PyString::intern_bound(py, row.phase))?;
+        let action = row.action.map(|action| match action {
+            crate::hsl_revised_controller::Action::Normal => pyo3::intern!(py, "normal"),
+            crate::hsl_revised_controller::Action::Panic => pyo3::intern!(py, "panic"),
+            crate::hsl_revised_controller::Action::Halted => pyo3::intern!(py, "halted"),
+        });
+        dict.set_item(pyo3::intern!(py, "action"), action)?;
+        samples.append(dict)?;
+    }
+    let events = PyList::empty_bound(py);
+    for row in backtest.revised_hsl_events() {
+        let dict = PyDict::new_bound(py);
+        fields!(dict, row, sequence, observed_at, side, coin, kind, reconstructed_at, reason);
+        events.append(dict)?;
+    }
+    report_dict.set_item(pyo3::intern!(py, "samples"), samples)?;
+    report_dict.set_item(pyo3::intern!(py, "events"), events)?;
+    Ok(Some(report))
 }
 
 fn struct_to_py_dict<T: Serialize + ?Sized>(py: Python<'_>, obj: &T) -> PyResult<Py<PyDict>> {
@@ -2044,6 +2123,51 @@ fn json_value_to_py(py: Python<'_>, value: &Value) -> PyResult<PyObject> {
     })
 }
 
+fn revised_hsl_from_dict(dict: &PyDict) -> PyResult<crate::backtest::revised_runtime::Config> {
+    use crate::backtest::revised_runtime::{Config, Policy};
+    fn keys(dict: &PyDict, allowed: &[&str]) -> PyResult<()> {
+        for key in dict.keys().iter() {
+            let key: String = key.extract()?;
+            if !allowed.contains(&key.as_str()) {
+                return Err(PyValueError::new_err(format!("unknown revised HSL field: {key}")));
+            }
+        }
+        Ok(())
+    }
+    fn policy(dict: &PyDict) -> PyResult<Policy> {
+        keys(dict, &["enabled", "red_threshold", "ema_span_minutes", "cooldown_minutes_after_red",
+            "restart_after_red_policy", "panic_close_order_type"])?;
+        Ok(Policy {
+            enabled: extract_value(dict, "enabled")?,
+            red_threshold: extract_value(dict, "red_threshold")?,
+            ema_span_minutes: extract_value(dict, "ema_span_minutes")?,
+            cooldown_minutes_after_red: extract_value(dict, "cooldown_minutes_after_red")?,
+            restart_after_red_policy: extract_value(dict, "restart_after_red_policy")?,
+            panic_close_order_type: extract_value(dict, "panic_close_order_type")?,
+        })
+    }
+    fn pair(value: &PyAny) -> PyResult<[Policy; 2]> {
+        let items: Vec<&PyDict> = value.extract()?;
+        if items.len() != 2 {
+            return Err(PyValueError::new_err("revised HSL sides require exactly long and short"));
+        }
+        Ok([policy(items[0])?, policy(items[1])?])
+    }
+    keys(dict, &["engine", "mode", "sides", "portfolio", "coins"])?;
+    let portfolio: Option<&PyDict> = extract_value(dict, "portfolio")?;
+    let coins: &PyDict = extract_value(dict, "coins")?;
+    let mut coin_policies = std::collections::BTreeMap::new();
+    for (key, value) in coins.iter() {
+        coin_policies.insert(key.extract::<String>()?, pair(value)?);
+    }
+    Ok(Config {
+        mode: extract_value(dict, "mode")?,
+        sides: pair(extract_value::<&PyAny>(dict, "sides")?)?,
+        portfolio: portfolio.map(policy).transpose()?,
+        coins: coin_policies,
+    })
+}
+
 fn backtest_params_from_dict(dict: &PyDict) -> PyResult<BacktestParams> {
     let parse_hsl_cfg = |parent: &PyDict, key: &str| -> PyResult<EquityHardStopLossConfig> {
         let item = parent
@@ -2052,6 +2176,20 @@ fn backtest_params_from_dict(dict: &PyDict) -> PyResult<BacktestParams> {
         let cfg = item
             .downcast::<PyDict>()
             .map_err(|_| PyValueError::new_err(format!("{key} must be a dict")))?;
+        let engine = extract_optional_string(cfg, "engine", "legacy")?;
+        if engine == "revised" {
+            let revised = revised_hsl_from_dict(cfg)?;
+            // The legacy storage is inert when revised is Some. No removed
+            // policy is hydrated into the revised controller or producer payload.
+            return Ok(EquityHardStopLossConfig {
+                signal_mode: revised.mode.clone(),
+                revised: Some(revised),
+                ..EquityHardStopLossConfig::default()
+            });
+        }
+        if engine != "legacy" {
+            return Err(PyValueError::new_err("HSL engine must be legacy or revised"));
+        }
         let ratios_item = cfg.get_item("tier_ratios")?.ok_or_else(|| {
             PyValueError::new_err(format!("missing required key: {key}.tier_ratios"))
         })?;
@@ -2081,6 +2219,7 @@ fn backtest_params_from_dict(dict: &PyDict) -> PyResult<BacktestParams> {
             }
         }
         Ok(EquityHardStopLossConfig {
+            revised: None,
             enabled: extract_value(cfg, "enabled")?,
             signal_mode,
             red_threshold: extract_value(cfg, "red_threshold")?,
@@ -2098,7 +2237,7 @@ fn backtest_params_from_dict(dict: &PyDict) -> PyResult<BacktestParams> {
     };
     let hard_stop_cfg = parse_hsl_cfg(dict, "equity_hard_stop_loss")?;
 
-    Ok(BacktestParams {
+    let params = BacktestParams {
         starting_balance: extract_value(dict, "starting_balance")?,
         maker_fee: extract_value(dict, "maker_fee")?,
         taker_fee: extract_value(dict, "taker_fee")?,
@@ -2121,6 +2260,11 @@ fn backtest_params_from_dict(dict: &PyDict) -> PyResult<BacktestParams> {
         },
         metrics_only: dict
             .get_item("metrics_only")?
+            .map(|item| item.extract::<bool>())
+            .transpose()?
+            .unwrap_or(false),
+        hsl_detailed_report: dict
+            .get_item("hsl_detailed_report")?
             .map(|item| item.extract::<bool>())
             .transpose()?
             .unwrap_or(false),
@@ -2162,6 +2306,13 @@ fn backtest_params_from_dict(dict: &PyDict) -> PyResult<BacktestParams> {
             .map(|item| item.extract::<f64>())
             .transpose()?
             .unwrap_or(0.001),
+        // Legacy native payloads predate this optional simulation setting.
+        // Default only absence; explicit malformed values still fail below.
+        limit_order_fill_buffer_pct: dict
+            .get_item("limit_order_fill_buffer_pct")?
+            .map(|item| item.extract::<f64>())
+            .transpose()?
+            .unwrap_or(0.0),
         market_order_slippage_pct: dict
             .get_item("market_order_slippage_pct")?
             .map(|item| item.extract::<f64>())
@@ -2177,7 +2328,14 @@ fn backtest_params_from_dict(dict: &PyDict) -> PyResult<BacktestParams> {
             .map(|item| item.extract::<u64>())
             .transpose()?
             .unwrap_or(1), // default to 1m candles
-    })
+    };
+    crate::limit_fills::validate_buffer(params.limit_order_fill_buffer_pct)
+        .map_err(PyValueError::new_err)?;
+    if let Some(revised) = &params.equity_hard_stop_loss.revised {
+        revised.validate(&params.coins, params.pnls_max_lookback_days, params.candle_interval_minutes)
+            .map_err(PyValueError::new_err)?;
+    }
+    Ok(params)
 }
 
 fn exchange_params_from_dict(dict: &PyDict) -> PyResult<ExchangeParams> {
@@ -2194,10 +2352,10 @@ fn exchange_params_from_dict(dict: &PyDict) -> PyResult<ExchangeParams> {
     Ok(params)
 }
 
-fn bot_params_pair_from_dict(dict: &PyDict) -> PyResult<BotParamsPair> {
+fn bot_params_pair_from_dict(dict: &PyDict, revised: bool) -> PyResult<BotParamsPair> {
     Ok(BotParamsPair {
-        long: bot_params_from_dict(extract_value(dict, "long")?)?,
-        short: bot_params_from_dict(extract_value(dict, "short")?)?,
+        long: bot_params_from_dict(extract_value(dict, "long")?, revised)?,
+        short: bot_params_from_dict(extract_value(dict, "short")?, revised)?,
     })
 }
 
@@ -2437,7 +2595,7 @@ fn extract_optional_twel_enforcer_policy(dict: &PyDict) -> PyResult<TwelEnforcer
     })
 }
 
-fn bot_params_from_dict(dict: &PyDict) -> PyResult<BotParams> {
+fn bot_params_from_dict(dict: &PyDict, revised: bool) -> PyResult<BotParams> {
     let risk_wel_enforcer_threshold: f64 = extract_value(dict, "risk_wel_enforcer_threshold")?;
     let risk_twel_enforcer_threshold: f64 = extract_value(dict, "risk_twel_enforcer_threshold")?;
     let risk_we_excess_allowance_pct: f64 = extract_value(dict, "risk_we_excess_allowance_pct")?;
@@ -2445,24 +2603,48 @@ fn bot_params_from_dict(dict: &PyDict) -> PyResult<BotParams> {
     let wallet_exposure_limit_raw: f64 = extract_value(dict, "wallet_exposure_limit")?;
     let n_positions_float: f64 = extract_value(dict, "n_positions")?;
     let n_positions = n_positions_float.round() as usize;
-    let hsl_enabled: bool = extract_value(dict, "hsl_enabled")?;
-    let hsl_red_threshold: f64 = extract_value(dict, "hsl_red_threshold")?;
-    let hsl_ema_span_minutes: f64 = extract_value(dict, "hsl_ema_span_minutes")?;
-    let hsl_cooldown_minutes_after_red: f64 =
-        extract_value(dict, "hsl_cooldown_minutes_after_red")?;
-    let hsl_no_restart_drawdown_threshold: f64 =
-        extract_value(dict, "hsl_no_restart_drawdown_threshold")?;
-    let hsl_restart_after_red_policy: String =
-        extract_optional_string(dict, "hsl_restart_after_red_policy", "threshold")?;
-    let hsl_tier_ratios = dict
-        .get_item("hsl_tier_ratios")?
-        .ok_or_else(|| PyValueError::new_err("position missing 'hsl_tier_ratios'"))?
-        .downcast::<PyDict>()
-        .map_err(|_| PyValueError::new_err("hsl_tier_ratios must be a dict"))?;
-    let hsl_tier_ratio_yellow: f64 = extract_value(hsl_tier_ratios, "yellow")?;
-    let hsl_tier_ratio_orange: f64 = extract_value(hsl_tier_ratios, "orange")?;
-    let hsl_orange_tier_mode: String = extract_value(dict, "hsl_orange_tier_mode")?;
-    let hsl_panic_close_order_type: String = extract_value(dict, "hsl_panic_close_order_type")?;
+    let hsl = if revised {
+        for key in dict.keys().iter() {
+            if key.extract::<String>()?.starts_with("hsl_") {
+                return Err(PyValueError::new_err("revised HSL policies belong only in equity_hard_stop_loss"));
+            }
+        }
+        // Only the explicit revised scope policy can enable protective orders.
+        // Legacy HSL storage is unused, including in disabled revised scopes.
+        BotParams::default()
+    } else {
+        let hsl_enabled: bool = extract_value(dict, "hsl_enabled")?;
+        let hsl_red_threshold: f64 = extract_value(dict, "hsl_red_threshold")?;
+        let hsl_ema_span_minutes: f64 = extract_value(dict, "hsl_ema_span_minutes")?;
+        let hsl_cooldown_minutes_after_red: f64 =
+            extract_value(dict, "hsl_cooldown_minutes_after_red")?;
+        let hsl_no_restart_drawdown_threshold: f64 =
+            extract_value(dict, "hsl_no_restart_drawdown_threshold")?;
+        let hsl_restart_after_red_policy: String =
+            extract_optional_string(dict, "hsl_restart_after_red_policy", "threshold")?;
+        let hsl_tier_ratios = dict
+            .get_item("hsl_tier_ratios")?
+            .ok_or_else(|| PyValueError::new_err("position missing 'hsl_tier_ratios'"))?
+            .downcast::<PyDict>()
+            .map_err(|_| PyValueError::new_err("hsl_tier_ratios must be a dict"))?;
+        let hsl_tier_ratio_yellow: f64 = extract_value(hsl_tier_ratios, "yellow")?;
+        let hsl_tier_ratio_orange: f64 = extract_value(hsl_tier_ratios, "orange")?;
+        let hsl_orange_tier_mode: String = extract_value(dict, "hsl_orange_tier_mode")?;
+        let hsl_panic_close_order_type: String = extract_value(dict, "hsl_panic_close_order_type")?;
+        BotParams {
+            hsl_enabled,
+            hsl_red_threshold,
+            hsl_ema_span_minutes,
+            hsl_cooldown_minutes_after_red,
+            hsl_no_restart_drawdown_threshold,
+            hsl_restart_after_red_policy,
+            hsl_tier_ratio_yellow,
+            hsl_tier_ratio_orange,
+            hsl_orange_tier_mode,
+            hsl_panic_close_order_type,
+            ..BotParams::default()
+        }
+    };
     // Callers resolve live fixed denominators before building orchestrator input.
     // Preserve zero here: per-symbol zero is the explicit side-disable sentinel.
     let wallet_exposure_limit = wallet_exposure_limit_raw;
@@ -2535,16 +2717,16 @@ fn bot_params_from_dict(dict: &PyDict) -> PyResult<BotParams> {
         entry_eligible: extract_optional_bool(dict, "entry_eligible", true)?,
         ema_span_0: extract_optional_f64(dict, "ema_span_0")?,
         ema_span_1: extract_optional_f64(dict, "ema_span_1")?,
-        hsl_enabled,
-        hsl_red_threshold,
-        hsl_ema_span_minutes,
-        hsl_cooldown_minutes_after_red,
-        hsl_no_restart_drawdown_threshold,
-        hsl_restart_after_red_policy,
-        hsl_tier_ratio_yellow,
-        hsl_tier_ratio_orange,
-        hsl_orange_tier_mode,
-        hsl_panic_close_order_type,
+        hsl_enabled: hsl.hsl_enabled,
+        hsl_red_threshold: hsl.hsl_red_threshold,
+        hsl_ema_span_minutes: hsl.hsl_ema_span_minutes,
+        hsl_cooldown_minutes_after_red: hsl.hsl_cooldown_minutes_after_red,
+        hsl_no_restart_drawdown_threshold: hsl.hsl_no_restart_drawdown_threshold,
+        hsl_restart_after_red_policy: hsl.hsl_restart_after_red_policy,
+        hsl_tier_ratio_yellow: hsl.hsl_tier_ratio_yellow,
+        hsl_tier_ratio_orange: hsl.hsl_tier_ratio_orange,
+        hsl_orange_tier_mode: hsl.hsl_orange_tier_mode,
+        hsl_panic_close_order_type: hsl.hsl_panic_close_order_type,
         risk_entry_cooldown_minutes: extract_optional_f64(dict, "risk_entry_cooldown_minutes")?,
         n_positions,
         total_wallet_exposure_limit,
@@ -4292,6 +4474,17 @@ pub fn get_order_id_type_from_string_alias(name: &str) -> PyResult<u16> {
 }
 
 // -------- Orchestrator JSON API --------
+
+#[pyfunction]
+pub fn compute_protective_closes_json(input_json: &str) -> PyResult<String> {
+    let inputs: Vec<crate::orchestrator::ProtectiveCloseInput> =
+        serde_json::from_str(input_json)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    let orders = crate::orchestrator::compute_protective_closes(&inputs)
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    serde_json::to_string(&orders)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+}
 
 #[pyfunction]
 pub fn compute_ideal_orders_json(input_json: &str) -> PyResult<String> {

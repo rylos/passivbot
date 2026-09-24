@@ -1,5 +1,6 @@
 from copy import deepcopy
 
+from .gpu import GPU_SCREENING_DEFAULTS
 from .optimize_bounds import get_optimize_bounds_defaults
 from .strategy import get_all_strategy_defaults
 
@@ -158,16 +159,19 @@ def get_template_config():
                 ],
                 "filter_by_min_effective_cost": False,
                 "gap_tolerance_ohlcvs_minutes": 120,
+                "hsl_detailed_report": False,
                 "hlcvs_data_dir": None,
                 "hlcvs_data_override_mode": "intersection",
                 "liquidation_threshold": 0.05,
                 "maker_fee_override": 0.0004,
                 "market_order_slippage_pct": 0.0005,
+                "limit_order_fill_buffer_pct": 0.0,
                 "market_settings": {
                     "overrides": {},
                     "overrides_by_exchange": {}
                 },
                 "market_settings_sources": {},
+                "offline": False,
                 "ohlcv_source_dir": None,
                 "scenarios": [
                     {
@@ -430,7 +434,9 @@ def get_template_config():
                 "forced_mode_short": "",
                 "hedge_mode": False,
                 "hsl_accept_incomplete_history": False,
+                "hsl_unavailable_grace_seconds": 120.0,
                 "hsl_position_during_cooldown_policy": "panic",
+                "hsl_engine": "legacy",
                 "hsl_signal_mode": "coin",
                 "ignored_coins": {
                     "long": [],
@@ -529,6 +535,8 @@ def get_template_config():
                         "max_dispatch_candidate_bars": None,
                         "checkpoint_interval_seconds": 5.0,
                         "drift_halt": 0.6,
+                        "drift_rank_halt": None,
+                        "drift_objective_tolerance": 1.0e-6,
                         "drift_min_samples": 32,
                         "drift_probes": 4,
                         "drift_window": 128,
@@ -539,12 +547,7 @@ def get_template_config():
                             "max_exact": 128,
                             "mode": "auto",
                         },
-                        "successive_halving": {
-                            "enabled": False,
-                            "history_fractions": [0.25, 0.5, 1.0],
-                            "min_survivors": 64,
-                            "survival_fraction": 0.5,
-                        },
+                        "screening": deepcopy(GPU_SCREENING_DEFAULTS),
                         "validate_per_generation": 8
                     },
                     "pymoo": {

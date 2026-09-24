@@ -94,6 +94,7 @@ def _singleton_or_mapping(data: Any, *, endpoint: str) -> dict:
 class BitunixClient:
     """Minimal async Bitunix futures client with a CCXT-compatible live boundary."""
 
+    _position_fill_transport_guard = True
     id = "bitunix"
     name = "Bitunix"
     precisionMode = 4  # ccxt.TICK_SIZE
@@ -449,6 +450,8 @@ class BitunixClient:
         url = f"{self.rest_url}{path}" + (f"?{query}" if query else "")
         await self._throttle(cancel=cancel)
         session = await self._get_session()
+        from live.position_fill_sync import check_transport_admission
+        check_transport_admission(is_write=method.upper() != "GET")
         try:
             async with session.request(
                 method,
@@ -1181,7 +1184,11 @@ class BitunixClient:
         qty = abs(_float(row.get("qty"), field="fill.qty"))
         price = _float(row.get("price"), field="fill.price")
         timestamp = _int(row.get("ctime"), field="fill.ctime")
-        fee = _float(row.get("fee"), field="fill.fee", default=0.0)
+        fee = (
+            None
+            if row.get("fee") in (None, "")
+            else {"currency": "USDT", "cost": _float(row["fee"], field="fill.fee")}
+        )
         info = deepcopy(row)
         info["positionSide"] = pside.upper()
         info["reduceOnly"] = reduce_only
@@ -1197,8 +1204,8 @@ class BitunixClient:
             "price": price,
             "amount": qty,
             "cost": qty * price,
-            "fee": {"currency": "USDT", "cost": fee},
-            "fees": [{"currency": "USDT", "cost": fee}],
+            "fee": fee,
+            "fees": [fee] if fee is not None else None,
             "clientOrderId": str(row.get("clientId") or ""),
         }
 
@@ -1651,6 +1658,7 @@ class BitunixClient:
 class BitunixOrderStream:
     """Native private-order and multiplexed public-candle WebSocket boundary."""
 
+    _position_fill_transport_guard = True
     id = "bitunix"
     has = {"watchOrders": True, "watchOHLCV": True}
     PING_INTERVAL_SECONDS = 15.0
@@ -2295,6 +2303,13 @@ class BitunixBot(CCXTBot):
             return False
         return True
 
+    async def _prepare_protective_account(self) -> None:
+        # Ordinary mode writes require a funded balance. A restored reduce-only
+        # exit needs only proof that the existing account is already in hedge mode.
+        current = await self.cca.fetch_position_mode()
+        if current.get("hedged") is not True:
+            raise RuntimeError("Bitunix protective startup requires existing hedge position mode")
+
     async def update_exchange_config(self) -> None:
         current = await self.cca.fetch_position_mode()
         if current.get("hedged") is True:
@@ -2408,10 +2423,3 @@ class BitunixBot(CCXTBot):
         if position_side not in {"long", "short"}:
             raise ValueError("Bitunix fill missing explicit LONG/SHORT positionSide")
         return position_side
-
-    async def close(self) -> None:
-        self.stop_data_maintainers()
-        if self.ccp is not None:
-            await self.ccp.close()
-        await self.cca.close()
-        self._close_live_event_pipeline(timeout=2.0)

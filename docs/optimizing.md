@@ -498,6 +498,8 @@ change; old screening checkpoints are incompatible.
 
 The following boundaries are intentional rather than silent fallbacks:
 
+- `backtest.limit_order_fill_buffer_pct` must be zero. Use a CPU optimizer (`pymoo` or `deap`) for nonzero limit-fill buffers; the GPU screening model does not implement them.
+
 - `trailing_grid_v7` is outside the Apple MPS implementation. Use `optimize.backend: "pymoo"` or
   `"deap"` for it; GPU optimization never substitutes EMA Anchor or Trailing Martingale behavior.
 - `backtest.btc_collateral_cap` must be zero. Positive BTC collateral changes the simulated
@@ -720,7 +722,7 @@ The backend is hybrid rather than a replacement backtester:
 4. Diverse proxy-front candidates and broad drift probes are sent to the unchanged Rust backtester.
 5. Only exact Rust results enter `all_results.bin` and the persisted Pareto front.
 6. Rolling rank and constraint-agreement gates independently stop the run if proxy/exact agreement
-   falls below `drift_halt` after sufficient evidence. Constraint classification is monitored over
+   falls below their thresholds after sufficient evidence. Constraint classification is monitored over
    all validations and independently for proxy-front candidates and broad probes. An isolated
    disagreement is retained as drift evidence rather than aborting immediately; the exact Rust
    result remains authoritative and an exact-infeasible candidate cannot enter the Pareto front.
@@ -728,6 +730,11 @@ The backend is hybrid rather than a replacement backtester:
    gates, so rank correlation uses only classification-agreeing samples and requires at least eight
    comparable broad probes. Window and exact-budget validation reserve enough total probes to retain
    those eight whenever the configured probe constraint-agreement gate has not already failed.
+   A low or undefined scalar rank can instead be explained by complete per-objective evidence:
+   every objective must either agree within `drift_objective_tolerance` or have non-flat proxy
+   and exact values whose rank correlation meets the rank threshold. This handles near-ties and
+   cancellation between opposing objectives without excusing a flat proxy against meaningfully
+   varying exact results. The continuation is logged; constraint gates remain independent.
 
 `optimize.iters` remains the number of evolutionary exact Rust validations. Any exact seed-
 bootstrap evaluations are additional and are reported separately. GPU screening counts and
@@ -746,6 +753,8 @@ GPU-specific settings live under `optimize.gpu`:
       "max_dispatch_candidate_bars": null,
       "checkpoint_interval_seconds": 5.0,
       "drift_halt": 0.6,
+      "drift_rank_halt": null,
+      "drift_objective_tolerance": 0.000001,
       "drift_min_samples": 32,
       "drift_probes": 4,
       "drift_window": 128,
@@ -756,11 +765,10 @@ GPU-specific settings live under `optimize.gpu`:
         "max_exact": 128,
         "mode": "auto"
       },
-      "successive_halving": {
-        "enabled": false,
-        "history_fractions": [0.25, 0.5, 1.0],
+      "screening": {
+        "scenarios": [],
         "min_survivors": 64,
-        "survival_fraction": 0.5
+        "survival_fraction": 0.1
       },
       "validate_per_generation": 8
     }
@@ -814,7 +822,7 @@ duplicate-elimination controls as the ordinary pymoo optimizer.
   active-volatility kernels, nor to kernels with optional metric feature paths enabled.
 - `seed_bootstrap.mode` controls `-t/--start` handling. `auto` exact-evaluates all deduplicated seeds
   up to `seed_bootstrap.max_exact`, then switches to full-history proxy screening plus capped exact
-  validation for larger pools. With successive halving disabled, screened seeds reuse their
+  validation for larger pools. With scenario screening disabled, screened seeds reuse their
   full-history proxy metrics in the initial population. This bounded cache survives resume and is
   released after the initial population completes; exact validation still runs normally. The
   initial base-config candidate is screened alongside the seeds, without entering seed ranking
@@ -827,21 +835,28 @@ duplicate-elimination controls as the ordinary pymoo optimizer.
   evolutionary exact-validation budget. Checkpoints preserve incomplete bootstrap plans and can
   recover a seed result durably flushed immediately before a restart. Anchored fine-tune context
   is checkpoint-owned as well, so resume does not require the original starting-config files.
-- `successive_halving.enabled` opts a non-suite, single-coin Trailing Martingale run into
-  progressively longer recent-history suffixes. The default `history_fractions` are 25%, 50%, and
-  100%, measured backwards from the configured end date; each partial suffix receives the normal
-  indicator warmup immediately before its scoring boundary. After each partial rung,
-  constraint-aware Pareto selection retains `survival_fraction` (50% by default), subject to
-  `min_survivors` (64 by default). With the default 1024 population this means 1024 candidates on
-  the most recent 25%, 512 on the most recent 50%, and 256 on full history. Shorter rungs use the
-  same 500 million candidate-bars safety envelope, so they can safely dispatch more candidates
-  together; the cap itself is not raised. Partial-rung rows are marked ineligible in NSGA-II, and
-  only the full-history survivors may enter exact Rust validation, proxy-front selection, broad
-  probes, or drift evidence. The ladder remains disabled by default because it trades some search
-  breadth for throughput and deliberately biases early filtering toward recent market behavior.
-  The suffix-window semantics are included in checkpoint identity, so checkpoints made with the
-  former prefix behavior do not resume. EMA Anchor, multicoin, and suite runs fail closed if this
-  opt-in is requested.
+- `screening.scenarios` selects the suite scenario labels used for one broad GPU screening
+  pass. The default `[]` disables screening. A non-empty list requires suite mode and must
+  include any scenario explicitly selected by an objective or limit. Each scenario uses its
+  complete configured date range and normal indicator warmup; there are no implicit history
+  fractions. Reducers and limits operate on the subset for promotion only.
+  Constraint-aware, Pareto-diverse selection retains `survival_fraction` (10% by default),
+  rounded up and subject to `min_survivors` (64 by default), capped at the candidate count.
+  With 1024 candidates, defaults retain 103. The minimum must cover `validate_per_generation`.
+  Survivors are rescored across the complete suite on the GPU before exact Rust validation.
+  Only those full-suite rows enter exact selection, proxy-front evidence, broad probes, or
+  drift comparisons. Seed bootstrap still evaluates the complete suite.
+  Screening supports GPU-supported suite strategies, including EMA Anchor and Trailing
+  Martingale. Compatible single-side multicoin Trailing Martingale scenarios share batches
+  during screening and full evaluation; device dispatch limits remain unchanged.
+  Runs without screening retain their existing batching. General evaluator compatibility
+  rules still apply when resuming checkpoints across code updates.
+  Screening labels and promotion settings are part of checkpoint identity, alongside scenario
+  dates and runtime settings. Changing that policy requires a fresh optimization.
+  Choose representative scenarios: aggressive screening can discard candidates that perform
+  well elsewhere. Compare useful exact results per hour and missed good candidates; reduced
+  candle work is not a measured speedup. `PYTHONPATH=src python -m tools.gpu_suite_benchmark`
+  provides a bounded synthetic comparison of separate and combined survivor batches.
 - `validate_per_generation` caps exact candidates selected from each proxy generation.
 - `drift_probes` reserves at least part of that validation budget for candidates away from the
   proxy front.
@@ -850,10 +865,32 @@ duplicate-elimination controls as the ordinary pymoo optimizer.
   true-front candidates. Front members are never relabeled as broad probes. The separate broad-
   probe gates activate only after enough truthful off-front evidence has accumulated; allocation
   shortfalls and recovery are logged.
-- `drift_window`, `drift_min_samples`, and `drift_halt` configure the rolling rank and optimizer-
-  limit classification safety gates. Broad-probe Spearman correlation plus aggregate,
-  proxy-front, and broad-probe constraint agreement must each remain at or above `drift_halt`.
-  `drift_halt` must be greater than zero and at most one.
+- `drift_window` and `drift_min_samples` configure the rolling evidence window. `drift_halt`
+  controls optimizer-limit classification agreement and, for compatibility, the rank threshold
+  when `drift_rank_halt` is `null`. Set `drift_rank_halt` to change rank sensitivity independently;
+  it does not change constraint thresholds or their evidence budgets. Both thresholds must be
+  greater than zero and at most one. Aggregate, proxy-front, and broad-probe constraint agreement
+  must each remain at or above `drift_halt`.
+  Scalar broad-probe Spearman below the rank threshold (or undefined for constant values) halts
+  unless every rank-comparable probe has per-objective evidence and every objective passes the
+  check described above. `drift_objective_tolerance` defaults to `0.000001` and must be finite and
+  non-negative. It is an absolute error allowance in the fixed initial objective-scale units
+  (normally each objective's initial interquartile range), not a percentage of profit or a
+  dynamically widened tolerance as the population converges. Zero requires identical objective
+  values for the small-error exception. The alternative rank check requires both objective
+  ranges to exceed that tolerance, so constant biased values cannot pass on absent rank signal.
+  Diagnostics report scalar and per-objective ranges, maximum absolute errors, correlations,
+  sample counts, and both thresholds. Objective indices follow configured scoring order,
+  including repeated scenario objectives. Broad probes sample the current off-front population;
+  they are not independent draws across the original search bounds.
+  New `metrics.gpu_validation` records persist the ordered normalized proxy/exact objective
+  vectors as schema 3, in both seed screening and evolutionary validation. Checkpoints and
+  durable-tail recovery retain this evidence and validate its length against configured scoring.
+  Supported non-finite metric sentinels keep their existing conservative scalar scores; schema 3
+  records mark both objective vectors `null` and cannot enable the per-objective exception.
+  Legacy schema 2 records have only scalar evidence
+  and cannot enable the per-objective exception. A checkpoint already halted by its safety gate
+  remains halted; exact Pareto results can seed a fresh run after investigating the disagreement.
   At least eight samples of a validation class are required before its independent low agreement
   can halt a run, so `drift_window` and `optimize.iters` must be large enough to retain and reach
   eight true proxy-front validations even when the complete feasible proxy front contributes only
@@ -900,6 +937,49 @@ remain the only stored optimization results. The screening source is owned and e
 Rust extension; it does not replace or modify the exact Rust backtester. Credit: the Torch
 metric-reduction work was adapted from RustyCZ's Passivbot GPU branch at commit `7c529bc73`; the
 MPS Metal integration and hybrid validation gates are specific to this implementation.
+
+#### GPU scenario screening
+
+Define screening workloads as ordinary scenarios and reference their labels:
+
+```json
+{
+  "backtest": {
+    "suite_enabled": true,
+    "end_date": "2024-07-01",
+    "scenarios": [
+      {"label": "recent", "start_date": "2024-01-01"},
+      {"label": "long_history", "start_date": "2022-01-01"}
+    ]
+  },
+  "optimize": {
+    "backend": "gpu",
+    "gpu": {
+      "screening": {
+        "scenarios": ["recent"],
+        "survival_fraction": 0.1,
+        "min_survivors": 64
+      }
+    }
+  }
+}
+```
+
+This is a configuration fragment, to merge into a strategy config. Every scenario, including
+`recent`, remains part of the final suite and its reducers. There is no separate validation-only
+or screening-only scenario registry. Screening does not create an independent holdout test.
+Use `--optimize.gpu.screening.scenarios '["recent"]'` to select a scenario from the CLI;
+use `[]` to disable screening.
+
+**Migrating `successive_halving`:** disabled legacy blocks (including blocks with no `enabled`
+field) are removed with a warning during config loading/formatting. Existing new screening
+settings are preserved. Saving the normalized config removes the warning. Enabled legacy blocks
+stop config preparation with an actionable error, including for backtests: fractional windows
+cannot be translated into explicit dates without choosing new search semantics. Define the
+scenario dates you want, enable suite mode, select screening labels, copy `survival_fraction`
+and `min_survivors` if desired, and remove the old block. Remove the block and leave
+`screening.scenarios=[]` if you want screening disabled instead. Start a new optimization;
+checkpoints from enabled successive halving are incompatible with scenario screening.
 
 #### Profiling Apple MPS optimization
 

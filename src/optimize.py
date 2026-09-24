@@ -738,6 +738,10 @@ def _record_individual_result(individual, evaluator_config, overrides_list, reco
     config = individual_to_config(individual, optimizer_overrides, overrides_list, evaluator_config)
     anchor_meta = config.get("_optimizer_anchor")
     entry = clean_config(strip_config_metadata(config))
+    # Prepared dataset membership is result provenance, not user configuration.
+    # Cleaning strips it, but single-run resume compares the exact membership.
+    if "coins" in config.get("backtest", {}):
+        entry["backtest"]["coins"] = deepcopy(config["backtest"]["coins"])
     entry[CONTRACT_KEY] = recorded_evaluation_contract(evaluator_config)
     if anchor_meta is not None:
         entry["optimizer_anchor"] = anchor_meta
@@ -764,6 +768,9 @@ def _resume_config_mismatches(entry: dict, config: dict) -> list[str]:
         if any(alias in section for alias in REDUCER_ALIASES):
             canonicalize_reducer_mapping(section, path=path)
 
+    # Released configurations without this setting used strict crossing at zero.
+    old_bt.setdefault("limit_order_fill_buffer_pct", 0.0)
+    new_bt.setdefault("limit_order_fill_buffer_pct", 0.0)
     old_opt = _canonicalize_resume_optimize(entry.get("optimize") or {})
     new_opt = _canonicalize_resume_optimize(config.get("optimize") or {})
     old_bot = entry.get("bot", entry) or {}
@@ -788,6 +795,7 @@ def _resume_config_mismatches(entry: dict, config: dict) -> list[str]:
         "liquidation_threshold",
         "maker_fee_override",
         "market_order_slippage_pct",
+        "limit_order_fill_buffer_pct",
         "market_settings",
         "market_settings_sources",
         "ohlcv_source_dir",
@@ -883,6 +891,13 @@ def _resume_config_mismatches(entry: dict, config: dict) -> list[str]:
 
 def _canonicalize_resume_optimize(section: dict) -> dict:
     normalized = deepcopy(section)
+    if normalized.get("backend") == "gpu" and isinstance(normalized.get("gpu"), dict):
+        from optimization.backends.gpu_backend import GPU_DEFAULTS
+
+        # These additive options preserve the legacy gates when omitted. Do not
+        # normalize other policy differences or erase explicit non-default values.
+        for key in ("drift_rank_halt", "drift_objective_tolerance"):
+            normalized["gpu"].setdefault(key, GPU_DEFAULTS[key])
     if "scoring" in normalized:
         normalized["scoring"] = [
             spec.to_config() for spec in extract_objective_specs(normalized["scoring"])
@@ -1185,6 +1200,8 @@ def ea_mu_plus_lambda_stream(
             on_result=_on_result,
             on_interrupt=_on_interrupt,
             max_pending=max_pending_evals,
+            progress_label="Optimizer population",
+            progress_total=len(individuals),
         )
 
         total_evals += completed["count"]
@@ -1693,6 +1710,11 @@ class Evaluator:
             self.key_paths,
             overrides_list,
         )
+        from config.hsl_revised import validate_optimizer_metrics
+        validate_optimizer_metrics(config, [
+            *(spec.metric for spec in self.scoring_specs),
+            *(check["metric"] for check in self.limit_checks),
+        ], markets_by_exchange=self.msss)
         individual_hash = calc_hash(individual)
         if self.use_duplicate_guard:
             if individual_hash in self.seen_hashes:
@@ -2113,6 +2135,14 @@ class SuiteEvaluator:
 
         if unstuck_ema_spans_coupled(scenario_config):
             scenario_config = apply_coupled_unstuck_ema_spans(deepcopy(scenario_config))
+        from config.hsl_revised import engine, validate_optimizer_metrics
+        if engine(scenario_config) == "revised":
+            validate_optimizer_metrics(scenario_config, [
+                *(spec.metric for spec, basis in zip(self.base.scoring_specs, self.objective_bases)
+                  if basis.scenario is None or basis.scenario == ctx.label),
+                *(check["metric"] for check in self.base.limit_checks
+                  if check.get("scenario") is None or check["scenario"] == ctx.label),
+            ], markets_by_exchange=ctx.msss)
         return scenario_config
 
     def _build_scenario_candidate_config(
@@ -3480,6 +3510,8 @@ async def main():
         verbose=False,
         raw_snapshot=raw_snapshot,
     )
+    from config.hsl_revised import require_runtime_support
+    require_runtime_support(config, supported_modes=("coin", "pside", "unified"))
     config = parse_overrides(config, verbose=False)
     validate_optimizer_overrides(config.get("optimize", {}).get("enable_overrides", []))
     if "couple_unstuck_ema_spans" in (

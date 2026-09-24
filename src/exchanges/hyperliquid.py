@@ -16,6 +16,7 @@ from live.balance_composition import (
     normalize_hyperliquid_unified_balance_composition,
 )
 from passivbot import logging
+from live import hsl_revised_live
 from passivbot_exceptions import FatalBotException
 from utils import MarketIdentifierResolutionError, symbol_to_coin, ts_to_date, utc_ms
 from config.access import require_live_value
@@ -1415,18 +1416,51 @@ class HyperliquidBot(CCXTBot):
         self._hl_balance_consumed = False
         return deepcopy(raw_snapshot), deepcopy(positions), float(balance)
 
+    async def _fetch_protective_positions(self) -> list:
+        """Read core and HIP-3 exposure without consuming account balance/equity."""
+        tasks = [
+            asyncio.create_task(self.cca.fetch_positions()),
+            asyncio.create_task(self._fetch_hip3_positions()),
+        ]
+        try:
+            core, hip3 = await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        positions = {}
+        for raw in core:
+            normalized = self._normalize_ccxt_position(raw)
+            if self._get_hl_dex_for_symbol(normalized["symbol"]):
+                continue
+            self._record_hl_live_margin_mode(
+                normalized["symbol"], normalized.get("margin_mode")
+            )
+            positions[(normalized["symbol"], normalized["position_side"])] = normalized
+        for normalized in hip3:
+            positions[(normalized["symbol"], normalized["position_side"])] = normalized
+        return list(positions.values())
+
     async def capture_authoritative_state_staged_snapshot(
         self, plan: set[str], timings_ms: dict[str, int]
     ) -> dict | None:
         """Fetch Hyperliquid authoritative staged surfaces using coherent account cohorts."""
         out = {"plan": set(plan), "pnls_ok": True}
         tasks = {}
-        if "balance" in plan or "positions" in plan:
+        if "balance" in plan:
             tasks["positions_balance"] = asyncio.create_task(
                 self._timed_authoritative_fetch(
                     "positions_balance",
                     self._capture_positions_balance_staged_snapshot(),
                     timings_ms,
+                )
+            )
+        elif "positions" in plan:
+            tasks["positions"] = asyncio.create_task(
+                self._timed_authoritative_fetch(
+                    "positions", self._fetch_protective_positions(), timings_ms,
                 )
             )
         if "open_orders" in plan:
@@ -1463,6 +1497,8 @@ class HyperliquidBot(CCXTBot):
                         out["balance_composition"] = malformed_balance_composition(
                             source="normalizer", reason="normalizer_error"
                         )
+            elif key == "positions":
+                out["positions"] = result
             elif key == "open_orders":
                 out["open_orders"] = result
             elif key == "fills":
@@ -1689,6 +1725,7 @@ class HyperliquidBot(CCXTBot):
             elm["position_side"] = "long" if "long" in elm["info"]["dir"].lower() else "short"
         return sorted(fetched, key=lambda x: x["timestamp"])
 
+    @hsl_revised_live.connector_write("cancel")
     async def execute_cancellation(self, order: dict) -> dict:
         """Hyperliquid: Cancel order with vault support."""
         params = (

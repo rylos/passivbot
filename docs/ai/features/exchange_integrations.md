@@ -257,8 +257,12 @@ Handling:
    the requested range. Promote the exact omission to verified no-trade continuity only if one
    successful raw payload returns both boundaries and no row inside the gap. This contextual proof
    may repair an older persistent `fetch_failed` gap. Empty, one-sided, malformed, or partially
-   recovered responses remain unavailable, preserve persistent gap status, and restart the
-   persistent retry cooldown rather than issuing another contextual request on every candle read.
+   recovered responses remain unavailable, preserve persistent gap status, and start a five-minute
+   contextual-proof cooldown rather than issuing another request on every candle read. Adjacent
+   records retain independent retry clocks; all unverified fragments of the proof window must be
+   eligible and both real bounds must fit one request page. Wider gaps retain ordinary repair
+   instead of repeated short-cooldown proof attempts. Ordinary missing-range retry timing remains
+   unchanged.
 
 ## Bitget Futures
 
@@ -559,6 +563,12 @@ fanning out one depth request per market or substituting bid/ask for a last trad
 are explicitly disabled, live market snapshots select this targeted REST path directly without
 opening or waiting for a public ticker socket; unbounded bulk requests and requests above the
 eight-symbol limit fail closed.
+
+Live snapshots default to targeted ticker reads even with WebSockets enabled. Only requested
+symbols participate in the bounded readiness wait, so an unrelated silent market cannot delay
+protection of a held position. This still uses the shared websocket cache and retains its freshness
+checks and capped depth fallback. An explicit `market_snapshot_ticker_strategy=bulk` remains an
+operator override.
 
 Bitunix klines return at most 200 rows. The live field names are inverted relative to their units:
 `quoteVol` is base quantity and `baseVol` is quote notional; normalize `quoteVol` as CCXT base

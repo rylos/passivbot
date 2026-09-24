@@ -138,21 +138,28 @@ def test_changed_contract_blocks_checkpoint_fitness_reuse(tmp_path):
 
 
 @pytest.mark.parametrize("backend", ["deap", "pymoo"])
+@pytest.mark.parametrize("mode", ["legacy", "coin", "pside", "unified"])
+@pytest.mark.parametrize("suite", [False, True])
 def test_result_writers_persist_contract_before_candidate_projection(
-    backend, monkeypatch
+    backend, mode, suite, monkeypatch
 ):
     from types import SimpleNamespace
     import optimize
     from optimization.callback import build_pymoo_record_entry
 
     config = _config()
+    if mode != "legacy":
+        from config.hsl_revised import generated_template
+        config = generated_template(config, mode)
+    config["backtest"]["coins"] = {"binance": ["BTC", "ETH"]}
+    metrics = {"suite_metrics": {"scenario": {}}} if suite else {}
     candidate = deepcopy(config)
     candidate["bot"]["long"]["risk"]["entry_cooldown_minutes"] = 37.0
     build = lambda *args, **kwargs: deepcopy(candidate)
     if backend == "pymoo":
         entry = build_pymoo_record_entry(
             vector=[37.0],
-            metrics={},
+            metrics=metrics,
             template=config,
             build_config_fn=build,
             overrides_fn=None,
@@ -161,7 +168,7 @@ def test_result_writers_persist_contract_before_candidate_projection(
         monkeypatch.setattr(optimize, "individual_to_config", build)
         entries = []
         optimize._record_individual_result(
-            SimpleNamespace(evaluation_metrics={}),
+            SimpleNamespace(evaluation_metrics=metrics),
             config,
             [],
             SimpleNamespace(record=entries.append),
@@ -169,6 +176,12 @@ def test_result_writers_persist_contract_before_candidate_projection(
         entry = entries[0]
     assert entry[CONTRACT_KEY] == build_evaluation_contract(config)
     assert optimize._resume_config_mismatches(entry, config) == []
+    if suite:
+        assert "coins" not in entry["backtest"]
+    else:
+        assert entry["backtest"]["coins"] == config["backtest"]["coins"]
+        config["backtest"]["coins"]["binance"].remove("ETH")
+        assert any("backtest.coins" in diff for diff in optimize._resume_config_mismatches(entry, config))
 
 
 def test_added_fixed_backtest_settings_do_not_evade_legacy_comparison():
@@ -296,6 +309,24 @@ def test_gpu_runtime_settings_retain_documented_strict_resume_comparison():
     old = _record(config)
     config["optimize"]["gpu"]["exact_workers"] = 987
     assert any("gpu" in item for item in _resume_config_mismatches(old, config))
+
+
+@pytest.mark.parametrize("legacy_halt", [0.6, 0.8])
+def test_gpu_resume_accepts_missing_additive_drift_defaults(legacy_halt):
+    from optimize import _resume_config_mismatches
+
+    config = _config()
+    config["optimize"]["backend"] = "gpu"
+    config["optimize"]["gpu"]["drift_halt"] = legacy_halt
+    old = _record(config)
+    del old["optimize"]["gpu"]["drift_rank_halt"]
+    del old["optimize"]["gpu"]["drift_objective_tolerance"]
+    assert _resume_config_mismatches(old, config) == []
+    assert "drift_rank_halt" not in old["optimize"]["gpu"]
+    for key, value in (("drift_rank_halt", 0.5), ("drift_objective_tolerance", 0.1)):
+        changed = deepcopy(config)
+        changed["optimize"]["gpu"][key] = value
+        assert any("gpu" in item for item in _resume_config_mismatches(old, changed))
 
 
 @pytest.mark.parametrize("backend", ["deap", "pymoo"])
