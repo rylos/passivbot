@@ -119,3 +119,24 @@ aggiornati a mano i default degli input.
 - La volatilità 1h auto-calcolata è sottostimata (TradingView ha poca storia
   oraria rispetto allo span di 1562 h del bot): impostarla a mano. Il 2026-09-23
   il valore 0,0198 riproduceva esattamente il prossimo ordine DCA del bot (92,32).
+
+## report/update_art.py
+
+Rigenera le due pagine backtest su claude.ai (ry-hl
+`https://claude.ai/artifact/Rpsfu37PUgyZebEA2z1PYn`, ry-bybit
+`https://claude.ai/artifact/1uEigwyfEircREnHdjqP3H`) partendo dall'HTML già
+pubblicato, che fa da template (stile, grafici, parametri).
+
+1. Su debian: backtest delle config live (`bot.long` preso da amazon) nel
+   worktree `~/passivbot-up`, config in `configs/buf/<nome>_<buffer>[_variante].json`,
+   risultati in `backtests_buf/`. Nomi attesi: `hl_0.0`, `bybit_0.0` (completi) e
+   opzionali `_0.0001`, `_0.0005`, varianti `_twel25`, `_twel2`, `_hsl`.
+2. Copiare i risultati in locale (per `*_0.0` servono `analysis.json`,
+   `balance_and_equity.csv.gz`, `config.json`, `fills.csv`; per gli altri basta
+   `analysis.json`).
+3. Leggere le due pagine con Artifact `read` (salva l'HTML completo) e lanciare:
+   `python3 ops/report/update_art.py --template-hl <hl.html> --template-bybit <bybit.html> --art <dir> --end AAAA-MM-GG --generated GG/MM/AAAA --out <dir>`
+4. Ripubblicare `art_hl.html` / `art_bybit.html` sugli stessi URL.
+
+Il testo sull'episodio del 2 aprile 2025 nella sezione "Sensibilità ai fill" è
+fisso: se un nuovo backtest cambia il quadro, va aggiornato nello script.
