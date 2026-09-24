@@ -66,3 +66,10 @@ Sostituisce il bot freqtrade RyLoS T4G sullo stesso account (`bybit_02`, unified
 - Al primo avvio il bot ha letto 123 fill storici (+1.210 USDT, sono i trade di freqtrade) e `[candle] HYPE 1h missing=314`: l'EMA di volatilità a 1825 h parte non convergente, come su HL a ogni riavvio.
 - Rischio noto del candidato (suite a 19): dd max 38% in giugno 2026 su tutte e tre le partizioni, 7,1 giorni; adg 0,79% contro 0,985% del live HL. Test della quarta partizione (+75 g) ancora da fare a fine r4e.
 - Monitoraggio: `watchdog.py bybit` (cron `3-59/10`), `trade_report.py bybit` (cron `*/2`), flag `~/watchdog/bybit_maintenance`, healthchecks = check ex-freqtrade (`HC_FREQTRADE`). Notifiche Telegram con prefisso `ry-bybit`.
+
+## Profilo di rischio delle config live (analisi 2026-09-24)
+Dai fill dei backtest su dati bybit 2024-12-05 → 2026-09-13 (debian, `backtests/bybit/2026-09-14T18_35_31` = config ry-hl, `…18_35_43` = config ry-bybit; differiscono dal live solo per enforcer 1,001 e pesi forager normalizzati):
+- ry-hl: 1188 cicli, 99,5% vincenti, +0,40% medio, perdita chiusa peggiore −0,32%, dd aperto 21,5%, held max 1,6 g, adg 0,74%.
+- ry-bybit: 1182 cicli, 99,4% vincenti, +0,47% medio, perdita peggiore −0,72%, dd aperto 24,5%, held max 2,1 g, adg 0,86%.
+- Le perdite chiuse sono trascurabili (somma −1,1% contro +551% su bybit): **il rischio è il drawdown a posizione aperta** (crollo senza rimbalzo a esposizione piena), non la perdita per trade. Non stimare "win rate di pareggio" supponendo chiusure a −20/−30%: nel backtest non esistono.
+- Indicatore TradingView della config ry-bybit: `ops/tradingview/rylos_bybit.pine` (istruzioni in `ops/README.md`).
