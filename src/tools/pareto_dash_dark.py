@@ -949,6 +949,14 @@ def serve_dash(data_root: str, host: str = "127.0.0.1", port: int = 8050):
                                 value=run_dirs[-1],
                                 clearable=False,
                             ),
+                            dbc.Button(
+                                "Ricarica",
+                                id="reload-runs",
+                                color="secondary",
+                                size="sm",
+                                outline=True,
+                                className="mt-2 w-100",
+                            ),
                         ]
                     )
                 ],
@@ -1132,6 +1140,23 @@ def serve_dash(data_root: str, host: str = "127.0.0.1", port: int = 8050):
         fluid=True,
         style={"height": "100vh"},
     )
+
+    # Reload: forget the cached fronts and rediscover runs, so a running
+    # optimize (or a new run) shows up without restarting the server.
+    # Re-emitting the dropdown value re-fires every callback that reads it.
+    @app.callback(
+        Output("run-selection", "options"),
+        Output("run-selection", "value"),
+        Input("reload-runs", "n_clicks"),
+        State("run-selection", "value"),
+        prevent_initial_call=True,
+    )
+    def reload_runs(_n_clicks, current_run):
+        RUN_CACHE.clear()
+        HISTORY_CACHE.clear()
+        runs = discover_runs(data_root) or [current_run]
+        options = [{"label": os.path.basename(r), "value": r} for r in runs]
+        return options, current_run if current_run in runs else runs[-1]
 
     # =========================================================================
     # TAB CONTENT RENDERING
