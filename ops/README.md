@@ -106,19 +106,27 @@ rinominato via API il 2026-09-03: stesso uuid, stesso URL di ping.
 cambiare position mode con una posizione aperta. Se freqtrade dovesse tornare su
 questo account, va rimesso one-way **a conto piatto**.
 
-## tradingview/rylos_bybit.pine
+## tradingview/rylos_live.pine
 
 Indicatore Pine v6 per TradingView (grafico HYPEUSDT **5m**), non gira su nessun
-server: replica gate 4RSI, griglia DCA (`trailing_grid_v7`) e uscite della config
-live di ry-bybit (`2cab1b32`, `exit_min_gain` 0,0035). Se la config cambia, vanno
-aggiornati a mano i default degli input.
+server: replica gate 4RSI, griglia DCA (`trailing_grid_v7`), uscite e stop
+sull'equity della config live, che dal 2026-09-28 è la stessa su ry-hl e ry-bybit
+(`4e066c8d` + HSL legacy al 25%, media 189 min, pausa 12 h). Se la config cambia,
+vanno aggiornati a mano i default degli input. La versione per la config
+precedente di ry-bybit (`2cab1b32`) è in `tradingview/archive/rylos_bybit_2cab1b32.pine`.
 
 - La posizione simulata sul grafico non coincide con quella vera: per allinearla
   usare gli input "Override live" (prezzo medio, esposizione WE = notional/wallet,
   gradino attuale da Telegram) e rimetterli a 0 quando la posizione si chiude.
 - La volatilità 1h auto-calcolata è sottostimata (TradingView ha poca storia
-  oraria rispetto allo span di 1562 h del bot): impostarla a mano. Il 2026-09-23
-  il valore 0,0198 riproduceva esattamente il prossimo ordine DCA del bot (92,32).
+  oraria rispetto allo span del bot, 1103 h): se serve precisione sul prossimo DCA
+  impostarla a mano confrontandola con il bot.
+- Stop sull'equity: la linea fucsia è il prezzo a cui il drawdown *istantaneo*
+  arriva al 25% (realizzato + posizione aperta, simulati con wallet = 1; con
+  l'override si parte da equity al massimo, quindi a WE piena circa −8,5% dal
+  medio). Il bot usa la media del drawdown su 189 minuti, quindi scatta dopo e
+  più in basso della linea. Sopra il 18,75% (zona arancione) il bot non fa più
+  DCA: la simulazione fa lo stesso. Dopo lo stop, 12 ore senza nuove entrate.
 
 ## report/update_art.py
 
