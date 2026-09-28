@@ -1,8 +1,8 @@
 {"pause_h": 12,
  "intro": "Lo stop chiude la posizione a mercato quando il drawdown della strategia (media su 189 minuti) supera il 25%, poi il bot resta fermo 12 ore. Sulla storia completa dal 5 dicembre 2024 non scatta mai: tutti i numeri della pagina sono identici con e senza. Sulle 112 partenze a freddo ogni 5 giorni (finestre di 105 giorni, senza e con buffer 0,05%, 224 prove) scatta solo 3 volte, nelle partenze che senza stop superavano il 40% di drawdown. Nella partenza del 30 marzo 2025 senza stop il conto sarebbe risalito da solo: lì lo stop costa circa un quinto dell'equity finale; in quella del 23 febbraio evita la liquidazione.",
  "rows": [
-  {"label": "4e066c8d con stop (live)", "hsl": true, "adg0": 0.00736, "adg5": 0.00704, "dd0": 0.321, "dd5": 0.321, "bad": 0, "n": 224, "rec": 40},
-  {"label": "4e066c8d senza stop", "hsl": false, "adg0": 0.0062, "adg5": 0.0071, "dd0": 0.950, "dd5": 0.733, "bad": 3, "n": 224, "rec": 18},
-  {"label": "ry-bybit precedente (2cab1b32)", "hsl": false, "adg0": 0.0079, "adg5": 0.0072, "dd0": 0.387, "dd5": 0.807, "bad": 20, "n": 224, "rec": 13},
-  {"label": "ry-hl precedente (93b1ab16)", "hsl": false, "adg0": 0.0070, "adg5": 0.0063, "dd0": 0.233, "dd5": 0.784, "bad": 20, "n": 224, "rec": 12}
+  {"label": "4e066c8d con stop (live)", "hsl": true, "adg0": 0.00779, "adg5": 0.00739, "dd0": 0.319, "dd5": 0.319, "bad": 0, "n": 224, "rec": 40},
+  {"label": "4e066c8d senza stop", "hsl": false, "adg0": 0.00664, "adg5": 0.00741, "dd0": 0.95, "dd5": 0.732, "bad": 3, "n": 224, "rec": 11},
+  {"label": "ry-bybit precedente (2cab1b32)", "hsl": false, "adg0": 0.00837, "adg5": 0.00771, "dd0": 0.387, "dd5": 0.807, "bad": 20, "n": 224, "rec": 7},
+  {"label": "ry-hl precedente (93b1ab16)", "hsl": false, "adg0": 0.00741, "adg5": 0.00671, "dd0": 0.233, "dd5": 0.784, "bad": 20, "n": 224, "rec": 6}
  ]}

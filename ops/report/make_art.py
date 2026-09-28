@@ -233,6 +233,14 @@ def risk_section(name, cyc, wins, loss):
 
 
 s = open(ARGS.template).read()
+# Artifact read restituisce la pagina dentro lo scheletro del servizio (doctype, <head> con uno
+# <style> proprio): lo scheletro si toglie, al publish viene rimesso.
+if not s.lstrip().startswith("<title>"):
+    s = s[s.index("<title>"):]
+s = s.removesuffix("\n").removesuffix("</body></html>")
+# template che ha già la sezione dello stop (pagina rigenerata): si toglie e si rifà
+s = re.sub(r"<section>\n  <h2>Stop sull'equity: dove scatta</h2>.*?</section>\n<script>const HSLW=.*?</script>\n?", "", s, count=1, flags=re.S)
+s = s.replace("\n" + HSL_JS, "").replace(HSL_JS, "")
 name = ARGS.name
 a, d = load(f"{name}_0.0")
 cfg = json.load(open(d + "/config.json"))
@@ -333,8 +341,9 @@ if ARGS.hsl_windows:
     win = json.load(open(ARGS.hsl_windows))
     summ = json.loads(open(ARGS.hsl_summary).read())
     s = s.replace("<section>\n  <h2>Parametri della config</h2>", hsl_section(win, summ) + "\n<section>\n  <h2>Parametri della config</h2>", 1)
-    s = s.replace("</style>", HSL_CSS + "</style>", 1)
-    s = s.replace("</body></html>", HSL_JS + "\n</body></html>", 1) if "</body></html>" in s else s + HSL_JS
+    if ".hslgrid{" not in s:
+        s = s.replace('</style>\n<div class="wrap">', HSL_CSS + '</style>\n<div class="wrap">', 1)
+    s += HSL_JS
 
 # --- dati grafici e piè di pagina
 data = json.dumps({"series": series, "monthly": monthly}, separators=(",", ":"))
