@@ -35,3 +35,5 @@ seg/v/u) con e senza buffer, vincoli dd <= 40%, held <= 7 g, recupero <= 20 g, T
   dd max 28,2%, held 3,7 g, recupero 16-17 g.
 - Parità verificata: stesso risultato bit per bit sul codice live (088e26b85) e sul merge
   upstream 7d7010989 (adg 0,007865, 5481 fill, periodo intero).
+
+Pagine backtest (artefatti claude.ai): ry-bybit precedente https://claude.ai/artifact/1uEigwyfEircREnHdjqP3H, ry-hl precedente https://claude.ai/artifact/Rpsfu37PUgyZebEA2z1PYn, 4e066c8d https://claude.ai/artifact/J8DWWt9C3bsGK4znwgfgzz (dati fino al 2026-09-27).

@@ -140,3 +140,14 @@ pubblicato, che fa da template (stile, grafici, parametri).
 
 Il testo sull'episodio del 2 aprile 2025 nella sezione "Sensibilità ai fill" è
 fisso: se un nuovo backtest cambia il quadro, va aggiornato nello script.
+
+## report/make_art.py
+
+Genera la pagina backtest di una singola config (artefatto claude.ai) partendo dal template di ry-bybit: rigenera testata, nota, KPI, tabelle, grafici, sezione "Win rate e rischio / Sensibilità ai fill" e i parametri dalla `config.json` del backtest. Serve quando cambia la config live (update_art.py aggiorna solo le due pagine storiche).
+
+1. Template: `Artifact read` della pagina ry-bybit, salvare l'HTML.
+2. Backtest su debian (`~/passivbot-up`, serve il buffer) con `base_dir` per variante: `<nome>_0.0`, `<nome>_0.0001`, `<nome>_0.0005`, `<nome>_0.0_twel25`/`_0.0005_twel25`, `_twel2`, più `<tag>_0.0` e `<tag>_0.0005` per ogni config di confronto.
+3. `rsync` di analysis.json, config.json, fills.csv, balance_and_equity.csv.gz in una cartella locale.
+4. `python3 ops/report/make_art.py --template tpl.html --art DIR --name <nome> --end YYYY-MM-DD --generated GG/MM/AAAA --out pagina.html --title ... --h1 ... --code ... --role ... --note ... [--compare "etichetta=tag"] [--footer ...]`, poi pubblicare con Artifact.
+
+Pagina di 4e066c8d (live su entrambi i bot dal 2026-09-28): https://claude.ai/artifact/J8DWWt9C3bsGK4znwgfgzz
