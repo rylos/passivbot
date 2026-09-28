@@ -152,3 +152,4 @@ Richiesta di Marco dopo "la live è impossibile da battere?": optimize alla pari
   - Passano (adg medio buf0/buf5, dd max, held, rec; fee HL): **4e066c8d 0,713/0,678, 28,2%, 3,7 g, 17**; fff82fbd 0,702/0,670, 27,6%, 3,4, 17; 0b75e534 0,707/0,667, 34,8%, 5,9, 12; 7afa5e45 0,694/0,665, 26,3%, 3,7, 17; 40615c46 0,697/0,658, 37,1%, 7,2, 12; 81d9118f 0,666/0,633, 26,6%, 3,7, 12/7; a8e688d5 0,649/0,618, 30,1%, 3,3, 9.
   - **live bybit** (fee Bybit): 0,751/0,697, dd 38,2% (r1) / 80,4% (y2_b5), held 4,0/6,8, rec 11/13.
   - **live HL** (fee HL): 0,664/0,602, dd **48,9% (q6)** / 78,2%, **held 34,9 g** (q6: partenza a freddo 2026-07-11, griglia piena il 13/07 e posizione chiusa solo il 23/09), rec 29/30 → sulle serie mai viste i candidati r8 battono la live HL su tutto (4e066c8d +7% adg senza buffer, +13% col buffer).
+- **Deploy 2026-09-28**: Marco ha scelto `4e066c8d` su ENTRAMBI i bot (non i due profili separati), anche con posizioni aperte. Vedi live_deployment.md.
