@@ -279,6 +279,7 @@ titolo(r, t, c) =>
     table.merge_cells(tbl, 0, r, 2, r)
 f1(x) => str.tostring(x, "#.#")
 pct(x) => str.tostring(100 * x, "+#.##;-#.##") + "%"
+pu(x) => str.tostring(100 * x, "#.##") + "%"
 
 if barstate.islast
     gain = inPos ? close / avgOra - 1 : na
@@ -303,8 +304,8 @@ if barstate.islast
     info(15, "poi vende a", inPos ? str.tostring(avgOra * (1 + trThr - trRet), format.mintick) + " (" + pct(trThr - trRet) + ")" : "—")
 
     titolo(16, "STOP SULL'EQUITY (vende tutto a mercato)", color.new(color.fuchsia, 50))
-    riga(17, "Drawdown medio (sim) < " + pct(hslRed), pct(-ddEma), not hslOn or ddEma < hslRed)
-    riga(18, "DCA attivi (sotto " + pct(hslOrg * hslRed) + ")", hslOn and ddEma >= hslOrg * hslRed ? "fermi" : "si'", not hslOn or ddEma < hslOrg * hslRed)
+    riga(17, "Drawdown medio (sim) sotto " + pu(hslRed), pu(ddEma), not hslOn or ddEma < hslRed)
+    riga(18, "DCA attivi (drawdown sotto " + pu(hslOrg * hslRed) + ")", hslOn and ddEma >= hslOrg * hslRed ? "fermi" : "si'", not hslOn or ddEma < hslOrg * hslRed)
     info(19, "Scatterebbe a ~", hslOn and inPos ? str.tostring(stopPx, format.mintick) + " (" + pct(stopPx / avgOra - 1) + ")" : "—")
     info(20, "Pausa", time < pausaFino ? "fino alle " + str.format_time(int(pausaFino), "HH:mm dd/MM", "Europe/Rome") : "no")
 
