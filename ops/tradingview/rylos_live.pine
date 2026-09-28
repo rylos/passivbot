@@ -69,7 +69,7 @@ showGate = input.bool(true, "Segnali 4RSI (anche senza fill)", group = gV)
 showSim  = input.bool(true, "Fill simulati (entry, DCA, uscite)", group = gV)
 showStop = input.bool(true, "Linea dello stop sull'equity", group = gV)
 showCrash= input.bool(true, "Linea dello stop sul prezzo", group = gV)
-showTrail= input.bool(true, "Uscita trailing (linea e sezione in tabella)", group = gV)
+showTrail= input.bool(true, "Uscita trailing sul grafico (linea ed etichette)", group = gV)
 nLvl     = input.int(3, "Gradini DCA da mostrare", minval = 1, maxval = 6, group = gV)
 lvlBars  = input.int(40, "Lunghezza linee (barre)", group = gV)
 
@@ -341,13 +341,12 @@ if barstate.islast
     riga(r, "→ VENDE", inPos and sigOut and gain > minGain ? "SI'" : "no", inPos and sigOut and gain > minGain)
     r += 1
 
-    if showTrail
-        titolo(r, "USCITA TRAILING (vende tutto)", color.new(color.purple, 50))
-        r += 1
-        riga(r, "Arma sopra", inPos ? str.tostring(avgOra * (1 + trThr), format.mintick) + " (" + pct(trThr) + ")" : "—", inPos and gain > trThr)
-        r += 1
-        info(r, "poi vende a", inPos ? str.tostring(avgOra * (1 + trThr - trRet), format.mintick) + " (" + pct(trThr - trRet) + ")" : "—")
-        r += 1
+    titolo(r, "USCITA TRAILING (vende tutto)", color.new(color.purple, 50))
+    r += 1
+    riga(r, "Arma sopra", inPos ? str.tostring(avgOra * (1 + trThr), format.mintick) + " (" + pct(trThr) + ")" : "—", inPos and gain > trThr)
+    r += 1
+    info(r, "poi vende a", inPos ? str.tostring(avgOra * (1 + trThr - trRet), format.mintick) + " (" + pct(trThr - trRet) + ")" : "—")
+    r += 1
 
     titolo(r, "STOP SULL'EQUITY (✓ = scatta, vende tutto a mercato)", color.new(color.fuchsia, 50))
     r += 1
