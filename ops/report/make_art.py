@@ -252,19 +252,22 @@ s = s.removesuffix("\n").removesuffix("</body></html>")
 # template che ha già la sezione dello stop (pagina rigenerata): si toglie e si rifà
 s = re.sub(r"<section>\n  <h2>Stop sull'equity: dove scatta</h2>.*?</section>\n<script>const HSLW=.*?</script>\n?", "", s, count=1, flags=re.S)
 s = s.replace("\n" + HSL_JS, "").replace(HSL_JS, "")
-# metriche e cicli affiancati senza scorrimento orizzontale: colonne che possono stringersi,
-# etichette e date che vanno a capo, sotto i 600px si nascondono gradini e HYPE max
-NOSCROLL_CSS = (".two{grid-template-columns:minmax(0,1.1fr) minmax(0,.9fr)}\n.two>div{min-width:0}\n"
+# tabelle senza scorrimento orizzontale: colonne che possono stringersi, etichette che vanno a capo;
+# nei cicli tutto su una riga, sotto i 600px data e ora su due righe e niente colonna dei gradini.
+# Blocco fra marcatori: si sostituisce a ogni rigenerazione.
+NOSCROLL_CSS = ("/*noscroll*/\n.two{grid-template-columns:minmax(0,1.1fr) minmax(0,.9fr)}\n.two>div{min-width:0}\n"
                 "th,td{white-space:normal}\ntd.num,th.num{white-space:nowrap}\n.tbl th.num{white-space:normal}\n"
                 ".two.mc{grid-template-columns:minmax(0,.8fr) minmax(0,1.2fr)}\n"
-                ".tbl.cy th,.tbl.cy td{padding:6px 7px}\n.tbl.cy td span{white-space:nowrap}\n"
+                ".tbl.cy th,.tbl.cy td{padding:6px 8px;white-space:nowrap}\n"
                 ".hslgrid{grid-template-columns:repeat(3,minmax(0,1fr))}\n.legend{flex-wrap:wrap}\n"
-                "@media (max-width:1000px){.two.mc{grid-template-columns:1fr}}\n"
+                "@media (max-width:1100px){.two.mc{grid-template-columns:1fr}}\n"
                 "@media (max-width:900px){.two,.hslgrid{grid-template-columns:1fr}}\n"
-                "@media (max-width:600px){.tbl.wr td.num{white-space:normal}}\n"
-                "@media (max-width:600px){.tbl.cy th:nth-child(4),.tbl.cy td:nth-child(4),.tbl.cy th:nth-child(5),.tbl.cy td:nth-child(5){display:none}.tbl.cy th,.tbl.cy td{padding:6px 4px;font-size:12px}}\n")
-if ".two.mc{" not in s:
-    s = s.replace('</style>\n<div class="wrap">', NOSCROLL_CSS + '</style>\n<div class="wrap">', 1)
+                "@media (max-width:600px){.tbl.wr td.num{white-space:normal}.tbl.cy td{white-space:normal}.tbl.cy td span{white-space:nowrap}"
+                ".tbl.cy th:nth-child(4),.tbl.cy td:nth-child(4){display:none}.tbl.cy th,.tbl.cy td{padding:6px 4px;font-size:12px}}\n/*/noscroll*/\n")
+s = re.sub(r"/\*noscroll\*/.*?/\*/noscroll\*/\n", "", s, flags=re.S)
+s = s.replace('</style>\n<div class="wrap">', NOSCROLL_CSS + '</style>\n<div class="wrap">', 1)
+# HYPE max tolto dai cicli: con una posizione lo dice già il WE max
+s = s.replace('<th class="num">HYPE max</th>', "", 1)
 s = re.sub(r'<section class="two">(\s*<div>\s*<h2>Metriche complete</h2>)', r'<section class="two mc">\1', s, count=1)
 s = re.sub(r'(<h2>Metriche complete</h2>\s*<p class="sub">.*?</p>\s*)<div class="tbl">', r'\1<div class="tbl mc">', s, count=1, flags=re.S)
 s = re.sub(r'(<h2>Cicli di posizione</h2>\s*<p class="sub">.*?</p>\s*)<div class="tbl">', r'\1<div class="tbl cy">', s, count=1, flags=re.S)
@@ -360,7 +363,7 @@ for c in reversed(cyc):
     cls = "neg" if c["net"] < 0 else ""
     dt = lambda t: f"<span>{t[:10]}</span> <span>{t[11:]}</span>"   # a capo solo fra data e ora
     trs.append(f"<tr><td>{dt(t0)}</td><td>{dt(t1)}</td><td class='num'>{it(days, 1)}</td><td class='num'>{c['n_entry']}</td>"
-               f"<td class='num'>{it(c['maxq'], 1)}</td><td class='num'>{it(c['maxwe'])}</td>"
+               f"<td class='num'>{it(c['maxwe'])}</td>"
                f"<td class='num {cls}'>{it(c['net'])}</td><td class='num {cls}'>{'+' if c['pct'] > 0 else ''}{it(c['pct'])}%</td></tr>")
 s = replace_tbody(s, "Cicli di posizione", "".join(trs))
 # colonna del guadagno in % del saldo all'apertura (template vecchi non ce l'hanno)
