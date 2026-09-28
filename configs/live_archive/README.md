@@ -37,3 +37,6 @@ seg/v/u) con e senza buffer, vincoli dd <= 40%, held <= 7 g, recupero <= 20 g, T
   upstream 7d7010989 (adg 0,007865, 5481 fill, periodo intero).
 
 Pagine backtest (artefatti claude.ai): ry-bybit precedente https://claude.ai/artifact/1uEigwyfEircREnHdjqP3H, ry-hl precedente https://claude.ai/artifact/Rpsfu37PUgyZebEA2z1PYn, 4e066c8d https://claude.ai/artifact/J8DWWt9C3bsGK4znwgfgzz (dati fino al 2026-09-27).
+
+## Stato live dal 2026-09-28 14:05
+Entrambi i bot: `bot.long` = 4e066c8d con HSL legacy acceso (red 0,25, ema 189 min, cooldown 720 min), codice `65877b070` (merge upstream fino a 4d30330f5). Test: su 112 partenze a freddo ogni 5 giorni × buffer 0/0,05% adg medio 0,736%/0,704%, dd max 32%, nessun fallimento (senza HSL: 3 su 224, dd max 95%); periodo intero invariato (lo stop non scatta).
