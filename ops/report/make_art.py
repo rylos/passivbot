@@ -272,12 +272,15 @@ eq_month = OrderedDict((r[""][:7], float(r["strategy_equity"])) for r in rows)
 ndays = a["n_days"]
 gain = e_end / 10000
 cagr = gain ** (365 / ndays) - 1
+# ADG reale dal saldo iniziale: quello di passivbot parte dalla fine del primo giorno
+adg_real = gain ** (1 / ndays) - 1
+start_day = rows[0][""][:10]
 wins = [c for c in cyc if c["pct"] > 0]
 loss = [c for c in cyc if c["pct"] <= 0]
 
 # --- titolo, testata, nota
 s = re.sub(r"<title>.*?</title>", f"<title>{ARGS.title}</title>", s, count=1)
-s = re.sub(r"2024-12-05 → 2026-\d\d-\d\d", f"2024-12-05 → {ARGS.end}", s)
+s = re.sub(r"20\d\d-\d\d-\d\d → 20\d\d-\d\d-\d\d", f"{start_day} → {ARGS.end}", s, count=1)
 s = re.sub(r"<h1>.*?</h1>", f"<h1>{ARGS.h1} <code>{ARGS.code}</code></h1>", s, count=1, flags=re.S)
 s = re.sub(r'<p class="role">.*?</p>', f'<p class="role">{ARGS.role}</p>', s, count=1, flags=re.S)
 s = re.sub(r'<p class="note">.*?</p>', f'<p class="note">{ARGS.note}</p>', s, count=1, flags=re.S)
@@ -288,7 +291,7 @@ s = re.sub(r'<div class="stamp">.*?</div>',
 kp = lambda l, v, sub: f"<div class='kpi'><div class='l'>{l}</div><div class='v'>{v}</div><div class='s'>{sub}</div></div>"
 kpis = "".join([
     kp("Guadagno", it(gain, 1) + "×", f"10.000 → {it(e_end, 0)} {CUR}"),
-    kp("ADG", pct(a["adg_strategy_eq"], 3), f"pesato {pct(a['adg_strategy_eq_w'], 3)} · CAGR {it(100 * cagr, 0)}%"),
+    kp("ADG", pct(adg_real, 3), f"passivbot {pct(a['adg_strategy_eq'], 3)} · CAGR {it(100 * cagr, 0)}%"),
     kp("Drawdown max", pct(a["drawdown_worst_strategy_eq"]), f"media peggior 1% {pct(a['drawdown_worst_mean_1pct_strategy_eq'])}"),
     kp("MDG", pct(a["mdg_strategy_eq"], 3), f"Sharpe {it(a['sharpe_ratio_strategy_eq'])} · Sortino {it(a['sortino_ratio_strategy_eq'])} (giornalieri)"),
     kp("Cicli chiusi", str(len(cyc)), f"{len(wins)} in utile · {len(loss)} in perdita"),
@@ -308,15 +311,16 @@ for m, net in monthly.items():
 s = replace_tbody(s, "Per mese", "".join(trs))
 
 # --- metriche complete
-M = [("ADG (equity strategia)", pct(a["adg_strategy_eq"], 3)), ("ADG pesato sul recente", pct(a["adg_strategy_eq_w"], 3)),
-     ("MDG (mediana giornaliera)", pct(a["mdg_strategy_eq"], 3)), ("Guadagno (×)", it(a["gain_strategy_eq"], 3)),
+M = [("ADG dal saldo iniziale", pct(adg_real, 3)), ("ADG passivbot (dalla fine del primo giorno)", pct(a["adg_strategy_eq"], 3)),
+     ("ADG pesato sul recente (passivbot)", pct(a["adg_strategy_eq_w"], 3)), ("MDG (mediana giornaliera)", pct(a["mdg_strategy_eq"], 3)),
+     ("Guadagno dal saldo iniziale (×)", it(gain, 3)), ("Guadagno passivbot, dalla fine del primo giorno (×)", it(a["gain_strategy_eq"], 3)),
      ("Drawdown peggiore", pct(a["drawdown_worst_strategy_eq"], 3)), ("Drawdown, media peggior 1%", pct(a["drawdown_worst_mean_1pct_strategy_eq"], 3)),
      ("Sharpe", it(a["sharpe_ratio_strategy_eq"], 3)), ("Sortino", it(a["sortino_ratio_strategy_eq"], 3)),
      ("Calmar", it(a["calmar_ratio_strategy_eq"], 3)), ("Giorni max per recuperare un massimo", it(a["strategy_eq_recovery_days_max"], 3)),
      ("Posizione più lunga (giorni)", it(a["position_held_days_max"], 3)), ("Durata media posizione (giorni)", it(a["position_held_days_mean"], 3)),
-     ("Perdite / profitti", it(a["loss_profit_ratio"], 3)), ("Tempo medio sott'acqua", pct(a["strategy_eq_underwater_pct_mean"], 3)),
-     ("Volume medio giornaliero (% wallet)", pct(a["volume_pct_per_day_avg"], 3)), ("Posizioni per giorno", it(a["positions_held_per_day"], 3)),
-     ("Quota tempo esposto", pct(a["exposure_ratio_usd"], 3)), ("Completamento backtest", pct(a["backtest_completion_ratio"], 3)),
+     ("Perdite / profitti", it(a["loss_profit_ratio"], 3)), ("Drawdown medio (peggiore di ogni giorno)", pct(a["strategy_eq_underwater_pct_mean"], 3)),
+     ("Volume medio nei giorni con fill (% wallet)", pct(a["volume_pct_per_day_avg"], 3)), ("Posizioni per giorno", it(a["positions_held_per_day"], 3)),
+     ("Esposizione media / max (WE)", f"{it(a['total_wallet_exposure_mean'], 2)} / {it(a['total_wallet_exposure_max'], 2)}"), ("Completamento backtest", pct(a["backtest_completion_ratio"], 3)),
      ("Hard stop per anno", it(a["hard_stop_restarts_per_year"], 3)), ("Giorni con fill", pct(a["fills_active_days_ratio"], 3)),
      ("Ore medie fra ingressi", it(a["entry_interval_hours_mean"], 3)), ("Ore max fra ingressi", it(a["entry_interval_hours_max"], 3))]
 s = replace_tbody(s, "Metriche complete", "".join(f"<tr><td>{k}</td><td class='num'>{v}</td></tr>" for k, v in M))
