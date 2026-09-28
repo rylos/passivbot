@@ -396,7 +396,7 @@ mod core {
         /// Candle color of the closed 5m candle: >0 green, <0 red, 0 doji/unknown.
         pub candle_color: f64,
         /// 1 - last closed 1m close / highest 1m high of the last
-        /// `rylos_dca_pause_window_minutes` closed candles (0 = no drop/unknown).
+        /// `rylos_crash_window_minutes` closed candles (0 = no drop/unknown).
         #[serde(default)]
         pub drop_from_high_1m: f64,
     }
@@ -2639,19 +2639,15 @@ mod core {
             && gain > bp.rylos_exit_min_gain
     }
 
-    /// RyLoS crash guard: no new entries (initial or grid) while the last closed
-    /// 1m close is at least `rylos_dca_pause_drop_pct` below the recent 1m high.
-    /// With the crash stop on, entries also wait while the drop exceeds
-    /// `rylos_crash_stop_pct`, so a stopped position is not rebuilt mid-crash.
+    /// RyLoS crash stop: no new entries (initial or grid) while the last closed
+    /// 1m close is at least `rylos_crash_stop_pct` below the recent 1m high, so
+    /// a stopped position is not rebuilt mid-crash.
     fn rylos_entries_paused(bp: &BotParams, sig: Option<&RylosSignalInput>) -> bool {
-        if !bp.rylos_4rsi_enabled {
-            return false;
-        }
-        let Some(drop) = sig.map(|s| s.drop_from_high_1m).filter(|d| d.is_finite()) else {
-            return false;
-        };
-        (bp.rylos_dca_pause_drop_pct > 0.0 && drop >= bp.rylos_dca_pause_drop_pct)
-            || (bp.rylos_crash_stop_pct > 0.0 && drop >= bp.rylos_crash_stop_pct)
+        bp.rylos_4rsi_enabled
+            && bp.rylos_crash_stop_pct > 0.0
+            && sig
+                .map(|s| s.drop_from_high_1m)
+                .is_some_and(|d| d.is_finite() && d >= bp.rylos_crash_stop_pct)
     }
 
     /// RyLoS crash stop (long only): full market close when the bid is more
@@ -5604,21 +5600,18 @@ mod core {
         }
 
         #[test]
-        fn rylos_crash_guard_pause_and_stop() {
+        fn rylos_crash_stop_and_entry_wait() {
             let mut bp = BotParams::default();
             bp.rylos_4rsi_enabled = true;
             let sig = |drop| RylosSignalInput { osc_4rsi: 0.0, stoch_k: 0.0, candle_color: 0.0, drop_from_high_1m: drop };
-            // tutto spento: nessun effetto
+            // spento: nessun effetto
             assert!(!rylos_entries_paused(&bp, Some(&sig(0.9))));
-            bp.rylos_dca_pause_drop_pct = 0.05;
-            assert!(!rylos_entries_paused(&bp, Some(&sig(0.049))));
-            assert!(rylos_entries_paused(&bp, Some(&sig(0.05))));
-            assert!(!rylos_entries_paused(&bp, None));
-            bp.rylos_dca_pause_drop_pct = 0.0;
-            bp.rylos_crash_stop_pct = 0.15;
-            assert!(rylos_entries_paused(&bp, Some(&sig(0.2))));
-            assert!(!rylos_entries_paused(&bp, Some(&sig(0.1))));
             let pos = Position { size: 1.0, price: 100.0 };
+            assert!(!rylos_crash_stop_triggered(&bp, &pos, &OrderBook { bid: 50.0, ask: 50.1 }));
+            bp.rylos_crash_stop_pct = 0.15;
+            assert!(rylos_entries_paused(&bp, Some(&sig(0.15))));
+            assert!(!rylos_entries_paused(&bp, Some(&sig(0.1))));
+            assert!(!rylos_entries_paused(&bp, None));
             assert!(!rylos_crash_stop_triggered(&bp, &pos, &OrderBook { bid: 85.1, ask: 85.2 }));
             assert!(rylos_crash_stop_triggered(&bp, &pos, &OrderBook { bid: 84.9, ask: 85.0 }));
             assert!(!rylos_crash_stop_triggered(&bp, &Position { size: 0.0, price: 0.0 }, &OrderBook { bid: 50.0, ask: 50.1 }));

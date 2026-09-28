@@ -231,8 +231,8 @@ def compute_rylos_signal_live(
 
 def rylos_drop_from_high_1m(highs: np.ndarray, closes: np.ndarray, window: int) -> float:
     """1 - last close / highest high of the last `window` closed 1m candles
-    (crash guard input; same definition as Backtest::rylos_drop_from_high_1m).
-    0.0 when the guard is off (window <= 0) or data is missing."""
+    (crash stop input; same definition as Backtest::rylos_drop_from_high_1m).
+    0.0 when the stop is off (window <= 0) or data is missing."""
     if window <= 0 or len(closes) == 0:
         return 0.0
     high = float(np.max(highs[-window:]))

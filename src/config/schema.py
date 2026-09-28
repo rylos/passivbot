@@ -45,8 +45,7 @@ def _get_shared_bot_defaults():
             },
             "rylos_4rsi": {
                 "crash_stop_pct": 0.0,
-                "dca_pause_drop_pct": 0.0,
-                "dca_pause_window_minutes": 30.0,
+                "crash_window_minutes": 30.0,
                 "enabled": False,
                 "entry_stoch_threshold": 36.222,
                 "exit_min_gain": 0.0103,
@@ -105,8 +104,7 @@ def _get_shared_bot_defaults():
             },
             "rylos_4rsi": {
                 "crash_stop_pct": 0.0,
-                "dca_pause_drop_pct": 0.0,
-                "dca_pause_window_minutes": 30.0,
+                "crash_window_minutes": 30.0,
                 "enabled": False,
                 "entry_stoch_threshold": 36.222,
                 "exit_min_gain": 0.0103,

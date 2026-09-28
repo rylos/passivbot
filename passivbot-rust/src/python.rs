@@ -2765,9 +2765,8 @@ fn bot_params_from_dict(dict: &PyDict, revised: bool) -> PyResult<BotParams> {
         rylos_osc_exit_threshold: extract_optional_f64(dict, "rylos_osc_exit_threshold")?,
         rylos_exit_stoch_threshold: extract_optional_f64(dict, "rylos_exit_stoch_threshold")?,
         rylos_exit_min_gain: extract_optional_f64(dict, "rylos_exit_min_gain")?,
-        rylos_dca_pause_drop_pct: extract_optional_f64(dict, "rylos_dca_pause_drop_pct")?,
-        rylos_dca_pause_window_minutes: extract_optional_f64(dict, "rylos_dca_pause_window_minutes")?,
         rylos_crash_stop_pct: extract_optional_f64(dict, "rylos_crash_stop_pct")?,
+        rylos_crash_window_minutes: extract_optional_f64(dict, "rylos_crash_window_minutes")?,
     })
 }
 

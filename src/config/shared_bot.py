@@ -53,9 +53,8 @@ BOT_GROUP_FIELD_MAP = {
         "osc_exit_threshold": "rylos_osc_exit_threshold",
         "exit_stoch_threshold": "rylos_exit_stoch_threshold",
         "exit_min_gain": "rylos_exit_min_gain",
-        "dca_pause_drop_pct": "rylos_dca_pause_drop_pct",
-        "dca_pause_window_minutes": "rylos_dca_pause_window_minutes",
         "crash_stop_pct": "rylos_crash_stop_pct",
+        "crash_window_minutes": "rylos_crash_window_minutes",
     },
 }
 

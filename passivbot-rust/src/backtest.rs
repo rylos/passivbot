@@ -1869,10 +1869,10 @@ impl<'a> Backtest<'a> {
     /// (same definition as the live path in rylos_signal.py).
     fn rylos_drop_from_high_1m(&self, row: usize, coin_idx: usize) -> f64 {
         let bp = &self.bot_params[coin_idx].long;
-        if bp.rylos_dca_pause_drop_pct <= 0.0 && bp.rylos_crash_stop_pct <= 0.0 {
+        if bp.rylos_crash_stop_pct <= 0.0 {
             return 0.0;
         }
-        let window = bp.rylos_dca_pause_window_minutes.round().max(1.0) as usize;
+        let window = bp.rylos_crash_window_minutes.round().max(1.0) as usize;
         let first = (row + 1).saturating_sub(window);
         let mut high = f64::NEG_INFINITY;
         for r in first..=row {
