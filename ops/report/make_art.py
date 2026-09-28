@@ -268,6 +268,8 @@ s = re.sub(r"/\*noscroll\*/.*?/\*/noscroll\*/\n", "", s, flags=re.S)
 s = s.replace('</style>\n<div class="wrap">', NOSCROLL_CSS + '</style>\n<div class="wrap">', 1)
 # HYPE max tolto dai cicli: con una posizione lo dice già il WE max
 s = s.replace('<th class="num">HYPE max</th>', "", 1)
+# durata dei cicli in ore
+s = s.replace('<th class="num">Giorni</th><th class="num">Gradini</th>', '<th class="num">Ore</th><th class="num">Gradini</th>', 1)
 s = re.sub(r'<section class="two">(\s*<div>\s*<h2>Metriche complete</h2>)', r'<section class="two mc">\1', s, count=1)
 s = re.sub(r'(<h2>Metriche complete</h2>\s*<p class="sub">.*?</p>\s*)<div class="tbl">', r'\1<div class="tbl mc">', s, count=1, flags=re.S)
 s = re.sub(r'(<h2>Cicli di posizione</h2>\s*<p class="sub">.*?</p>\s*)<div class="tbl">', r'\1<div class="tbl cy">', s, count=1, flags=re.S)
@@ -359,10 +361,10 @@ s = replace_tbody(s, "Metriche complete", "".join(f"<tr><td>{k}</td><td class='n
 trs = []
 for c in reversed(cyc):
     t0, t1 = c["start"][:16], c["end"][:16]
-    days = (datetime.fromisoformat(t1) - datetime.fromisoformat(t0)).total_seconds() / 86400
+    hours = (datetime.fromisoformat(t1) - datetime.fromisoformat(t0)).total_seconds() / 3600
     cls = "neg" if c["net"] < 0 else ""
     dt = lambda t: f"<span>{t[:10]}</span> <span>{t[11:]}</span>"   # a capo solo fra data e ora
-    trs.append(f"<tr><td>{dt(t0)}</td><td>{dt(t1)}</td><td class='num'>{it(days, 1)}</td><td class='num'>{c['n_entry']}</td>"
+    trs.append(f"<tr><td>{dt(t0)}</td><td>{dt(t1)}</td><td class='num'>{it(hours, 1)}</td><td class='num'>{c['n_entry']}</td>"
                f"<td class='num'>{it(c['maxwe'])}</td>"
                f"<td class='num {cls}'>{it(c['net'])}</td><td class='num {cls}'>{'+' if c['pct'] > 0 else ''}{it(c['pct'])}%</td></tr>")
 s = replace_tbody(s, "Cicli di posizione", "".join(trs))
