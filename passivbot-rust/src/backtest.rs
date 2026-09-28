@@ -5380,6 +5380,16 @@ impl<'a> Backtest<'a> {
         if self.revised_hsl_enabled() {
             return order.execution_type == orchestrator::ExecutionType::Market;
         }
+        // rylos 4RSI exit: the orchestrator marks it limit outside panic mode.
+        if order.execution_type == orchestrator::ExecutionType::Limit
+            && match order.order.order_type {
+                OrderType::ClosePanicLong => self.bot_params[idx].long.rylos_4rsi_enabled,
+                OrderType::ClosePanicShort => self.bot_params[idx].short.rylos_4rsi_enabled,
+                _ => false,
+            }
+        {
+            return false;
+        }
         match order.order.order_type {
             OrderType::ClosePanicLong => {
                 let cfg = if self.hard_stop_signal_mode() == "coin" {

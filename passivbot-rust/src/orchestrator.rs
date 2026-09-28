@@ -895,6 +895,15 @@ mod core {
         });
     }
 
+    /// A panic close outside panic mode can only come from the rylos 4RSI exit
+    /// signal: it stays a limit order, while HSL/forced panic keeps its own
+    /// panic_close_order_type.
+    fn is_rylos_signal_close(order: &IdealOrder, mode: TradingMode, bot_params: &BotParams) -> bool {
+        bot_params.rylos_4rsi_enabled
+            && mode != TradingMode::Panic
+            && is_panic_close_order_type(order.order_type)
+    }
+
     fn to_executable_order(
         order: IdealOrder,
         global: &OrchestratorGlobal,
@@ -902,12 +911,13 @@ mod core {
         mode: TradingMode,
         bot_params: &BotParams,
     ) -> ExecutableOrder {
-        let execution_type =
-            if should_use_market_execution(&order, global, order_book, Some(bot_params)) {
-                ExecutionType::Market
-            } else {
-                ExecutionType::Limit
-            };
+        let execution_type = if is_rylos_signal_close(&order, mode, bot_params) {
+            ExecutionType::Limit
+        } else if should_use_market_execution(&order, global, order_book, Some(bot_params)) {
+            ExecutionType::Market
+        } else {
+            ExecutionType::Limit
+        };
         let execution_priority = if is_protective_close_reducer(order.order_type, order.pside)
             || (mode == TradingMode::GracefulStop && order.order_type.is_close())
         {
@@ -5539,6 +5549,35 @@ mod core {
                     &global.global_bot_params.long,
                 )
                 .execution_type,
+                ExecutionType::Market
+            );
+        }
+
+        #[test]
+        fn rylos_signal_close_stays_limit_while_hsl_panic_goes_market() {
+            let mut global = make_basic_global();
+            global.global_bot_params.long.hsl_enabled = true;
+            global.global_bot_params.long.hsl_panic_close_order_type = "market".to_string();
+            global.global_bot_params.long.rylos_4rsi_enabled = true;
+            let order_book = OrderBook { bid: 100.0, ask: 100.1 };
+            let order = IdealOrder {
+                symbol_idx: 0,
+                pside: PositionSide::Long,
+                qty: -1.0,
+                price: 100.0,
+                order_type: OrderType::ClosePanicLong,
+            };
+            let bp = global.global_bot_params.long.clone();
+            let exec = |mode| {
+                to_executable_order(order.clone(), &global, &order_book, mode, &bp).execution_type
+            };
+            assert_eq!(exec(TradingMode::Normal), ExecutionType::Limit);
+            assert_eq!(exec(TradingMode::Panic), ExecutionType::Market);
+            let mut plain = bp.clone();
+            plain.rylos_4rsi_enabled = false;
+            assert_eq!(
+                to_executable_order(order.clone(), &global, &order_book, TradingMode::Normal, &plain)
+                    .execution_type,
                 ExecutionType::Market
             );
         }
