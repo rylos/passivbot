@@ -48,8 +48,14 @@ def pct(x, d=1):
 
 
 def load(tag):
+    """analysis.json del run, con adg_real: ADG dal saldo iniziale (equity finale / iniziale).
+    L'adg_strategy_eq di passivbot parte invece dall'equity di fine del primo giorno."""
     d = sorted(glob.glob(f"{ARGS.art}/{tag}/*/*"))[-1]
-    return json.load(open(d + "/analysis.json")), d
+    a = json.load(open(d + "/analysis.json"))
+    rows = list(csv.DictReader(gzip.open(d + "/balance_and_equity.csv.gz", "rt")))
+    g = float(rows[-1]["strategy_equity"]) / float(rows[0]["strategy_equity"])
+    a["adg_real"] = g ** (1 / a["n_days"]) - 1 if g > 0 else -1.0
+    return a, d
 
 
 def cycles_of(fills):
@@ -109,7 +115,12 @@ def params_html(lg):
                                          ("Pausa dopo lo stop", f"{h['cooldown_minutes_after_red'] / 60:.0f} h"),
                                          ("Chiusura", h["panic_close_order_type"]),
                                          ("Soglie gialla / arancione", f"{pct(h['tier_ratios']['yellow'] * h['red_threshold'], 1)} / {pct(h['tier_ratios']['orange'] * h['red_threshold'], 1)}")])]
-         if (h := lg.get("hsl", {})).get("enabled") else []))
+         if (h := lg.get("hsl", {})).get("enabled") else [])
+       + ([group("Stop sul prezzo", [("Vende se il bid scende sotto il medio di", pct(r["crash_stop_pct"], 0)),
+                                     ("Chiusura", "market"),
+                                     ("Entrate ferme se il prezzo è sceso dal massimo di", pct(r["crash_stop_pct"], 0)),
+                                     ("Finestra del massimo (candele 1m chiuse)", f"{r.get('crash_window_minutes', 30):.0f} min")])]
+          if r.get("crash_stop_pct", 0) > 0 else []))
 
 
 def rome(ts):
@@ -211,8 +222,8 @@ def risk_section(name, cyc, wins, loss):
             a5, _ = load(t5)
         except IndexError:
             continue
-        trs.append(f"<tr class='{cls}'><td>{lab}</td><td class='num'>{pct(a0['adg_strategy_eq'], 2)}</td><td class='num'>{pct(a0['drawdown_worst_strategy_eq'])}</td>"
-                   f"<td class='num'>{pct(a5['adg_strategy_eq'], 2)}</td><td class='num hi'>{pct(a5['drawdown_worst_strategy_eq'])}</td>"
+        trs.append(f"<tr class='{cls}'><td>{lab}</td><td class='num'>{pct(a0['adg_real'], 2)}</td><td class='num'>{pct(a0['drawdown_worst_strategy_eq'])}</td>"
+                   f"<td class='num'>{pct(a5['adg_real'], 2)}</td><td class='num hi'>{pct(a5['drawdown_worst_strategy_eq'])}</td>"
                    f"<td class='num'>{it(a5['position_held_days_max'], 1)} g</td></tr>")
     a0, _ = load(f"{name}_0.0")
     a1, _ = load(f"{name}_0.0001")
@@ -225,7 +236,7 @@ def risk_section(name, cyc, wins, loss):
   </div>
   <div>
     <h2>Sensibilità ai fill</h2>
-    <p class="sub">Con <code>limit_order_fill_buffer_pct</code> un ordine limite si riempie solo se il prezzo lo oltrepassa di quel margine. Con 0,01% (≈1 tick): ADG {pct(a1['adg_strategy_eq'], 2)}, dd {pct(a1['drawdown_worst_strategy_eq'])}; con 0,05%: ADG {pct(a5['adg_strategy_eq'], 2)}, dd {pct(a5['drawdown_worst_strategy_eq'])}.</p>
+    <p class="sub">Con <code>limit_order_fill_buffer_pct</code> un ordine limite si riempie solo se il prezzo lo oltrepassa di quel margine. Con 0,01% (≈1 tick): ADG {pct(a1['adg_real'], 2)}, dd {pct(a1['drawdown_worst_strategy_eq'])}; con 0,05%: ADG {pct(a5['adg_real'], 2)}, dd {pct(a5['drawdown_worst_strategy_eq'])}.</p>
     <div class="tbl wr"><table><thead><tr><th>Variante</th><th class="num">ADG</th><th class="num">DD</th><th class="num">ADG 0,05%</th><th class="num">DD 0,05%</th><th class="num">Held 0,05%</th></tr></thead><tbody>{"".join(trs)}</tbody></table></div>
     <p class="sub" style="margin-top:10px">Le config precedenti dipendevano da un'uscita trailing riuscita per un soffio il 2 aprile 2025 (col buffer 0,05% il drawdown saliva al 78-80%). Questa config è stata ottimizzata con e senza buffer su 18 partenze sfasate: il drawdown quasi non cambia fra i due casi.</p>
   </div>
@@ -338,13 +349,20 @@ s = replace_tbody(s, "Cicli di posizione", "".join(trs))
 
 # --- win rate / sensibilità ai fill, parametri
 s = re.sub(r'<section class="two">\s*<div>\s*<h2>Win rate e rischio</h2>.*?</section>\n?', "", s, count=1, flags=re.S)
-s = s.replace("<section>\n  <h2>Parametri della config</h2>", risk_section(name, cyc, wins, loss) + "\n<section>\n  <h2>Parametri della config</h2>", 1)
-hsl_on = cfg["bot"]["long"].get("hsl", {}).get("enabled")
-s = re.sub(r'<div class="params">.*?</dl></div></div>', lambda _: f'<div class="params{" p5" if hsl_on else ""}">{params_html(cfg["bot"]["long"])}</div>', s, count=1, flags=re.S)
+# prima delle sezioni sugli stop (quella sul crollo resta nel template), poi i parametri
+anchor = next(x for x in ("<section>\n  <h2>Stop sul prezzo", "<section>\n  <h2>Parametri della config</h2>") if x in s)
+s = s.replace(anchor, risk_section(name, cyc, wins, loss) + "\n" + anchor, 1)
+ph = params_html(cfg["bot"]["long"])
+pcls = {5: " p5", 6: " p6"}.get(ph.count("<div class='pgroup'>"), "")
+s = re.sub(r'<div class="params[^"]*">.*?</dl></div></div>', lambda _: f'<div class="params{pcls}">{ph}</div>', s, count=1, flags=re.S)
+if pcls == " p6" and ".params.p6{" not in s:
+    s = s.replace('</style>\n<div class="wrap">', '.params.p6{grid-template-columns:repeat(3,1fr)}\n@media (max-width:900px){.params.p6{grid-template-columns:1fr}}\n</style>\n<div class="wrap">', 1)
 if ARGS.hsl_windows:
     win = json.load(open(ARGS.hsl_windows))
     summ = json.loads(open(ARGS.hsl_summary).read())
-    s = s.replace("<section>\n  <h2>Parametri della config</h2>", hsl_section(win, summ) + "\n<section>\n  <h2>Parametri della config</h2>", 1)
+    # lo stop sull'equity va prima della sezione sul crollo (stop sul prezzo), se c'è
+    anchor = next(x for x in ("<section>\n  <h2>Stop sul prezzo", "<section>\n  <h2>Parametri della config</h2>") if x in s)
+    s = s.replace(anchor, hsl_section(win, summ) + "\n" + anchor, 1)
     if ".hslgrid{" not in s:
         s = s.replace('</style>\n<div class="wrap">', HSL_CSS + '</style>\n<div class="wrap">', 1)
     s += HSL_JS
