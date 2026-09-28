@@ -303,9 +303,9 @@ if barstate.islast
     riga(14, "Arma sopra", inPos ? str.tostring(avgOra * (1 + trThr), format.mintick) + " (" + pct(trThr) + ")" : "—", inPos and gain > trThr)
     info(15, "poi vende a", inPos ? str.tostring(avgOra * (1 + trThr - trRet), format.mintick) + " (" + pct(trThr - trRet) + ")" : "—")
 
-    titolo(16, "STOP SULL'EQUITY (vende tutto a mercato)", color.new(color.fuchsia, 50))
-    riga(17, "Drawdown medio (sim) sotto " + pu(hslRed), pu(ddEma), not hslOn or ddEma < hslRed)
-    riga(18, "DCA attivi (drawdown sotto " + pu(hslOrg * hslRed) + ")", hslOn and ddEma >= hslOrg * hslRed ? "fermi" : "si'", not hslOn or ddEma < hslOrg * hslRed)
+    titolo(16, "STOP SULL'EQUITY (✓ = scatta, vende tutto)", color.new(color.fuchsia, 50))
+    riga(17, "Drawdown medio sopra " + pu(hslRed) + " (sim)", pu(ddEma), hslOn and ddEma >= hslRed)
+    riga(18, "DCA fermi: drawdown sopra " + pu(hslOrg * hslRed), hslOn and ddEma >= hslOrg * hslRed ? "fermi" : "attivi", hslOn and ddEma >= hslOrg * hslRed)
     info(19, "Scatterebbe a ~", hslOn and inPos ? str.tostring(stopPx, format.mintick) + " (" + pct(stopPx / avgOra - 1) + ")" : "—")
     info(20, "Pausa", time < pausaFino ? "fino alle " + str.format_time(int(pausaFino), "HH:mm dd/MM", "Europe/Rome") : "no")
 
