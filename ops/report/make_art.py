@@ -344,8 +344,12 @@ for c in reversed(cyc):
     cls = "neg" if c["net"] < 0 else ""
     trs.append(f"<tr><td>{t0}</td><td>{t1}</td><td class='num'>{it(days, 1)}</td><td class='num'>{c['n_entry']}</td>"
                f"<td class='num'>{it(c['maxq'], 1)}</td><td class='num'>{it(c['maxwe'])}</td>"
-               f"<td class='num {cls}'>{it(c['net'])}</td></tr>")
+               f"<td class='num {cls}'>{it(c['net'])}</td><td class='num {cls}'>{'+' if c['pct'] > 0 else ''}{it(c['pct'])}%</td></tr>")
 s = replace_tbody(s, "Cicli di posizione", "".join(trs))
+# colonna del guadagno in % del saldo all'apertura (template vecchi non ce l'hanno)
+s = s.replace('<th class="num">Netto USDT</th></tr>', '<th class="num">Netto USDT</th><th class="num">Netto %</th></tr>', 1)
+s = s.replace("WE = esposizione massima raggiunta sul wallet.</p>",
+              "WE = esposizione massima raggiunta sul wallet; netto % = utile netto sul saldo all'apertura.</p>", 1)
 
 # --- win rate / sensibilità ai fill, parametri
 s = re.sub(r'<section class="two">\s*<div>\s*<h2>Win rate e rischio</h2>.*?</section>\n?', "", s, count=1, flags=re.S)
