@@ -647,6 +647,14 @@ pub struct BotParams {
     pub rylos_exit_stoch_threshold: f64,
     #[serde(default)]
     pub rylos_exit_min_gain: f64,
+    // RyLoS crash guard (0 = off): pause entries after a fast 1m drop, market
+    // close when price falls too far below the position price
+    #[serde(default)]
+    pub rylos_dca_pause_drop_pct: f64,
+    #[serde(default)]
+    pub rylos_dca_pause_window_minutes: f64,
+    #[serde(default)]
+    pub rylos_crash_stop_pct: f64,
 }
 
 impl Default for BotParams {
@@ -715,6 +723,9 @@ impl Default for BotParams {
             rylos_osc_exit_threshold: 0.0,
             rylos_exit_stoch_threshold: 0.0,
             rylos_exit_min_gain: 0.0,
+            rylos_dca_pause_drop_pct: 0.0,
+            rylos_dca_pause_window_minutes: 0.0,
+            rylos_crash_stop_pct: 0.0,
         }
     }
 }

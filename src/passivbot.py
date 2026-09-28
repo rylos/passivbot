@@ -16790,6 +16790,9 @@ class Passivbot:
             "rylos_osc_exit_threshold": 24.845,
             "rylos_exit_stoch_threshold": 73.05,
             "rylos_exit_min_gain": 0.0103,
+            "rylos_dca_pause_drop_pct": 0.0,
+            "rylos_dca_pause_window_minutes": 30.0,
+            "rylos_crash_stop_pct": 0.0,
         }
         strategy_keys = {
             "close_grid_qty_pct",
@@ -16863,6 +16866,9 @@ class Passivbot:
             "rylos_osc_exit_threshold",
             "rylos_exit_stoch_threshold",
             "rylos_exit_min_gain",
+            "rylos_dca_pause_drop_pct",
+            "rylos_dca_pause_window_minutes",
+            "rylos_crash_stop_pct",
         ]
         out: dict[str, object] = {}
         strategy_getter = getattr(self, "_strategy_params_to_rust_dict", None)
@@ -16995,6 +17001,7 @@ class Passivbot:
             DEFAULT_RYLOS_SIGNAL_CONFIG,
             LIVE_MIN_CANDLES,
             compute_rylos_signal_live,
+            rylos_drop_from_high_1m,
         )
 
         cfg = {
@@ -17026,6 +17033,12 @@ class Passivbot:
                     arr["ts"],
                     cfg,
                 )
+                if sig is not None:
+                    sig["drop_from_high_1m"] = rylos_drop_from_high_1m(
+                        arr["h"].astype(np.float64),
+                        arr["c"].astype(np.float64),
+                        self._rylos_crash_guard_window(symbol),
+                    )
                 return symbol, sig
             except Exception as exc:
                 logging.warning(
@@ -17037,6 +17050,18 @@ class Passivbot:
 
         results = await asyncio.gather(*(one(s) for s in symbols))
         return {symbol: sig for symbol, sig in results if sig is not None}
+
+    def _rylos_crash_guard_window(self, symbol: str) -> int:
+        """Window (1m candles) of the crash guard drop; 0 when the guard is off."""
+        try:
+            if (
+                float(self.bp("long", "rylos_dca_pause_drop_pct", symbol)) <= 0.0
+                and float(self.bp("long", "rylos_crash_stop_pct", symbol)) <= 0.0
+            ):
+                return 0
+            return max(1, int(round(float(self.bp("long", "rylos_dca_pause_window_minutes", symbol)))))
+        except KeyError:
+            return 0
 
     def _unstuck_ema_required(
         self, pside: str, symbol: str, mode: Optional[str]

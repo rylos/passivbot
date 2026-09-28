@@ -395,6 +395,10 @@ mod core {
         pub stoch_k: f64,
         /// Candle color of the closed 5m candle: >0 green, <0 red, 0 doji/unknown.
         pub candle_color: f64,
+        /// 1 - last closed 1m close / highest 1m high of the last
+        /// `rylos_dca_pause_window_minutes` closed candles (0 = no drop/unknown).
+        #[serde(default)]
+        pub drop_from_high_1m: f64,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2635,6 +2639,33 @@ mod core {
             && gain > bp.rylos_exit_min_gain
     }
 
+    /// RyLoS crash guard: no new entries (initial or grid) while the last closed
+    /// 1m close is at least `rylos_dca_pause_drop_pct` below the recent 1m high.
+    /// With the crash stop on, entries also wait while the drop exceeds
+    /// `rylos_crash_stop_pct`, so a stopped position is not rebuilt mid-crash.
+    fn rylos_entries_paused(bp: &BotParams, sig: Option<&RylosSignalInput>) -> bool {
+        if !bp.rylos_4rsi_enabled {
+            return false;
+        }
+        let Some(drop) = sig.map(|s| s.drop_from_high_1m).filter(|d| d.is_finite()) else {
+            return false;
+        };
+        (bp.rylos_dca_pause_drop_pct > 0.0 && drop >= bp.rylos_dca_pause_drop_pct)
+            || (bp.rylos_crash_stop_pct > 0.0 && drop >= bp.rylos_crash_stop_pct)
+    }
+
+    /// RyLoS crash stop (long only): full market close when the bid is more
+    /// than `rylos_crash_stop_pct` below the position price.
+    fn rylos_crash_stop_triggered(bp: &BotParams, pos: &Position, ob: &OrderBook) -> bool {
+        bp.rylos_4rsi_enabled
+            && bp.rylos_crash_stop_pct > 0.0
+            && pos.size > 0.0
+            && pos.price > 0.0
+            && ob.bid.is_finite()
+            && ob.bid > 0.0
+            && ob.bid < pos.price * (1.0 - bp.rylos_crash_stop_pct)
+    }
+
     fn should_generate_closes(mode: TradingMode, has_pos: bool) -> bool {
         match mode {
             TradingMode::Manual => false,
@@ -3866,7 +3897,15 @@ mod core {
                         &s.order_book,
                     );
 
-                if mode == TradingMode::Panic || rylos_exit {
+                let rylos_crash_stop = has_pos
+                    && mode != TradingMode::Manual
+                    && rylos_crash_stop_triggered(
+                        &s.long.bot_params,
+                        &s.long.position,
+                        &s.order_book,
+                    );
+
+                if mode == TradingMode::Panic || rylos_exit || rylos_crash_stop {
                     if let Some(p) = calc_panic_close(
                         s.symbol_idx,
                         PositionSide::Long,
@@ -3892,6 +3931,9 @@ mod core {
                                 &mut diagnostics,
                             )?;
                         (entries, closes) = (generated_entries, generated_closes);
+                        if rylos_entries_paused(&s.long.bot_params, s.long.rylos_signal.as_ref()) {
+                            entries.clear();
+                        }
                         if close_inputs_unavailable {
                             if let Some(order) = calc_independent_wel_ideal_order(
                                 input,
@@ -4592,13 +4634,21 @@ mod core {
                 // normal so it can emit closes, but those closes remain risk-critical
                 // for live execution priority.
                 let mode = side.mode.unwrap_or(TradingMode::Normal);
-                to_executable_order(
+                let crash_stop = order.pside == PositionSide::Long
+                    && is_panic_close_order_type(order.order_type)
+                    && rylos_crash_stop_triggered(&side.bot_params, &side.position, &symbol.order_book);
+                let mut executable = to_executable_order(
                     order,
                     &input.global,
                     &symbol.order_book,
                     mode,
                     &side.bot_params,
-                )
+                );
+                if crash_stop {
+                    executable.execution_type = ExecutionType::Market;
+                    executable.execution_priority = ExecutionPriority::RiskCritical;
+                }
+                executable
             })
             .collect();
 
@@ -5551,6 +5601,30 @@ mod core {
                 .execution_type,
                 ExecutionType::Market
             );
+        }
+
+        #[test]
+        fn rylos_crash_guard_pause_and_stop() {
+            let mut bp = BotParams::default();
+            bp.rylos_4rsi_enabled = true;
+            let sig = |drop| RylosSignalInput { osc_4rsi: 0.0, stoch_k: 0.0, candle_color: 0.0, drop_from_high_1m: drop };
+            // tutto spento: nessun effetto
+            assert!(!rylos_entries_paused(&bp, Some(&sig(0.9))));
+            bp.rylos_dca_pause_drop_pct = 0.05;
+            assert!(!rylos_entries_paused(&bp, Some(&sig(0.049))));
+            assert!(rylos_entries_paused(&bp, Some(&sig(0.05))));
+            assert!(!rylos_entries_paused(&bp, None));
+            bp.rylos_dca_pause_drop_pct = 0.0;
+            bp.rylos_crash_stop_pct = 0.15;
+            assert!(rylos_entries_paused(&bp, Some(&sig(0.2))));
+            assert!(!rylos_entries_paused(&bp, Some(&sig(0.1))));
+            let pos = Position { size: 1.0, price: 100.0 };
+            assert!(!rylos_crash_stop_triggered(&bp, &pos, &OrderBook { bid: 85.1, ask: 85.2 }));
+            assert!(rylos_crash_stop_triggered(&bp, &pos, &OrderBook { bid: 84.9, ask: 85.0 }));
+            assert!(!rylos_crash_stop_triggered(&bp, &Position { size: 0.0, price: 0.0 }, &OrderBook { bid: 50.0, ask: 50.1 }));
+            bp.rylos_4rsi_enabled = false;
+            assert!(!rylos_crash_stop_triggered(&bp, &pos, &OrderBook { bid: 50.0, ask: 50.1 }));
+            assert!(!rylos_entries_paused(&bp, Some(&sig(0.9))));
         }
 
         #[test]

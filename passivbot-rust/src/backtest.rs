@@ -1861,7 +1861,29 @@ impl<'a> Backtest<'a> {
             osc_4rsi,
             stoch_k,
             candle_color,
+            drop_from_high_1m: self.rylos_drop_from_high_1m(row, coin_idx),
         })
+    }
+
+    /// 1 - close[row] / max(high[row-window+1..=row]) with the long-side window
+    /// (same definition as the live path in rylos_signal.py).
+    fn rylos_drop_from_high_1m(&self, row: usize, coin_idx: usize) -> f64 {
+        let bp = &self.bot_params[coin_idx].long;
+        if bp.rylos_dca_pause_drop_pct <= 0.0 && bp.rylos_crash_stop_pct <= 0.0 {
+            return 0.0;
+        }
+        let window = bp.rylos_dca_pause_window_minutes.round().max(1.0) as usize;
+        let first = (row + 1).saturating_sub(window);
+        let mut high = f64::NEG_INFINITY;
+        for r in first..=row {
+            high = high.max(self.hlcvs_value(r, coin_idx, HIGH));
+        }
+        let close = self.hlcvs_value(row, coin_idx, CLOSE);
+        if high.is_finite() && high > 0.0 && close.is_finite() {
+            (1.0 - close / high).max(0.0)
+        } else {
+            0.0
+        }
     }
 
     #[cfg(test)]
@@ -5380,15 +5402,14 @@ impl<'a> Backtest<'a> {
         if self.revised_hsl_enabled() {
             return order.execution_type == orchestrator::ExecutionType::Market;
         }
-        // rylos 4RSI exit: the orchestrator marks it limit outside panic mode.
-        if order.execution_type == orchestrator::ExecutionType::Limit
-            && match order.order.order_type {
-                OrderType::ClosePanicLong => self.bot_params[idx].long.rylos_4rsi_enabled,
-                OrderType::ClosePanicShort => self.bot_params[idx].short.rylos_4rsi_enabled,
-                _ => false,
-            }
-        {
-            return false;
+        // rylos: the orchestrator decides panic execution (4RSI exit limit,
+        // crash stop and HSL panic market).
+        if match order.order.order_type {
+            OrderType::ClosePanicLong => self.bot_params[idx].long.rylos_4rsi_enabled,
+            OrderType::ClosePanicShort => self.bot_params[idx].short.rylos_4rsi_enabled,
+            _ => false,
+        } {
+            return order.execution_type == orchestrator::ExecutionType::Market;
         }
         match order.order.order_type {
             OrderType::ClosePanicLong => {
