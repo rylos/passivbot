@@ -2,7 +2,9 @@
 indicator("RyLoS passivbot — ry-hl · ry-bybit (4e066c8d)", overlay = true, max_labels_count = 300)
 
 // Replica della config live di ry-hl e ry-bybit (stessa config sui due bot dal
-// 2026-09-28): 4e066c8d (run r8) + stop sull'equity HSL al 25%.
+// 2026-09-28): 4e066c8d (run r8) + stop sull'equity HSL al 25% + stop sul
+// prezzo (crash stop) al 15% sotto il medio, con entrate ferme se il prezzo e'
+// sceso del 15% dal massimo degli ultimi 30 minuti.
 // Da usare su grafico 5m. Tutte le percentuali sono sul PREZZO; l'esposizione
 // (WE) e' notional / wallet, come la calcola passivbot.
 
@@ -47,6 +49,12 @@ hslEma  = input.float(189.0, "Media del drawdown (minuti)", group = gH)
 hslCool = input.float(720.0, "Pausa dopo lo stop (minuti)", group = gH)
 hslOrg  = input.float(0.75,  "Soglia arancione (quota della rossa): stop ai DCA", group = gH)
 
+// ══ Stop sul prezzo (rylos_4rsi.crash_stop_pct / crash_window_minutes) ══
+gK = "Stop sul prezzo (crash stop)"
+crashOn  = input.bool(true,   "Stop attivo", group = gK)
+crashPct = input.float(0.15,  "Distanza sotto il prezzo medio", step = 0.01, group = gK)
+crashWin = input.float(30.0,  "Finestra del massimo per fermare le entrate (minuti)", group = gK)
+
 // ══ Override live (per allineare alla posizione vera) ══
 gM = "Override live"
 manAvg = input.float(0.0, "Prezzo medio (0 = simulato)",     group = gM)
@@ -60,6 +68,8 @@ showBand = input.bool(true, "Banda entry (EMA bassa − dist)", group = gV)
 showGate = input.bool(true, "Segnali 4RSI (anche senza fill)", group = gV)
 showSim  = input.bool(true, "Fill simulati (entry, DCA, uscite)", group = gV)
 showStop = input.bool(true, "Linea dello stop sull'equity", group = gV)
+showCrash= input.bool(true, "Linea dello stop sul prezzo", group = gV)
+showTrail= input.bool(true, "Uscita trailing (linea e sezione in tabella)", group = gV)
 nLvl     = input.int(3, "Gradini DCA da mostrare", minval = 1, maxval = 6, group = gV)
 lvlBars  = input.int(40, "Lunghezza linee (barre)", group = gV)
 
@@ -101,6 +111,11 @@ volChiusa() =>
 volAuto = request.security(syminfo.tickerid, "60", volChiusa(), lookahead = barmerge.lookahead_on)
 vol = manVol > 0 ? manVol : volAuto
 
+// caduta dal massimo della finestra (candele chiuse), come drop_from_high_1m
+crashBars = math.max(1, math.round(crashWin / tfMin))
+dropHigh  = 1 - close / ta.highest(high, crashBars)
+entratePausa = crashOn and dropHigh >= crashPct
+
 spacing(we) => gsp * (1 + we / wela * gsWeW + nz(vol) * gsVolW)
 
 // ══ Simulazione della posizione (wallet = 1, pnl non reinvestito) ══
@@ -129,6 +144,12 @@ if sN > 0
         eqReal += sWe * (open / sAvg - 1)
         evento := "STOP EQUITY " + str.tostring(100 * (open / sAvg - 1), "+#.##;-#.##") + "%"
         pausaFino := time + hslCool * 60000
+        chiuso := true
+    // 0b) stop sul prezzo: sotto medio × (1 − 15%) chiude tutto a mercato
+    else if crashOn and low <= sAvg * (1 - crashPct)
+        fp = math.min(open, sAvg * (1 - crashPct))
+        eqReal += sWe * (fp / sAvg - 1)
+        evento := "STOP PREZZO " + str.tostring(100 * (fp / sAvg - 1), "+#.##;-#.##") + "%"
         chiuso := true
     // 1) uscita 4RSI: segnale sulla candela chiusa, si vende all'open della successiva
     else if sigOut[1] and open / sAvg - 1 > minGain
@@ -171,7 +192,7 @@ if sN > 0
                 mx   := high
                 mnAfterMx := close
                 evento := "DCA " + str.tostring(sN) + " @" + str.tostring(fp, format.mintick)
-else if gateIn[1] and low <= bandPx and time >= pausaFino
+else if gateIn[1] and low <= bandPx and time >= pausaFino and not entratePausa[1]
     // l'ordine iniziale sta a min(bid, banda): entra solo se il gate della
     // candela chiusa e' vero E il prezzo arriva alla banda (e non si e' in pausa)
     fp = math.min(open, bandPx)
@@ -205,10 +226,13 @@ stopPx = inPos ? avgOra * (1 + ((1 - hslRed) * pk - er) / weOra) : na
 // ══ Grafica ══
 plot(showBand ? bandPx : na, "Banda entry", color.new(color.red, 50), 1)
 plot(inPos ? avgOra : na, "Prezzo medio", color.new(color.yellow, 20), 1, plot.style_linebr)
-plot(inPos ? avgOra * (1 + trThr) : na, "Soglia trailing +7,57%",
+plot(showTrail and inPos ? avgOra * (1 + trThr) : na, "Soglia trailing +7,57%",
      color.new(color.lime, 60), 1, plot.style_linebr)
 plot(showStop and hslOn and inPos ? stopPx : na, "Stop sull'equity (stima)",
      color.new(color.fuchsia, 20), 2, plot.style_linebr)
+
+plot(showCrash and crashOn and inPos ? avgOra * (1 - crashPct) : na, "Stop sul prezzo",
+     color.new(color.orange, 10), 2, plot.style_linebr)
 
 plotshape(showGate and gateIn and barstate.isconfirmed, "Gate 4RSI", shape.circle,
      location.belowbar, color.new(color.lime, 50), size = size.tiny)
@@ -218,18 +242,19 @@ plotshape(showGate and sigOut and barstate.isconfirmed, "Segnale exit 4RSI", sha
 isEntry = str.startswith(evento, "ENTRY")
 isDca   = str.startswith(evento, "DCA")
 isStop  = str.startswith(evento, "STOP")
-isExit  = evento != "" and not isEntry and not isDca and not isStop
+isTrail = str.startswith(evento, "TRAILING")
+isExit  = evento != "" and not isEntry and not isDca and not isStop and (showTrail or not isTrail)
 plotshape(showSim and isEntry, "Entry simulata", shape.triangleup, location.belowbar,
      color.lime, size = size.small)
 plotshape(showSim and isDca, "DCA simulato", shape.triangleup, location.belowbar,
      color.aqua, size = size.small)
 plotshape(showSim and isExit, "Uscita simulata", shape.triangledown, location.abovebar,
      color.red, size = size.small)
-plotshape(showSim and isStop, "Stop sull'equity simulato", shape.xcross, location.abovebar,
+plotshape(showSim and isStop, "Stop simulato (equity o prezzo)", shape.xcross, location.abovebar,
      color.fuchsia, size = size.normal)
 if showSim and (isExit or isStop)
     label.new(bar_index, high, evento, style = label.style_label_down, size = size.tiny,
-         color = color.new(isStop ? color.fuchsia : color.red, 70), textcolor = color.white)
+         color = color.new(str.startswith(evento, "STOP PREZZO") ? color.orange : isStop ? color.fuchsia : color.red, 70), textcolor = color.white)
 
 // ══ Gradini DCA successivi (solo ultima barra) ══
 var line[]  lns = array.new_line()
@@ -262,7 +287,7 @@ if barstate.islast
                  textcolor = color.white, size = size.small))
 
 // ══ Tabella ══
-var tbl = table.new(position.top_right, 3, 26, border_width = 1,
+var tbl = table.new(position.top_right, 3, 32, border_width = 1,
      bgcolor = color.new(color.black, 45), border_color = color.new(color.gray, 60))
 bg = color.new(color.black, 45)
 col(c) => c ? color.new(color.green, 40) : color.new(color.red, 40)
@@ -283,37 +308,73 @@ pu(x) => str.tostring(100 * x, "#.##") + "%"
 
 if barstate.islast
     gain = inPos ? close / avgOra - 1 : na
-    info(0, "Grafico", timeframe.period == "5" ? "5m ✓" : timeframe.period + " — usa il 5m!")
+    int r = 0
+    info(r, "Grafico", timeframe.period == "5" ? "5m ✓" : timeframe.period + " — usa il 5m!")
+    r += 1
 
-    titolo(1, "ENTRATA (solo a posizione chiusa)", color.new(color.blue, 50))
-    riga(2, "4RSI sotto " + f1(oscIn), f1(osc), osc < oscIn)
-    riga(3, "Stoch sotto " + f1(stochIn), f1(k), k < stochIn)
-    riga(4, "Candela rossa", rossa ? "rossa" : "verde", rossa)
-    riga(5, "Prezzo sotto banda", pct(close / bandPx - 1), close <= bandPx)
-    riga(6, "→ ENTRA", gateIn and close <= bandPx ? "SI'" : "no", gateIn and close <= bandPx)
+    titolo(r, "ENTRATA (solo a posizione chiusa)", color.new(color.blue, 50))
+    r += 1
+    riga(r, "4RSI sotto " + f1(oscIn), f1(osc), osc < oscIn)
+    r += 1
+    riga(r, "Stoch sotto " + f1(stochIn), f1(k), k < stochIn)
+    r += 1
+    riga(r, "Candela rossa", rossa ? "rossa" : "verde", rossa)
+    r += 1
+    riga(r, "Prezzo sotto banda", pct(close / bandPx - 1), close <= bandPx)
+    r += 1
+    riga(r, "Non in crollo (caduta " + str.tostring(crashWin, "#") + "m < " + pu(crashPct) + ")", pu(dropHigh), not entratePausa)
+    r += 1
+    entra = gateIn and close <= bandPx and not entratePausa
+    riga(r, "→ ENTRA", entra ? "SI'" : "no", entra)
+    r += 1
 
-    titolo(7, "USCITA 4RSI (vende tutto)", color.new(color.purple, 50))
-    riga(8, "4RSI sopra " + f1(oscOut), f1(osc), osc > oscOut)
-    riga(9, "Stoch sopra " + f1(stochOut), f1(k), k > stochOut)
-    riga(10, "Candela verde", verde ? "verde" : "rossa", verde)
-    riga(11, "Gain sopra " + pct(minGain), inPos ? pct(gain) : "—", inPos and gain > minGain)
-    riga(12, "→ VENDE", inPos and sigOut and gain > minGain ? "SI'" : "no", inPos and sigOut and gain > minGain)
+    titolo(r, "USCITA 4RSI (vende tutto, limit)", color.new(color.purple, 50))
+    r += 1
+    riga(r, "4RSI sopra " + f1(oscOut), f1(osc), osc > oscOut)
+    r += 1
+    riga(r, "Stoch sopra " + f1(stochOut), f1(k), k > stochOut)
+    r += 1
+    riga(r, "Candela verde", verde ? "verde" : "rossa", verde)
+    r += 1
+    riga(r, "Gain sopra " + pct(minGain), inPos ? pct(gain) : "—", inPos and gain > minGain)
+    r += 1
+    riga(r, "→ VENDE", inPos and sigOut and gain > minGain ? "SI'" : "no", inPos and sigOut and gain > minGain)
+    r += 1
 
-    titolo(13, "USCITA TRAILING (vende tutto)", color.new(color.purple, 50))
-    riga(14, "Arma sopra", inPos ? str.tostring(avgOra * (1 + trThr), format.mintick) + " (" + pct(trThr) + ")" : "—", inPos and gain > trThr)
-    info(15, "poi vende a", inPos ? str.tostring(avgOra * (1 + trThr - trRet), format.mintick) + " (" + pct(trThr - trRet) + ")" : "—")
+    if showTrail
+        titolo(r, "USCITA TRAILING (vende tutto)", color.new(color.purple, 50))
+        r += 1
+        riga(r, "Arma sopra", inPos ? str.tostring(avgOra * (1 + trThr), format.mintick) + " (" + pct(trThr) + ")" : "—", inPos and gain > trThr)
+        r += 1
+        info(r, "poi vende a", inPos ? str.tostring(avgOra * (1 + trThr - trRet), format.mintick) + " (" + pct(trThr - trRet) + ")" : "—")
+        r += 1
 
-    titolo(16, "STOP SULL'EQUITY (✓ = scatta, vende tutto)", color.new(color.fuchsia, 50))
-    riga(17, "Drawdown medio sopra " + pu(hslRed) + " (sim)", pu(ddEma), hslOn and ddEma >= hslRed)
-    riga(18, "DCA fermi: drawdown sopra " + pu(hslOrg * hslRed), hslOn and ddEma >= hslOrg * hslRed ? "fermi" : "attivi", hslOn and ddEma >= hslOrg * hslRed)
-    info(19, "Scatterebbe a ~", hslOn and inPos ? str.tostring(stopPx, format.mintick) + " (" + pct(stopPx / avgOra - 1) + ")" : "—")
-    info(20, "Pausa", time < pausaFino ? "fino alle " + str.format_time(int(pausaFino), "HH:mm dd/MM", "Europe/Rome") : "no")
+    titolo(r, "STOP SULL'EQUITY (✓ = scatta, vende tutto a mercato)", color.new(color.fuchsia, 50))
+    r += 1
+    riga(r, "Drawdown medio sopra " + pu(hslRed) + " (sim)", pu(ddEma), hslOn and ddEma >= hslRed)
+    r += 1
+    riga(r, "DCA fermi: drawdown sopra " + pu(hslOrg * hslRed), hslOn and ddEma >= hslOrg * hslRed ? "fermi" : "attivi", hslOn and ddEma >= hslOrg * hslRed)
+    r += 1
+    info(r, "Scatterebbe a ~", hslOn and inPos ? str.tostring(stopPx, format.mintick) + " (" + pct(stopPx / avgOra - 1) + ")" : "—")
+    r += 1
+    info(r, "Pausa", time < pausaFino ? "fino alle " + str.format_time(int(pausaFino), "HH:mm dd/MM", "Europe/Rome") : "no")
+    r += 1
 
-    titolo(21, "POSIZIONE", color.new(color.gray, 40))
-    info(22, "Stato", not inPos ? "piatto" : manAvg > 0 ? (manN > 0 ? "gradino " + str.tostring(manN) : "reale (override)") : str.tostring(sN) + " fill simulati")
-    info(23, "Medio / gain", inPos ? str.tostring(avgOra, format.mintick) + "  " + pct(gain) : "—")
-    info(24, "Esposizione", str.tostring(weOra, "#.###") + " / " + str.tostring(twel, "#.##"))
-    info(25, "Prossimo DCA / vol 1h", inPos ? str.tostring(avgOra * (1 - spacing(weOra)), format.mintick) + " (" + pct(-spacing(weOra)) + ")  " + str.tostring(vol, "#.####") : str.tostring(vol, "#.#####"))
+    titolo(r, "STOP SUL PREZZO (✓ = scatta, vende tutto a mercato)", color.new(color.orange, 50))
+    r += 1
+    riga(r, "Bid sotto il medio − " + pu(crashPct), inPos and crashOn ? str.tostring(avgOra * (1 - crashPct), format.mintick) : "—", inPos and crashOn and close < avgOra * (1 - crashPct))
+    r += 1
+
+    titolo(r, "POSIZIONE", color.new(color.gray, 40))
+    r += 1
+    info(r, "Stato", not inPos ? "piatto" : manAvg > 0 ? (manN > 0 ? "gradino " + str.tostring(manN) : "reale (override)") : str.tostring(sN) + " fill simulati")
+    r += 1
+    info(r, "Medio / gain", inPos ? str.tostring(avgOra, format.mintick) + "  " + pct(gain) : "—")
+    r += 1
+    info(r, "Esposizione", str.tostring(weOra, "#.###") + " / " + str.tostring(twel, "#.##"))
+    r += 1
+    info(r, "Prossimo DCA / vol 1h", inPos ? str.tostring(avgOra * (1 - spacing(weOra)), format.mintick) + " (" + pct(-spacing(weOra)) + ")  " + str.tostring(vol, "#.####") : str.tostring(vol, "#.#####"))
+    r += 1
 
 // ══ Alert ══
 alertcondition(gateIn and barstate.isconfirmed, "RyLoS gate entry",
@@ -322,3 +383,5 @@ alertcondition(sigOut and barstate.isconfirmed, "RyLoS segnale exit",
      "RyLoS: segnale exit 4RSI su {{ticker}} (vende se gain > 0,26%)")
 alertcondition(hslOn and ddEma >= hslOrg * hslRed and barstate.isconfirmed, "RyLoS stop vicino",
      "RyLoS: drawdown simulato in zona arancione su {{ticker}} (DCA fermi, stop al 25%)")
+alertcondition(entratePausa and barstate.isconfirmed, "RyLoS crollo",
+     "RyLoS: prezzo sceso oltre il 15% dal massimo di 30 minuti su {{ticker}} (entrate ferme)")
