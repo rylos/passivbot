@@ -1,5 +1,7 @@
 """CUDA launch contract, independent of the shared strategy regression suite."""
 
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -179,6 +181,54 @@ def test_mps_compilation_does_not_apply_cuda_coin_specialization(monkeypatch):
     assert sources == [source]
 
 
+def test_disabled_hsl_specialization_requires_explicit_shader_guard(monkeypatch):
+    """Only guarded multicoin sources may opt into the compact HSL state."""
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace())
+    sys.modules.pop("optimization.gpu.mps_kernel", None)
+    from optimization.gpu.mps_kernel import _with_hsl_disabled, _with_hsl_features
+
+    guarded = (
+        "#ifndef PASSIVBOT_HSL_DIAGNOSTICS_ENABLED\n"
+        "#if PASSIVBOT_HSL_DISABLED\nint compact;\n#endif\n"
+    )
+    assert _with_hsl_disabled(guarded, False) == guarded
+    compact = _with_hsl_disabled(guarded, True)
+    assert compact == (
+        "#define PASSIVBOT_HSL_DISABLED 1\n" + guarded
+    )
+    assert "#define PASSIVBOT_HSL_DIAGNOSTICS_ENABLED 0" not in compact
+    assert _with_hsl_features(
+        compact,
+        ema_tail_enabled=False,
+        raw_drawdown_enabled=False,
+        raw_tail_enabled=False,
+    ) == compact
+    with pytest.raises(RuntimeError, match="disabled-HSL feature guard"):
+        _with_hsl_disabled("kernel void unguarded() {}", True)
+    sys.modules.pop("optimization.gpu.mps_kernel", None)
+
+
+def test_disabled_hsl_specialization_excludes_fused_layout(monkeypatch):
+    """The compact one-side HSL arrays must never back the fused kernel."""
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace())
+    sys.modules.pop("optimization.gpu.mps_kernel", None)
+    from optimization.gpu.mps_kernel import MpsEmaAnchorMulticoinFusedRunner
+
+    assert MpsEmaAnchorMulticoinFusedRunner.hsl_disabled_specialization is False
+    sys.modules.pop("optimization.gpu.mps_kernel", None)
+
+
+def test_disabled_hsl_source_removes_hsl_portfolio_scans():
+    """The ordinary disabled-HSL candle path has no pre-fill or HSL update scan."""
+    source = (
+        Path(__file__).parents[2]
+        / "passivbot-rust/src/gpu/mps_ema_anchor_multicoin_long.metal"
+    ).read_text()
+
+    assert "#if PASSIVBOT_HSL_DISABLED\n        float hsl_equity_before_fills = 0.0f;" in source
+    assert "#if !PASSIVBOT_HSL_DISABLED\n        if (can_generate && alive" in source
+
+
 @pytest.mark.parametrize("case", ["ema-multicoin-overhead", "tm-multicoin-overhead"])
 @pytest.mark.parametrize("coins", [2, 3, 5, 9, 17, 33, 64])
 def test_cuda_coin_capacity_matches_full_capacity_outputs(cuda, case, coins):
@@ -210,6 +260,39 @@ def test_cuda_coin_capacity_matches_full_capacity_outputs(cuda, case, coins):
     assert specialized.keys() == baseline.keys()
     for key in baseline:
         np.testing.assert_array_equal(specialized[key], baseline[key], err_msg=key)
+
+
+def test_cuda_disabled_hsl_specialization_matches_full_hsl_state(cuda):
+    """Removing unreachable per-coin HSL state must preserve every GPU output."""
+    torch, _library_cls = cuda
+    from tools.gpu_proxy_benchmark import _build_case
+
+    def evaluate(compact_hsl):
+        proxy, candidates, *_ = _build_case(
+            "ema-multicoin-overhead",
+            candidates=4,
+            dispatch_batch_size=4,
+            single_bars=128,
+            multicoin_bars=128,
+            coins=5,
+            seed=11,
+        )
+        runner = proxy.runners["long"]
+        if not compact_hsl:
+            runner.coin_hsl_may_enable = True
+        output = runner.run(proxy._parameter_matrix(candidates, "long"))
+        assert runner.dispatch_hsl_disabled is compact_hsl
+        return {
+            key: value.cpu().numpy().copy()
+            for key, value in output.items()
+            if isinstance(value, torch.Tensor)
+        }
+
+    compact = evaluate(True)
+    baseline = evaluate(False)
+    assert compact.keys() == baseline.keys()
+    for key in baseline:
+        np.testing.assert_array_equal(compact[key], baseline[key], err_msg=key)
 
 
 @pytest.mark.parametrize("pending_queries", [0, 2])
@@ -338,7 +421,7 @@ def test_tm_unchunked_dispatch_keeps_apple_launch_options(monkeypatch, device):
         )},
         btc_prices_enabled=False, equity_balance_diff_enabled=False,
         entry_interval_enabled=False, recovery_distribution_enabled=False,
-        max_dispatch_candidate_bars=None,
+        max_dispatch_candidate_bars=None, revised_capacity=0,
     )
     calls = []
     library = SimpleNamespace(
@@ -398,3 +481,77 @@ def test_cuda_tm_unchunked_blocks_preserve_raw_outputs(cuda, monkeypatch, count,
     assert actual.keys() == baseline.keys()
     for key in baseline:
         np.testing.assert_array_equal(actual[key], baseline[key], err_msg=key)
+
+
+@pytest.mark.parametrize("capacity", [None, 4])
+def test_cuda_multicoin_relation_bytes_preserve_signed_values(cuda, capacity):
+    torch, library_cls = cuda
+    source = '''
+        constant int MAX_COINS = 64;
+        kernel void relations(constant int* touch_min_qty_relation,
+                              device int* output,
+                              uint i [[thread_position_in_grid]]) {
+            output[i] = touch_min_qty_relation[i];
+        }
+    '''
+    assert "const signed char* touch_min_qty_relation" in cuda_source(source, coin_capacity=4)
+    assert "const signed char* touch_min_qty_relation" in cuda_source(source)
+    library = library_cls(source, coin_capacity=capacity)
+    values = torch.tensor([-1, 0, 1] * 50, device="cuda", dtype=torch.int8)
+    output = torch.empty(len(values), device="cuda", dtype=torch.int32)
+    library.relations(values, output, threads=len(values))
+    np.testing.assert_array_equal(output.cpu().numpy(), values.cpu().numpy())
+    with pytest.raises(ValueError, match="signed int8"):
+        library.relations(values.to(torch.int32), output, threads=len(values))
+
+
+@pytest.mark.parametrize("coins", [3, 28, 64])
+@pytest.mark.parametrize("count", [1023, 1025])
+def test_cuda_temporal_batch_increase_preserves_outputs_and_partial_tail(cuda, coins, count):
+    torch, _ = cuda
+    from tools.gpu_proxy_benchmark import _build_case
+
+    proxy, candidates, *_ = _build_case(
+        "tm-multicoin-overhead", candidates=count, dispatch_batch_size=1024,
+        single_bars=256, multicoin_bars=1513, coins=coins, seed=7,
+    )
+    runner = proxy.runners["long"]
+    runner.max_dispatch_candidate_bars = 1024 * coins * 47
+    matrix = proxy._parameter_matrix(candidates, "long")
+    ends = np.resize(np.asarray([1, 123, 1513], dtype=np.int32), count)
+
+    def evaluate(batch):
+        chunks = []
+        for offset in range(0, count, batch):
+            params = matrix[offset:offset + batch]
+            raw = runner.run(params, end_steps=ends[offset:offset + batch])
+            chunks.append({
+                key: value.cpu().numpy().copy()
+                for key, value in raw.items() if isinstance(value, torch.Tensor)
+            })
+        return {key: np.concatenate([chunk[key] for chunk in chunks]) for key in chunks[0]}
+
+    baseline = evaluate(512)
+    assert baseline
+    # Different candidate partitions also change history chunk boundaries. Reuse
+    # the runner to cover buffer reallocation and the one-candidate final batch.
+    for _ in range(2):
+        actual = evaluate(1024)
+        assert actual.keys() == baseline.keys()
+        for key in baseline:
+            np.testing.assert_array_equal(actual[key], baseline[key], err_msg=key)
+
+
+def test_mps_coin_capacity_is_explicit_and_preserves_other_source(monkeypatch):
+    import sys
+    from optimization.gpu.runtime import compile_shader
+
+    sources = []
+    torch = SimpleNamespace(
+        backends=SimpleNamespace(mps=SimpleNamespace(is_available=lambda: True)),
+        mps=SimpleNamespace(compile_shader=lambda source: sources.append(source)),
+    )
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    source = "constant int MAX_COINS = 64; // 64 remains elsewhere"
+    compile_shader(source, mps_coin_capacity=4)
+    assert sources == ["constant int MAX_COINS = 4; // 64 remains elsewhere"]

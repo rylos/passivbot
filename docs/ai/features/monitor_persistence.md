@@ -11,6 +11,9 @@ degraded cycles may also request a flush; concurrent requests serialize and the
 publisher's configured interval remains the write throttle. The independent
 maintainer uses a five-second minimum cadence to keep degraded state visible
 without turning diagnostic persistence into a high-frequency trading dependency.
+Trailing diagnostics resolve strategy settings once per symbol and position side within
+one synchronous section build. Those resolved settings are discarded afterward; configuration
+and coin-override changes must be observed by the next snapshot.
 
 `record_error` retains the event kind, tags, known code-owned source/stage classifications, and a
 bounded exception type. It must not persist arbitrary caller strings or numbers, exception messages,
@@ -32,6 +35,10 @@ bounded observability fallback must not delay exchange-client closure or replace
 Event sequences are monotonic within a monitor root, including across unclean restart. The startup
 watermark is the maximum of the manifest and checksummed segment recovery metadata. Never infer an
 envelope sequence from payload bytes or an invalid row.
+
+Revised-HSL account and health equity are passive observations of fresh committed balance and
+positions plus cached held-symbol quotes. Missing or stale inputs produce `null` equity rather
+than a startup placeholder or a partial portfolio sum; reporting performs no exchange I/O.
 
 ## Recovery Framing
 

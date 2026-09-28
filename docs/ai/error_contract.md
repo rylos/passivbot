@@ -55,6 +55,12 @@ Account-critical surfaces are required before any exchange action:
 2. balance
 3. open orders
 
+Dedicated full-position panic closes and their cancellations are an action-specific exception:
+positions and open orders must be fresh, but balance is not an input to their sizing or decision.
+The reduced Rust close contract accepts only signed size, book, tick size, and execution policy.
+It must emit exactly one full close per exposed target; malformed or incomplete batches are fatal.
+This exception does not apply to ordinary planning, risk evaluation, or stop-event reconstruction.
+
 Market snapshots must be fresh for the symbols acted upon. Candles and EMAs are required only for
 order classes whose strategy or risk decision consumes them. Stale flat-symbol candles must not
 block protective management of held symbols.
@@ -96,10 +102,15 @@ candles; it does not retain per-span contexts or consecutive-use counters.
 Protective panic and reduce-only actions may proceed when their own account-critical and
 symbol-scoped requirements are fresh, even if unrelated strategy surfaces are unavailable.
 
-Numeric non-positive/non-finite current balances and unusable historical HSL balance denominators
-have an explicit live readiness policy in `features/equity_hard_stop_loss.md`: pause ordinary
-planning, retain valid protection, refresh and retry with capped backoff and a finite per-episode
-attempt budget, and expose recovery. Exhaustion stops terminally without full-bot auto-restart.
+Numeric non-positive/non-finite current balances, unusable historical HSL denominators,
+and unavailable HSL evidence follow `features/equity_hard_stop_loss.md`. Current ordinary
+strategy inputs remain mandatory, but HSL-only reconstruction failures do not impose a blanket
+entry embargo. Continuous scoped signal unavailability starts a configurable grace period;
+after it expires, Rust evaluates current loss over budget without EMA. A committed emergency
+exit continues independently of history and balance repair until fresh flat/order confirmation.
+Proven cooldown/manual ownership is retained. HSL attempt exhaustion escalates diagnostics,
+without terminating protection; without HSL, exhaustion remains terminal.
+
 This is unavailability, not a substitute input or permission to ignore Rust validation. Shape/type
 errors, malformed configuration, and unrelated validation errors are outside this policy.
 

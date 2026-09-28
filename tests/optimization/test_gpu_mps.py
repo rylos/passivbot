@@ -610,6 +610,8 @@ def test_trailing_martingale_no_hsl_specialization_keeps_base_scalar_abi(
     )
 
     def fake_base_init(self, *args, **kwargs):
+        self.hsl_engine = "legacy"
+        self.revised_capacity = 0
         self.long_enabled = True
         self.short_enabled = False
         self.hsl_ema_tail_enabled = bool(kwargs["hsl_ema_tail_enabled"])
@@ -649,6 +651,8 @@ def test_trailing_martingale_hsl_specialization_keeps_requested_features(
     )
 
     def fake_base_init(self, *args, **kwargs):
+        self.hsl_engine = "legacy"
+        self.revised_capacity = 0
         self.long_enabled = False
         self.short_enabled = True
         self.hsl_ema_tail_enabled = bool(kwargs["hsl_ema_tail_enabled"])
@@ -688,6 +692,8 @@ def test_trailing_martingale_hsl_specialization_disables_unrequested_diagnostics
     )
 
     def fake_base_init(self, *args, **kwargs):
+        self.hsl_engine = "legacy"
+        self.revised_capacity = 0
         self.long_enabled = True
         self.short_enabled = False
         self.hsl_ema_tail_enabled = False
@@ -1022,6 +1028,8 @@ def test_trailing_martingale_runner_accepts_ordinary_market_execution(monkeypatc
     from optimization.gpu.mps_kernel import MpsTrailingMartingaleRunner
 
     def fake_base_init(self, *args, **kwargs):
+        self.hsl_engine = "legacy"
+        self.revised_capacity = 0
         self.long_enabled = True
         self.short_enabled = False
         self.hsl_ema_tail_enabled = False
@@ -2359,7 +2367,9 @@ kernel void passivbot_tm_multicoin_side_fill_pass_probe(
     touch_ticks = torch.zeros((3, 2), dtype=torch.int32, device=gpu_device())
     touch_nearest_ticks = torch.zeros(3, dtype=torch.int32, device=gpu_device())
     touch_min_qty_bits = torch.zeros(3, dtype=torch.int32, device=gpu_device())
-    touch_min_qty_relation = torch.zeros(3, dtype=torch.int32, device=gpu_device())
+    touch_min_qty_relation = torch.zeros(
+        3, dtype=torch.int8 if gpu_device() == "cuda" else torch.int32, device=gpu_device()
+    )
     coin_settings = torch.zeros((1, 13), dtype=torch.float32, device=gpu_device())
     coin_settings[0, 0] = 1.0
     coin_settings[0, 1] = 1.0
@@ -2684,7 +2694,7 @@ kernel void passivbot_tm_multicoin_order_phase_probe(
     )
     touch_min_qty_bits = torch.zeros((2, 1), dtype=torch.int32, device=gpu_device())
     touch_min_qty_relation = torch.zeros(
-        (2, 1), dtype=torch.int32, device=gpu_device()
+        (2, 1), dtype=torch.int8 if gpu_device() == "cuda" else torch.int32, device=gpu_device()
     )
     coin_settings = torch.zeros((1, 13), dtype=torch.float32, device=gpu_device())
     coin_settings[0, 0] = 0.001
@@ -5683,6 +5693,65 @@ def _multicoin_exposure_fixture(
     if return_context:
         return runner, row, runs[0], data
     return runner, row
+
+
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
+@pytest.mark.parametrize("side", ["long", "short"])
+@pytest.mark.parametrize("forced_delist", [False, True])
+@pytest.mark.parametrize("collect_counts", [False, True])
+def test_ema_disabled_hsl_preserves_optional_fill_counts(
+    side, forced_delist, collect_counts
+):
+    from optimization.gpu.metrics import _fill_activity_metrics
+
+    count = 1509 if forced_delist else 313
+    steps = np.arange(count)
+    closes = np.column_stack([
+        base * (1.0 + 0.09 * np.sin(steps / 17.0 + coin))
+        for coin, base in enumerate((100.0, 120.0))
+    ])
+    runner, row, run, _ = _multicoin_exposure_fixture(
+        "ema_anchor", side, count=count, closes=closes,
+        last_valid_indices=(89, 97) if forced_delist else None,
+        markets=[ProxyMarket(0.001, 0.01, 0.001, 0.0, 1.0, 0.001, 0.02)] * 2,
+        collect_coin_fill_counts=collect_counts,
+        return_context=True,
+    )
+    params = np.asarray([row] * 3, dtype=np.float64)
+    params[:, EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index("hsl_signal_mode")] = [0, 1, 2]
+
+    def evaluate(compact):
+        runner.hsl_disabled_specialization = compact
+        output = runner.run(params)
+        synchronize()
+        assert runner.dispatch_hsl_disabled is compact
+        # The runner reuses buffers; keep the baseline independent of the next run.
+        return {key: value.cpu().clone() for key, value in output.items()}
+
+    full = evaluate(False)
+    compact = evaluate(True)
+    assert full.keys() == compact.keys()
+    for key in full:
+        np.testing.assert_array_equal(
+            full[key].numpy(), compact[key].numpy(), err_msg=key
+        )
+    assert torch.all(compact["fill_count_entry"] > 0)
+    assert torch.all(compact["fill_count"] > compact["fill_count_entry"])
+    if forced_delist:
+        assert torch.all(compact["hsl_panic_close_loss_sum"] > 0)
+    assert ("coin_fill_counts" in compact) is collect_counts
+    if collect_counts:
+        torch.testing.assert_close(
+            compact["coin_fill_counts"].sum(dim=1), compact["fill_count"],
+            rtol=0, atol=0,
+        )
+        requested = {"fills_top_symbol_share", "fills_active_symbols_count"}
+        expected_metrics = _fill_activity_metrics(full, run, requested)
+        actual_metrics = _fill_activity_metrics(compact, run, requested)
+        for name in requested:
+            torch.testing.assert_close(
+                actual_metrics[name], expected_metrics[name], rtol=0, atol=0
+            )
 
 
 @pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
@@ -18110,7 +18179,7 @@ kernel void passivbot_tm_multicoin_market_wel_reservation_probe(
         (2, 1), dtype=torch.int32, device=gpu_device()
     )
     touch_min_qty_relation = torch.zeros(
-        (2, 1), dtype=torch.int32, device=gpu_device()
+        (2, 1), dtype=torch.int8 if gpu_device() == "cuda" else torch.int32, device=gpu_device()
     )
     coin_settings = torch.zeros((1, 13), dtype=torch.float32, device=gpu_device())
     coin_settings[0, 0] = 0.001
@@ -18245,7 +18314,7 @@ kernel void passivbot_tm_multicoin_market_unstuck_reservation_probe(
         (2, 1), dtype=torch.int32, device=gpu_device()
     )
     touch_min_qty_relation = torch.zeros(
-        (2, 1), dtype=torch.int32, device=gpu_device()
+        (2, 1), dtype=torch.int8 if gpu_device() == "cuda" else torch.int32, device=gpu_device()
     )
     coin_settings = torch.zeros((1, 13), dtype=torch.float32, device=gpu_device())
     coin_settings[0, 0] = 0.001
@@ -18492,7 +18561,7 @@ kernel void passivbot_tm_multicoin_market_reducer_dust_probe(
         (2, 1), dtype=torch.int32, device=gpu_device()
     )
     touch_min_qty_relation = torch.zeros(
-        (2, 1), dtype=torch.int32, device=gpu_device()
+        (2, 1), dtype=torch.int8 if gpu_device() == "cuda" else torch.int32, device=gpu_device()
     )
     coin_settings = torch.zeros((1, 13), dtype=torch.float32, device=gpu_device())
     coin_settings[0, 0] = 0.1
@@ -22058,3 +22127,32 @@ def test_tm_directional_chunking_uses_actual_batch_work_and_switches_safely():
                 assert value == expected[key]
         assert runner.last_profile["dispatch_count"] == (1 if count == 1 else 3)
         assert ("temporal_chunk_bars" in runner.last_profile) == (count == 3)
+
+
+
+
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
+@pytest.mark.parametrize('side', ['long', 'short'])
+def test_tm_multicoin_scenario_batch_matches_separate_candidate_batches(side):
+    count = 503
+    steps = np.arange(count)
+    closes = np.column_stack([100 * (1 + .1 * np.sin(steps / 17 + c)) for c in range(2)])
+    runner, row = _multicoin_exposure_fixture('trailing_martingale', side, count=count, closes=closes)
+    position_column = TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index('n_positions')
+    qty_column = TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index('entry_initial_qty_pct')
+    matrices, separate = [], []
+    for slots in (1, 2):
+        matrix = np.asarray([row] * 3, dtype=np.float64)
+        matrix[:, position_column] = slots
+        matrix[:, qty_column] = [.1, .5, 1.]
+        matrices.append(matrix)
+        separate.append({k: v.cpu().clone() if isinstance(v, torch.Tensor) else v
+                         for k, v in runner.run(matrix).items()})
+    together = runner.run(np.concatenate(matrices))
+    assert together['fill_count'].sum().item() > 0
+    for key, value in together.items():
+        if isinstance(value, torch.Tensor):
+            expected = torch.cat([output[key] for output in separate])
+            torch.testing.assert_close(value.cpu(), expected, rtol=0, atol=0, equal_nan=True)
+        else:
+            assert value == separate[0][key] == separate[1][key]

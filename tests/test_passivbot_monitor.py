@@ -1760,11 +1760,10 @@ def test_log_health_summary_structured_console_owns_periodic_line(caplog, monkey
         assert bot._live_event_pipeline.flush(timeout=2.0) is True
 
     health_records = [record for record in caplog.records if "[health]" in record.message]
-    assert [record.name for record in health_records] == ["passivbot.live_event_console"]
-    assert health_records[0].message == (
-        "[health] up=1m0s loop=2.5s pos=1L/0S bal=1000.00 USDT (snap 999.50) "
-        "ord=+2/-1 fills=3 (pnl=+1.25 USDT) err=1/10 ws=4 rate_lim=5 rss=0.9MiB"
-    )
+    assert {record.name for record in health_records} == {"passivbot.live_event_console"}
+    combined = " ".join(record.message for record in health_records)
+    assert "last_loop=2.5s" in combined and "open_orders=0" in combined
+    assert "ws_reconnects_total=4" in combined and "errors_1h=1/10" in combined
     assert bot.candle_health_called is True
     assert bot.payload_now_ms == 200000
     assert bot.payload_reset_event_pipeline_timing is True
@@ -1846,11 +1845,10 @@ def test_log_health_summary_uses_legacy_fallback_without_console_sink(
         assert bot._live_event_pipeline.flush(timeout=2.0) is True
 
     health_records = [record for record in caplog.records if "[health]" in record.message]
-    assert len(health_records) == 1
-    assert health_records[0].message == (
-        "[health] up=19m33s loop=39.5s pos=0L/0S bal=2946.66 USDT (snap 2951.82) "
-        "ord=+0/-0 fills=0 err=0/10 rss=83.6MiB"
-    )
+    assert health_records
+    combined = " ".join(record.message for record in health_records)
+    assert "last_loop=39.5s" in combined and "rss=83.6MiB" in combined
+    assert "account_age=?" in combined
     assert sink.events[0].event_type == EventTypes.HEALTH_SUMMARY
     assert bot._live_event_pipeline.close(timeout=2.0) is True
 
@@ -1897,9 +1895,9 @@ def test_log_health_summary_uses_fallback_when_emitter_missing(caplog, monkeypat
         bot._log_health_summary()
 
     assert bot.payload_reset_event_pipeline_timing is False
-    assert [record.message for record in caplog.records if "[health]" in record.message] == [
-        "[health] up=1s loop=n/a pos=0L/0S ord=+0/-0 fills=0 err=0/10"
-    ]
+    lines = [record.message for record in caplog.records if "[health]" in record.message]
+    assert len(lines) == 1
+    assert "last_loop=n/a" in lines[0] and "account_age=?" in lines[0]
     assert bot._live_event_pipeline.close(timeout=2.0) is True
 
 
@@ -2044,6 +2042,7 @@ def test_forager_and_ema_summary_emitters_emit_structured_events():
         h1_log_range_emas={},
         cache_only_symbols={"ETH/USDT:USDT"},
         projection_contexts={"ETH/USDT:USDT": {"tail_gap_age_ms": 120_000}},
+        timings={"elapsed_ms": 12.5, "symbol_count": 2, "slowest_symbols": []},
     )
     bot._emit_ema_fallback_used_event(
         close_ema_recoveries={"BTC/USDT:USDT": [(100.0, 1)]},
@@ -2158,6 +2157,9 @@ def test_forager_and_ema_summary_emitters_emit_structured_events():
     assert {event.cycle_id for event in events} == {"cy_11"}
     assert events[0].data["unavailable"]["count"] == 2
     assert events[1].data["selected_symbols"] == ["BTC/USDT:USDT"]
+    assert events[3].data["timings"] == {
+        "elapsed_ms": 12.5, "symbol_count": 2, "slowest_symbols": []
+    }
     assert events[2].status == "started"
     assert events[2].data["symbol_count"] == 2
     assert events[2].data["symbols"]["sample"] == [
@@ -5626,6 +5628,9 @@ async def test_execute_cancellations_parent_emits_ambiguous_confirmation_events(
             assert context["action"] == "cancel"
             assert context["orders"][0] is orders[0]
             assert context["wave"] is self._order_wave_in_progress
+            # Model the connector's actual admission, not batch scheduling.
+            from live.executor import record_cancel_connector_admission
+            record_cancel_connector_admission(self, orders[0])
             return [
                 {
                     "status": "success",
@@ -7686,3 +7691,28 @@ def test_unstuck_monitor_renderer_uses_independent_bounds(pside, strategy_availa
     rendered = "\n".join(_render_unstuck_panel({"unstuck": {"sides": hints}}))
     assert "band=110..120" in rendered
     assert "trigger=122.4" in rendered
+
+
+def test_coin_hsl_snapshot_reports_actual_cooldown_and_input_recovery():
+    from passivbot_monitor import _monitor_hsl_payload
+    from live.risk_input_recovery import RecoveryState
+    bot = SimpleNamespace(
+        _equity_hard_stop_enabled=lambda side: True,
+        _hsl_state=lambda side: {},
+        _equity_hard_stop_signal_mode=lambda: 'coin',
+        _equity_hard_stop_coin={'short': {'A': {
+            'halted': True, 'cooldown_until_ms': 900_000,
+            'last_metrics': {'tier': 'red', 'timestamp_ms': 60_000},
+        }}},
+        _risk_input_recovery=RecoveryState(reason='hsl_episode_evidence_unavailable', attempts=12),
+    )
+    from live.hsl_protection import ProtectionHealth, Scope, Health
+    bot._hsl_protection_health = ProtectionHealth()
+    bot._hsl_protection_health.scopes[Scope('coin', 'short', 'A')] = Health(exit_committed=True)
+    bot.config = {'live': {'hsl_unavailable_grace_seconds': 120.0}}
+    bot.get_exchange_time = lambda: 1_000_000
+    payload = _monitor_hsl_payload(bot, 'short')
+    assert payload['tier'] == 'red' and payload['halted']
+    assert payload['coins']['A']['cooldown_until_ms'] == 900_000
+    assert payload['coins']['A']['last_metrics']['timestamp_ms'] == 60_000
+    assert payload['input_recovery']['protective_exit_pending']

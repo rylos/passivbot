@@ -997,7 +997,7 @@ class TestEntryCooldownDeltaGuardEvents:
         finally:
             assert bot._live_event_pipeline.close(timeout=2.0) is True
 
-        assert "entry cooldown position-delta guard anchored" in caplog.text
+        assert "add-entry cooldown anchored" in caplog.text
         events = [
             event
             for event in sink.events
@@ -1047,7 +1047,7 @@ class TestEntryCooldownDeltaGuardEvents:
         finally:
             assert bot._live_event_pipeline.close(timeout=2.0) is True
 
-        assert "entry cooldown position-delta guard anchored" not in caplog.text
+        assert "add-entry cooldown anchored" not in caplog.text
         events = [
             event
             for event in sink.events
@@ -1087,7 +1087,9 @@ class TestPrepBacktestArgsMaxRealizedLossPct:
                 "btc_collateral_cap": 0.5,
                 "btc_collateral_ltv_cap": None,
                 "filter_by_min_effective_cost": False,
+                "hsl_detailed_report": False,
                 "dynamic_wel_by_tradability": True,
+                "limit_order_fill_buffer_pct": 0.0,
             },
             "bot": {
                 "long": {
@@ -1169,7 +1171,9 @@ class TestPrepBacktestArgsEquityHardStopLoss:
                 "btc_collateral_cap": 0.5,
                 "btc_collateral_ltv_cap": None,
                 "filter_by_min_effective_cost": False,
+                "hsl_detailed_report": False,
                 "dynamic_wel_by_tradability": True,
+                "limit_order_fill_buffer_pct": 0.0,
             },
             "bot": {
                 "long": {

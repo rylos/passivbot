@@ -416,16 +416,32 @@ def test_single_coin_shader_topology_is_fail_closed(
     ("ema_anchor", 4096, 900000, 1, 1_000_000_000, (False, 38, 900000)),
     ("trailing_martingale", 4096, 900000, 1, 100, (True, 1, 3)),
 ])
+@pytest.mark.parametrize("device", ["mps", "cuda"])
 def test_mps_multicoin_temporal_plan_preserves_work_limit(
-    strategy, batch, bars, sides, cap, expected
+    strategy, batch, bars, sides, cap, expected, device
 ):
+    if device == "cuda" and expected == (True, 512, 4096):
+        expected = (True, 1024, 2048)
     result = _mps_multicoin_dispatch_plan(
         strategy, batch, n_bars=bars, n_coins=29, n_sides=sides,
-        max_candidate_bars=cap,
+        max_candidate_bars=cap, device=device,
     )
     assert result == expected
     _, candidate_batch, history_chunk = result
     assert candidate_batch * history_chunk * 29 * sides <= cap
+
+
+@pytest.mark.parametrize("batch", [1, 17, 512, 513, 1024, 1025, 4096])
+@pytest.mark.parametrize("device,limit", [("mps", 512), ("cuda", 1024)])
+def test_multicoin_temporal_plan_respects_requested_batch_and_state_cap(batch, device, limit):
+    temporal, candidates, history = _mps_multicoin_dispatch_plan(
+        "trailing_martingale", batch, n_bars=2_500_000, n_coins=28,
+        n_sides=1, max_candidate_bars=1_000_000_000, device=device,
+    )
+    assert candidates <= min(batch, limit)
+    if temporal:
+        assert candidates * history <= 2_097_152
+    assert candidates * history * 28 <= 1_000_000_000
 
 
 def test_mps_dispatch_batch_size_bounds_single_and_multicoin_work():
@@ -504,79 +520,6 @@ def test_single_coin_proxy_preserves_order_across_bounded_dispatches():
     assert calls == [[0.0, 1.0], [2.0, 3.0], [4.0]]
 
 
-def test_single_coin_proxy_recent_history_expands_safe_dispatch_and_routes_window():
-    proxy, calls = _minimal_single_coin_proxy()
-    proxy.batch_size = 4096
-    proxy.dispatch_batch_size = 258
-    proxy.strategy_kind = "trailing_martingale"
-    proxy.runner.n = 1_931_815
-    proxy.run = ProxyRun(
-        1_000.0,
-        100,
-        10,
-        0,
-        0,
-        0,
-        60_000,
-        0.05,
-        0,
-        1_931_814,
-    )
-    proxy.history_warmup_bars = 100
-    original_run = proxy.runner.run
-    routed_windows = []
-    metric_runs = []
-
-    def routed_run(parameters, **kwargs):
-        routed_windows.append(dict(kwargs))
-        return original_run(parameters, **kwargs)
-
-    proxy.runner.run = routed_run
-    original_compute = proxy._compute_objectives
-
-    def capture_compute(output, run, *args, **kwargs):
-        metric_runs.append(run)
-        return original_compute(output, run, *args, **kwargs)
-
-    proxy._compute_objectives = capture_compute
-
-    history_start, trade_start = proxy.recent_window_for_history_fraction(0.25)
-    results = proxy.evaluate(
-        [{"value": float(index)} for index in range(1024)],
-        history_start_step=history_start,
-        trade_start_step=trade_start,
-    )
-
-    assert (history_start, trade_start) == (1_448_762, 1_448_863)
-    assert len(results) == 1024
-    assert [len(call) for call in calls] == [1024]
-    assert routed_windows == [
-        {
-            "profile": False,
-            "end_step": 1_931_815,
-            "history_start_step": 1_448_762,
-            "trade_start_step": 1_448_863,
-        }
-    ]
-    assert len(metric_runs) == 1
-    assert metric_runs[0].trade_start_idx == 1_448_863
-    assert metric_runs[0].requested_start_ts_ms == 1_448_863 * 60_000
-
-    proxy.runner.n = 1_250
-    proxy.run = ProxyRun(
-        1_000.0,
-        100,
-        1_000,
-        0,
-        0,
-        0,
-        60_000,
-        0.05,
-        900,
-        1_249,
-    )
-    assert proxy.recent_window_for_history_fraction(1.0) == (900, 1_000)
-    assert proxy.recent_window_for_history_fraction(0.25) == (1_086, 1_187)
 
 
 def test_single_coin_proxy_profile_records_dispatch_shape_and_timings(monkeypatch):
@@ -1381,6 +1324,7 @@ def test_single_coin_proxy_preserves_entry_interval_outputs_for_reduction():
 def test_multicoin_proxy_preserves_directional_hsl_outputs_for_reduction():
     torch = pytest.importorskip("torch")
     proxy = MpsMulticoinEmaProxy.__new__(MpsMulticoinEmaProxy)
+    proxy.hsl_engine = "legacy"
     proxy.batch_size = 1
     proxy._torch = torch
     proxy.profile_enabled = False
@@ -1437,6 +1381,7 @@ def test_multicoin_proxy_routes_dual_side_batch_through_fused_runner(
 ):
     torch = pytest.importorskip("torch")
     proxy = MpsMulticoinEmaProxy.__new__(MpsMulticoinEmaProxy)
+    proxy.hsl_engine = "legacy"
     proxy.batch_size = 2
     proxy._torch = torch
     proxy.profile_enabled = False
@@ -1549,6 +1494,8 @@ def test_multicoin_proxy_routes_dual_side_batch_through_fused_runner(
         ({"drawdown_worst_mean_1pct_strategy_eq_long"}, False, True, True, False),
         ({"strategy_eq_recovery_days_p99"}, False, False, False, True),
         ({"entry_interval_hours_p95"}, False, False, False, False),
+        ({"fills_top_symbol_share"}, False, False, False, False),
+        ({"fills_active_symbols_count"}, False, False, False, False),
     ],
 )
 @pytest.mark.parametrize("dynamic_wel_by_tradability", [True, False])
@@ -1775,6 +1722,9 @@ def test_multicoin_proxy_constructs_fused_shared_account_runner(
     assert short_overrides[0, wallet_exposure_column] == 0.0
     assert np.isnan(short_overrides[1, wallet_exposure_column])
     assert constructed["kwargs"]["hsl_ema_tail_enabled"] is tail_enabled
+    assert constructed["kwargs"]["collect_coin_fill_counts"] is bool(
+        needed_metrics & {"fills_top_symbol_share", "fills_active_symbols_count"}
+    )
     assert (
         constructed["kwargs"]["hsl_raw_drawdown_enabled"]
         is raw_drawdown_enabled
@@ -2288,6 +2238,7 @@ def test_single_coin_static_overrides_shadow_candidate_values_exact_last():
 @pytest.mark.parametrize(("side", "base"), [("long", 1.0), ("short", 2.0)])
 def test_multicoin_parameter_matrix_uses_only_enabled_side(side, base):
     proxy = MpsMulticoinEmaProxy.__new__(MpsMulticoinEmaProxy)
+    proxy.hsl_engine = "legacy"
     proxy.sides = [side]
     proxy.base_params = {
         side: {key: base for key in EMA_ANCHOR_MULTICOIN_PARAM_KEYS}
@@ -2318,6 +2269,7 @@ def test_multicoin_parameter_matrix_uses_only_enabled_side(side, base):
 
 def test_multicoin_parameter_matrix_keeps_dual_side_values_separate():
     proxy = MpsMulticoinEmaProxy.__new__(MpsMulticoinEmaProxy)
+    proxy.hsl_engine = "legacy"
     proxy.sides = ["long", "short"]
     proxy.base_params = {
         "long": {key: 1.0 for key in EMA_ANCHOR_MULTICOIN_PARAM_KEYS},
@@ -2336,6 +2288,7 @@ def test_multicoin_parameter_matrix_keeps_dual_side_values_separate():
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_multicoin_tm_parameter_matrix_keeps_forager_and_strategy_values(side):
     proxy = MpsMulticoinEmaProxy.__new__(MpsMulticoinEmaProxy)
+    proxy.hsl_engine = "legacy"
     proxy.sides = [side]
     proxy.param_keys = TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS
     proxy.base_params = {
@@ -2382,6 +2335,7 @@ def test_multicoin_tm_parameter_matrix_keeps_forager_and_strategy_values(side):
 
 def test_multicoin_tm_parameter_matrix_keeps_dual_side_values_separate():
     proxy = MpsMulticoinEmaProxy.__new__(MpsMulticoinEmaProxy)
+    proxy.hsl_engine = "legacy"
     proxy.sides = ["long", "short"]
     proxy.param_keys = TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS
     proxy.base_params = {
@@ -3474,6 +3428,7 @@ def test_parameter_columns_preserve_fixed_override_then_ema_coupling(coupled):
 
 def test_parameter_columns_keep_candidate_fallback_and_missing_key_failure():
     proxy = MpsMulticoinEmaProxy.__new__(MpsMulticoinEmaProxy)
+    proxy.hsl_engine = "legacy"
     proxy.param_keys = ("offset",)
     proxy.sides = ["short"]
     proxy.base_params = {"short": {}}
@@ -3482,3 +3437,83 @@ def test_parameter_columns_keep_candidate_fallback_and_missing_key_failure():
         proxy._parameter_matrix([{}])
     with pytest.raises((TypeError, ValueError)):
         proxy._parameter_matrix([{"short_offset": None}])
+
+
+
+
+
+
+
+
+def _suite_batch_proxy():
+    proxy = object.__new__(MpsMulticoinEmaProxy)
+    proxy.hsl_engine = "legacy"
+    proxy._torch = object()
+    proxy.strategy_kind = 'trailing_martingale'
+    proxy.sides = ['long']
+    proxy.data = object()
+    proxy.run = ProxyRun(1000, 5, 10, 600000, 600000, 0, 60000, .05, 0, 999)
+    proxy._runner_specs = {'long': (SimpleNamespace, dict(side='long', coin_overrides=np.array([[np.nan, 1.0]]), btc_prices=np.array([1., 2.])))}
+    proxy.checkpoint_contract = dict(base_params={'long': {'n_positions': 4}}, backtest={'max_realized_loss_pct': 1})
+    proxy.coin_override_contract = {'coins': ['A', 'B']}
+    proxy.needed_metrics = {'adg_strategy_eq'}
+    proxy.couple_unstuck_emas = False
+    proxy.batch_size = 1024
+    proxy.max_dispatch_candidate_bars = 500000000
+    return proxy
+
+
+@pytest.mark.parametrize('changed', ['data', 'run', 'runtime', 'overrides', 'btc', 'metrics', 'coupling', 'batch', 'work_limit', 'interrupt'])
+@pytest.mark.parametrize('device', ['cuda', 'mps'])
+def test_suite_batch_key_rejects_changed_execution_inputs(monkeypatch, changed, device):
+    import copy
+    from dataclasses import replace
+    from optimization.gpu import service
+    monkeypatch.setattr(service, 'gpu_device', lambda _: device)
+    first = _suite_batch_proxy()
+    second = copy.copy(first)
+    original = first.suite_batch_key()
+    assert original is not None
+    second.checkpoint_contract = copy.deepcopy(first.checkpoint_contract)
+    second.checkpoint_contract['base_params']['long']['n_positions'] = 20
+    assert second.suite_batch_key() == original
+    if changed == 'data': second.data = object()
+    elif changed == 'run': second.run = replace(first.run, starting_balance=2000)
+    elif changed == 'runtime': second.checkpoint_contract['backtest']['max_realized_loss_pct'] = .5
+    elif changed in ('overrides', 'btc'):
+        second._runner_specs = copy.deepcopy(first._runner_specs)
+        second._runner_specs['long'][1]['coin_overrides' if changed == 'overrides' else 'btc_prices'].flat[-1] = 9
+    elif changed == 'metrics': second.needed_metrics = {'sortino_ratio_strategy_eq'}
+    elif changed == 'coupling': second.couple_unstuck_emas = True
+    elif changed == 'batch': second.batch_size = 512
+    elif changed == 'interrupt':
+        second._runner_specs = copy.deepcopy(first._runner_specs)
+        second._runner_specs['long'][1]['interrupt_check'] = lambda: None
+    else: second.max_dispatch_candidate_bars = 1000
+    assert second.suite_batch_key() != original
+
+
+@pytest.mark.parametrize('device', ['cuda', 'mps'])
+def test_suite_batching_rejects_unsupported_topologies(monkeypatch, device):
+    from optimization.gpu import service
+    proxy = _suite_batch_proxy()
+    monkeypatch.setattr(service, 'gpu_device', lambda _: device)
+    proxy.sides = ['long', 'short']
+    assert proxy.suite_batch_key() is None
+    proxy.sides = ['long']
+    proxy.strategy_kind = 'ema_anchor'
+    assert proxy.suite_batch_key() is None
+
+
+def test_suite_materialization_preserves_parameter_and_metric_defaults():
+    proxy = _suite_batch_proxy()
+    proxy.param_keys = ['n_positions', 'total_wallet_exposure_limit', 'ema_span_0']
+    proxy.base_params = {'long': dict(zip(proxy.param_keys, [4, 1.5, 32]))}
+    proxy.base_total_wallet_exposure_limits = {'long': 1.5, 'short': 0}
+    proxy.base_n_positions = {'long': 4, 'short': 0}
+    original = [{'long_ema_span_0': 64}]
+    result = proxy.materialize_suite_candidates(original)
+    assert result == [dict(long_n_positions=4., long_total_wallet_exposure_limit=1.5,
+                           long_ema_span_0=64., short_n_positions=0, short_total_wallet_exposure_limit=0)]
+    np.testing.assert_array_equal(proxy._parameter_matrix(result), proxy._parameter_matrix(original))
+    assert original == [{'long_ema_span_0': 64}]

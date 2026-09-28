@@ -1,3 +1,4 @@
+from simulation_data import OfflineDataError, is_offline, simulation_data_scope, data_manifest
 import os
 from datetime import datetime, timezone
 import sys
@@ -286,6 +287,18 @@ def _resolve_backtest_hsl_configs(config: dict) -> tuple[dict, dict]:
         }
 
     return _convert(long_cfg), _convert(short_cfg)
+
+
+def _resolve_backtest_revised_hsl(config, coin_policies):
+    """Transport canonical policies, preserving explicit disabled null choices."""
+    mode = _resolve_backtest_hsl_signal_mode(config)
+    return {
+        "engine": "revised",
+        "mode": mode,
+        "sides": [deepcopy(config["bot"][side]["hsl"]) for side in POSITION_SIDES],
+        "portfolio": deepcopy(config["bot"]["hsl"]) if mode == "unified" else None,
+        "coins": coin_policies if mode == "coin" else {},
+    }
 
 
 def _resolve_backtest_hsl_signal_mode(config: dict) -> str:
@@ -944,6 +957,7 @@ class BacktestExecutionSettings:
     market_orders_allowed: bool
     market_order_near_touch_threshold: float
     market_order_slippage_pct: float
+    limit_order_fill_buffer_pct: float
     pnls_max_lookback_days: str | float
     pnls_max_lookback_days_backtest_value: float
 
@@ -1046,6 +1060,10 @@ def build_backtest_payload(
     Assemble the bundle, bot params, and metadata needed to execute a backtest.
     """
 
+    from config.hsl_revised import require_runtime_support
+    require_runtime_support(config, supported_modes=("coin", "pside", "unified"))
+    if runtime_config is not None:
+        require_runtime_support(runtime_config, supported_modes=("coin", "pside", "unified"))
     if runtime_config is None:
         runtime_config = compile_runtime_config(config, runtime="backtest", record_step=False)
     if execution_settings is None:
@@ -1329,14 +1347,16 @@ def execute_backtest(payload: BacktestPayload, config: dict):
             rust_profile = dict(profile_value)
     payload.rust_profile = rust_profile
 
+    payload.hard_stop_plot_data = dict(hard_stop_plot_data or {})
+    payload.hard_stop_plot_data.pop("_rust_profile", None)
     if payload.backtest_params.get("metrics_only", False):
-        payload.hard_stop_plot_data = {}
+        payload.hard_stop_plot_data = {
+            key: value for key, value in payload.hard_stop_plot_data.items() if key == "revised"
+        }
         analysis = expand_analysis(analysis_usd, analysis_btc, None, equities_array, config)
         return None, None, analysis
 
     equities_array = np.asarray(equities_array)
-    payload.hard_stop_plot_data = dict(hard_stop_plot_data or {})
-    payload.hard_stop_plot_data.pop("_rust_profile", None)
     analysis = expand_analysis(analysis_usd, analysis_btc, fills, equities_array, config)
     if bool(analysis.get("liquidated", False)):
         final_equity_usd = (
@@ -1456,6 +1476,11 @@ def subset_backtest_payload(
         if key in new_backtest_params and isinstance(new_backtest_params[key], list):
             new_backtest_params[key] = _select(new_backtest_params[key])
     new_backtest_params.pop("active_coin_indices", None)
+    hsl = new_backtest_params.get("equity_hard_stop_loss")
+    if hsl is not None and hsl.get("engine") == "revised" and hsl["mode"] == "coin":
+        selected_coins = set(new_backtest_params["coins"])
+        hsl["coins"] = {coin: policy for coin, policy in hsl["coins"].items() if coin in selected_coins}
+
 
     return BacktestPayload(
         bundle=new_bundle,
@@ -2104,6 +2129,9 @@ def _save_coins_hlcvs_artifacts_to_cache_dir(
         precomputed_array_hashes=array_hashes,
     )
     raise_if_backtest_cancel_requested("cache manifest write")
+    offline_snapshot = mss.get("__meta__", {}).get("offline_snapshot")
+    if offline_snapshot is not None:
+        manifest.setdefault("preparation", {})["offline_snapshot"] = offline_snapshot
     write_hlcvs_manifest(cache_dir, manifest)
     json.dump(
         {
@@ -2248,6 +2276,7 @@ def assert_hlcv_has_tradable_coverage(coins, mss):
         raise ValueError("HLCV data has no tradable candles after warmup")
 
 
+@simulation_data_scope
 async def prepare_hlcvs_mss(
     config,
     exchange,
@@ -2255,6 +2284,8 @@ async def prepare_hlcvs_mss(
     force_refetch_gaps: bool = False,
     allow_internal_nan_gaps: bool = False,
 ):
+    if is_offline() and force_refetch_gaps:
+        raise ValueError("backtest.offline cannot be combined with force_refetch_gaps")
     base_dir = require_config_value(config, "backtest.base_dir")
     results_path = oj(base_dir, exchange, "")
     warmup_map = compute_per_coin_warmup_minutes(config)
@@ -2294,6 +2325,12 @@ async def prepare_hlcvs_mss(
     override_result = load_hlcvs_data_override(config, exchange)
     if override_result is not None:
         cache_dir, coins, hlcvs, mss, results_path, btc_usd_prices, timestamps = override_result
+        if is_offline() and not mss.get("__meta__", {}).get("offline_snapshot"):
+            release_materialized_payload(hlcvs)
+            raise OfflineDataError(
+                "Offline dataset override lacks verified offline coverage provenance. "
+                "Prepare it once from raw caches using --offline y without --hlcvs-data-dir."
+            )
         ensure_valid_index_metadata(mss, hlcvs, coins, warmup_map)
         _validate_hlcvs_valid_windows_from_mss(
             hlcvs,
@@ -2326,6 +2363,9 @@ async def prepare_hlcvs_mss(
             cache_dir, coins, hlcvs, mss, results_path, btc_usd_prices, timestamps = (
                 result
             )
+            if is_offline() and not mss.get("__meta__", {}).get("offline_snapshot"):
+                release_materialized_payload(hlcvs)
+                raise OfflineDataError("Prepared cache lacks offline coverage provenance; verifying raw caches")
             logging.info(f"Successfully loaded hlcvs data from cache")
             ensure_valid_index_metadata(mss, hlcvs, coins, warmup_map)
             _validate_hlcvs_valid_windows_from_mss(
@@ -2400,6 +2440,8 @@ async def prepare_hlcvs_mss(
     )
     warn_hlcv_valid_range_coverage(config, coins, mss, timestamps)
     assert_hlcv_has_tradable_coverage(coins, mss)
+    if is_offline():
+        mss.setdefault("__meta__", {})["offline_snapshot"] = data_manifest()
     logging.info(f"Finished preparing hlcvs data for {exchange}. Shape: {hlcvs.shape}")
     try:
         cache_dir = save_coins_hlcvs_to_cache(
@@ -2411,7 +2453,7 @@ async def prepare_hlcvs_mss(
             btc_usd_prices,
             timestamps,
             warmup_minutes=backtest_warmup_minutes,
-            force_overwrite=force_refetch_gaps,
+            force_overwrite=force_refetch_gaps or is_offline(),
         )
     except Exception as e:
         release_materialized_payload(hlcvs)
@@ -2440,6 +2482,11 @@ def get_backtest_execution_settings(
 ) -> BacktestExecutionSettings:
     if not is_runtime_compiled:
         config = compile_runtime_config(config, runtime="backtest", record_step=False)
+    from config.validate import validate_limit_order_fill_buffer_pct
+
+    limit_order_fill_buffer_pct = validate_limit_order_fill_buffer_pct(
+        require_config_value(config, "backtest.limit_order_fill_buffer_pct")
+    )
     market_order_slippage_pct = float(
         get_optional_config_value(config, "backtest.market_order_slippage_pct", 0.0005)
         or 0.0
@@ -2469,6 +2516,7 @@ def get_backtest_execution_settings(
         market_orders_allowed=market_orders_allowed,
         market_order_near_touch_threshold=market_order_near_touch_threshold,
         market_order_slippage_pct=market_order_slippage_pct,
+        limit_order_fill_buffer_pct=limit_order_fill_buffer_pct,
         pnls_max_lookback_days=pnls_max_lookback.display_value,
         pnls_max_lookback_days_backtest_value=pnls_max_lookback.to_backtest_days_value(),
     )
@@ -2491,6 +2539,10 @@ def log_backtest_execution_settings(
     logging.info(
         "[backtest]   market_order_slippage_pct = %s (backtest)",
         execution_settings.market_order_slippage_pct,
+    )
+    logging.info(
+        "[backtest]   limit_order_fill_buffer_pct = %s (backtest)",
+        execution_settings.limit_order_fill_buffer_pct,
     )
     logging.info(
         "[backtest]   pnls_max_lookback_days = %s (live)",
@@ -2548,6 +2600,8 @@ def prep_backtest_args(
     is_runtime_compiled: bool = False,
     metrics_only: bool = False,
 ):
+    from config.hsl_revised import engine
+
     if not is_runtime_compiled:
         config = compile_runtime_config(config, runtime="backtest", record_step=False)
     if execution_settings is None:
@@ -2562,6 +2616,7 @@ def prep_backtest_args(
         config.get("backtest", {}).get("candle_interval_minutes", 1) or 1
     )
     bot_params_list = []
+    revised_coin_policies = {}
     strategy_params_list = []
     bot_params_template = deepcopy(require_config_value(config, "bot"))
     strategy_template = get_active_strategy_config(config, strategy_kind=strategy_kind)
@@ -2604,6 +2659,12 @@ def prep_backtest_args(
             coin_specific_bot_params[pside]["entry_eligible"] = (
                 coin_specific_bot_params[pside]["wallet_exposure_limit"] != 0.0
             )
+        if engine(config) == "revised":
+            revised_coin_policies[coin] = [
+                {**deepcopy(bot_params_template[side]["hsl"]),
+                 **deepcopy(coin_override_bot.get(side, {}).get("hsl", {}))}
+                for side in POSITION_SIDES
+            ]
         bot_params_list.append(coin_specific_bot_params)
         strategy_params_list.append(coin_specific_strategy_params)
     maker_fee_override = get_optional_config_value(
@@ -2657,90 +2718,101 @@ def prep_backtest_args(
             }
             for coin in coins
         ]
-    if backtest_params is None:
-        hard_stop_cfg_long, hard_stop_cfg_short = _resolve_backtest_hsl_configs(config)
-        hsl_signal_mode = _resolve_backtest_hsl_signal_mode(config)
-        if not isinstance(hard_stop_cfg_long, dict) or not isinstance(
-            hard_stop_cfg_short, dict
+    if backtest_params is not None:
+        supplied_hsl = backtest_params["equity_hard_stop_loss"]
+        if supplied_hsl.get("engine", "legacy") != engine(config):
+            raise ValueError("cached backtest HSL engine differs from the selected config")
+        if engine(config) == "revised" and supplied_hsl != _resolve_backtest_revised_hsl(
+            config, revised_coin_policies
         ):
-            raise TypeError("HSL pside configs must be dicts")
+            raise ValueError("cached revised HSL policies differ from the effective config")
+    if backtest_params is None:
+        if engine(config) == "revised":
+            hard_stop_cfg_long = _resolve_backtest_revised_hsl(config, revised_coin_policies)
+        else:
+            hard_stop_cfg_long, hard_stop_cfg_short = _resolve_backtest_hsl_configs(config)
+            hsl_signal_mode = _resolve_backtest_hsl_signal_mode(config)
+            if not isinstance(hard_stop_cfg_long, dict) or not isinstance(
+                hard_stop_cfg_short, dict
+            ):
+                raise TypeError("HSL pside configs must be dicts")
 
-        def _normalize_hsl_cfg(cfg: dict, path_prefix: str) -> dict:
-            tier_ratios = cfg.get("tier_ratios")
-            if not isinstance(tier_ratios, dict):
-                raise TypeError(
-                    f"{path_prefix}.tier_ratios must be a dict, got {type(tier_ratios).__name__}"
+            def _normalize_hsl_cfg(cfg: dict, path_prefix: str) -> dict:
+                tier_ratios = cfg.get("tier_ratios")
+                if not isinstance(tier_ratios, dict):
+                    raise TypeError(
+                        f"{path_prefix}.tier_ratios must be a dict, got {type(tier_ratios).__name__}"
+                    )
+                enabled = bool(cfg["enabled"])
+                red_threshold = float(cfg["red_threshold"])
+                ema_span_minutes = float(cfg["ema_span_minutes"])
+                cooldown_minutes_after_red = float(cfg["cooldown_minutes_after_red"])
+                no_restart_drawdown_threshold = float(cfg["no_restart_drawdown_threshold"])
+                tier_ratio_yellow = float(tier_ratios["yellow"])
+                tier_ratio_orange = float(tier_ratios["orange"])
+                orange_tier_mode = str(cfg["orange_tier_mode"])
+                panic_close_order_type = str(cfg["panic_close_order_type"])
+                restart_after_red_policy = normalize_hsl_restart_after_red_policy(
+                    cfg.get("restart_after_red_policy", "threshold"),
+                    path=f"{path_prefix}.restart_after_red_policy",
                 )
-            enabled = bool(cfg["enabled"])
-            red_threshold = float(cfg["red_threshold"])
-            ema_span_minutes = float(cfg["ema_span_minutes"])
-            cooldown_minutes_after_red = float(cfg["cooldown_minutes_after_red"])
-            no_restart_drawdown_threshold = float(cfg["no_restart_drawdown_threshold"])
-            tier_ratio_yellow = float(tier_ratios["yellow"])
-            tier_ratio_orange = float(tier_ratios["orange"])
-            orange_tier_mode = str(cfg["orange_tier_mode"])
-            panic_close_order_type = str(cfg["panic_close_order_type"])
-            restart_after_red_policy = normalize_hsl_restart_after_red_policy(
-                cfg.get("restart_after_red_policy", "threshold"),
-                path=f"{path_prefix}.restart_after_red_policy",
-            )
-            if enabled and red_threshold <= 0.0:
-                raise ValueError(
-                    f"{path_prefix}.red_threshold must be > 0.0 when enabled"
-                )
-            if enabled and ema_span_minutes <= 0.0:
-                raise ValueError(
-                    f"{path_prefix}.ema_span_minutes must be > 0.0 when enabled"
-                )
-            if cooldown_minutes_after_red < 0.0:
-                raise ValueError(
-                    f"{path_prefix}.cooldown_minutes_after_red must be >= 0.0"
-                )
-            if no_restart_drawdown_threshold < red_threshold:
-                logging.info(
-                    "[config] clamped %s.no_restart_drawdown_threshold %.6f -> %.6f to match red_threshold",
-                    path_prefix,
-                    no_restart_drawdown_threshold,
-                    red_threshold,
-                )
-                no_restart_drawdown_threshold = red_threshold
-            if not (red_threshold <= no_restart_drawdown_threshold <= 1.0):
-                raise ValueError(
-                    f"{path_prefix}.no_restart_drawdown_threshold must satisfy red_threshold <= no_restart_drawdown_threshold <= 1.0"
-                )
-            if not (0.0 < tier_ratio_yellow < tier_ratio_orange < 1.0):
-                raise ValueError(
-                    f"{path_prefix}.tier_ratios must satisfy 0 < yellow < orange < 1"
-                )
-            if orange_tier_mode not in {
-                "graceful_stop",
-                "tp_only_with_active_entry_cancellation",
-            }:
-                raise ValueError(
-                    f"{path_prefix}.orange_tier_mode must be one of {{graceful_stop, tp_only_with_active_entry_cancellation}}"
-                )
-            if panic_close_order_type not in {"market", "limit"}:
-                raise ValueError(
-                    f"{path_prefix}.panic_close_order_type must be one of {{market, limit}}"
-                )
-            return {
-                "enabled": enabled,
-                "signal_mode": hsl_signal_mode,
-                "red_threshold": red_threshold,
-                "ema_span_minutes": ema_span_minutes,
-                "cooldown_minutes_after_red": cooldown_minutes_after_red,
-                "no_restart_drawdown_threshold": no_restart_drawdown_threshold,
-                "restart_after_red_policy": restart_after_red_policy,
-                "tier_ratios": {
-                    "yellow": tier_ratio_yellow,
-                    "orange": tier_ratio_orange,
-                },
-                "orange_tier_mode": orange_tier_mode,
-                "panic_close_order_type": panic_close_order_type,
-            }
+                if enabled and red_threshold <= 0.0:
+                    raise ValueError(
+                        f"{path_prefix}.red_threshold must be > 0.0 when enabled"
+                    )
+                if enabled and ema_span_minutes <= 0.0:
+                    raise ValueError(
+                        f"{path_prefix}.ema_span_minutes must be > 0.0 when enabled"
+                    )
+                if cooldown_minutes_after_red < 0.0:
+                    raise ValueError(
+                        f"{path_prefix}.cooldown_minutes_after_red must be >= 0.0"
+                    )
+                if no_restart_drawdown_threshold < red_threshold:
+                    logging.info(
+                        "[config] clamped %s.no_restart_drawdown_threshold %.6f -> %.6f to match red_threshold",
+                        path_prefix,
+                        no_restart_drawdown_threshold,
+                        red_threshold,
+                    )
+                    no_restart_drawdown_threshold = red_threshold
+                if not (red_threshold <= no_restart_drawdown_threshold <= 1.0):
+                    raise ValueError(
+                        f"{path_prefix}.no_restart_drawdown_threshold must satisfy red_threshold <= no_restart_drawdown_threshold <= 1.0"
+                    )
+                if not (0.0 < tier_ratio_yellow < tier_ratio_orange < 1.0):
+                    raise ValueError(
+                        f"{path_prefix}.tier_ratios must satisfy 0 < yellow < orange < 1"
+                    )
+                if orange_tier_mode not in {
+                    "graceful_stop",
+                    "tp_only_with_active_entry_cancellation",
+                }:
+                    raise ValueError(
+                        f"{path_prefix}.orange_tier_mode must be one of {{graceful_stop, tp_only_with_active_entry_cancellation}}"
+                    )
+                if panic_close_order_type not in {"market", "limit"}:
+                    raise ValueError(
+                        f"{path_prefix}.panic_close_order_type must be one of {{market, limit}}"
+                    )
+                return {
+                    "enabled": enabled,
+                    "signal_mode": hsl_signal_mode,
+                    "red_threshold": red_threshold,
+                    "ema_span_minutes": ema_span_minutes,
+                    "cooldown_minutes_after_red": cooldown_minutes_after_red,
+                    "no_restart_drawdown_threshold": no_restart_drawdown_threshold,
+                    "restart_after_red_policy": restart_after_red_policy,
+                    "tier_ratios": {
+                        "yellow": tier_ratio_yellow,
+                        "orange": tier_ratio_orange,
+                    },
+                    "orange_tier_mode": orange_tier_mode,
+                    "panic_close_order_type": panic_close_order_type,
+                }
 
-        hard_stop_cfg_long = _normalize_hsl_cfg(hard_stop_cfg_long, "bot.long.hsl")
-        hard_stop_cfg_short = _normalize_hsl_cfg(hard_stop_cfg_short, "bot.short.hsl")
+            hard_stop_cfg_long = _normalize_hsl_cfg(hard_stop_cfg_long, "bot.long.hsl")
+            hard_stop_cfg_short = _normalize_hsl_cfg(hard_stop_cfg_short, "bot.short.hsl")
         liquidation_threshold = float(
             get_optional_config_value(config, "backtest.liquidation_threshold", 0.05)
             or 0.0
@@ -2772,6 +2844,7 @@ def prep_backtest_args(
             "trade_start_indices": [],
             "global_warmup_bars": 0,
             "metrics_only": bool(metrics_only),
+            "hsl_detailed_report": require_config_value(config, "backtest.hsl_detailed_report"),
             "skip_btc_analysis": False,
             "filter_by_min_effective_cost": bool(
                 require_config_value(config, "backtest.filter_by_min_effective_cost")
@@ -2786,6 +2859,7 @@ def prep_backtest_args(
             "pnls_max_lookback_days": execution_settings.pnls_max_lookback_days_backtest_value,
             "equity_hard_stop_loss": hard_stop_cfg_long,
             "market_order_slippage_pct": execution_settings.market_order_slippage_pct,
+            "limit_order_fill_buffer_pct": execution_settings.limit_order_fill_buffer_pct,
             "market_orders_allowed": execution_settings.market_orders_allowed,
             "market_order_near_touch_threshold": execution_settings.market_order_near_touch_threshold,
             "forager_score_hysteresis_pct": float(
@@ -2794,6 +2868,13 @@ def prep_backtest_args(
             ),
             "liquidation_threshold": liquidation_threshold,
         }
+    if backtest_params["equity_hard_stop_loss"].get("engine") == "revised":
+        # One authority for HSL policies: the explicit scope config above.
+        for pair in bot_params_list:
+            for side in POSITION_SIDES:
+                for key in list(pair[side]):
+                    if key.startswith("hsl_"):
+                        del pair[side][key]
     return bot_params_list, strategy_params_list, exchange_params, backtest_params
 
 
@@ -2946,6 +3027,12 @@ def post_process(
     label=None,
     plot_context: BacktestPlotContext | None = None,
 ):
+    from config.hsl_revised import engine
+    from hsl_revised_reporting import revised_report
+
+    hsl_report = revised_report(plot_context.hard_stop_plot_data if plot_context else None)
+    if engine(config) == "revised" and hsl_report is None:
+        raise ValueError("revised backtest results require their native HSL report")
     sts = utc_ms()
     disabled_plot_groups = parse_disabled_plot_groups(config.get("disable_plotting"))
     equities_array = np.asarray(equities_array)
@@ -2984,6 +3071,9 @@ def post_process(
     json.dump(
         analysis, open(f"{results_path}analysis.json", "w"), indent=4, sort_keys=True
     )
+    if hsl_report is not None:
+        with open(f"{results_path}hsl_report.json", "w", encoding="utf-8") as output:
+            json.dump(hsl_report, output, indent=2, sort_keys=True, allow_nan=False)
     original_config = config.get("_original_backtest_config")
     if original_config is not None:
         dump_config(
@@ -3222,6 +3312,8 @@ async def main():
         log_config_transforms=True,
         raw_snapshot=raw_snapshot,
     )
+    from config.hsl_revised import require_runtime_support
+    require_runtime_support(config, supported_modes=("coin", "pside", "unified"))
     config_logging_value = get_optional_config_value(config, "logging.level", None)
     effective_log_level = resolve_log_level(
         cli_log_level, config_logging_value, fallback=1
@@ -3295,7 +3387,7 @@ async def main():
         return
 
     for ex in backtest_exchanges:
-        await load_markets(ex)
+        await load_markets(ex, offline=config["backtest"].get("offline", False))
     await format_approved_ignored_coins(
         config, backtest_exchanges, prefer_backtest_coin_source_keys=True
     )

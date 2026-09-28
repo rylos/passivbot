@@ -67,6 +67,7 @@ between schemas, package versions, and tags.
 - **liquidation_threshold**: Early-stop backtest equity-floor guard. The run terminates once total equity falls to or below `starting_balance * liquidation_threshold`, and `backtest_completion_ratio` will fall below `1.0`. Example: with `starting_balance = 1000` and `liquidation_threshold = 0.05`, the backtest stops at equity `<= 50`. This is not a “5% drawdown” threshold; if the run never rises above the start, it corresponds to roughly a `0.95` worst drawdown. Must satisfy `0.0 <= liquidation_threshold < 1.0`.
 - **maker_fee_override**: Optional maker fee override (part-per-one; use `0.0002` for 0.02%). Leave `null` to use exchange-derived per-coin maker fees. CLI: `--maker-fee-override`.
 - **taker_fee_override**: Optional taker fee override (part-per-one; use `0.00055` for 0.055%). Leave `null` to use exchange-derived per-coin taker fees. CLI: `--taker-fee-override`.
+- **limit_order_fill_buffer_pct**: Backtest-only fill buffer, expressed as a fraction of the limit price (`0.0001` = 0.01%). A buy fills only when `low < limit_price * (1 - buffer)`; a sell fills only when `high > limit_price * (1 + buffer)`. Equality does not fill. Successful fills retain the original limit price and maker fee. Applies to all limit entries and closes, including protective limit closes, but not market execution. Default `0.0` preserves the original strict-crossing behavior. Must be finite and in `[0, 1)`. CPU optimization supports this fixed simulation setting; GPU optimization requires zero. Higher values may skip losing entries as well as profitable exits, so they do not guarantee worse performance.
 - **market_order_slippage_pct**: Backtest-only slippage applied whenever the backtester simulates market-order execution. This applies both to HSL panic closes when `bot.{long,short}.hsl.panic_close_order_type` is `"market"` and to normal orchestrator orders promoted to market execution by `live.market_orders_allowed`. A sell fills at `close * (1 - slippage_pct)` rounded down to `price_step`; a buy fills at `close * (1 + slippage_pct)` rounded up. The fill is guaranteed once the market-execution path is chosen, and the resulting fill also uses taker fees. Default `0.0005` (5 bps). This field is not a live slippage cap; live market orders use the exchange adapter's order semantics and any exchange/CCXT slippage controls.
 - **visible_metrics**: Controls which metrics are printed to the terminal after a standalone backtest. `null` shows the metrics implied by `optimize.scoring` and `optimize.limits`, `[]` shows all metrics, and an explicit list adds extra named metrics to the default view. This affects CLI visibility only; the full metric set is still computed and persisted.
   Fill-activity metrics use the `fills_*` prefix, including fill counts, per-day entry/close and long/short rates, no-fill gap durations, per-position-slot activity, active fill day counts/ratio, analysis duration, active symbol count, and top-symbol fill share.
@@ -153,6 +154,11 @@ HSL settings live under `bot.long.hsl` and `bot.short.hsl`. Use grouped names su
 `enabled`, `red_threshold`, `ema_span_minutes`, `cooldown_minutes_after_red`,
 `restart_after_red_policy`, `no_restart_drawdown_threshold`, `tier_ratios`,
 `orange_tier_mode`, and `panic_close_order_type`; do not prefix these leaves with `hsl_`.
+`live.hsl_engine` defaults to `legacy`. The experimental `revised` selection has
+separate [configuration migration rules](#experimental-revised-hsl-configuration)
+and is available for live execution, backtests and CPU optimization. See the
+[live validation and rollback checklist](hsl_revised_live_validation.md) before an operator-approved trial.
+
 `live.hsl_signal_mode` selects `coin` (default), `pside`, or `unified` signal construction.
 
 For parameter definitions, RED handling, cooldown/restart rules, per-coin overrides, and
@@ -264,24 +270,34 @@ The V8 `trailing_martingale` schema is a clean break from the v7 `trailing_grid`
 
 If a position is stuck, the bot uses profits from other positions to realize losses for the stuck position. If multiple positions are stuck, the position with the lowest price action distance is selected for unstucking.
 
-- **unstuck_close_pct**:
-  - Percentage of `full pos size * wallet_exposure_limit` to close for each unstucking order.
-- **unstuck_ema_dist**:
-  - Distance from EMA band to place unstucking order:
-    - `long_unstuck_close_price = upper_EMA_band * (1 + unstuck_ema_dist)`
-    - `short_unstuck_close_price = lower_EMA_band * (1 - unstuck_ema_dist)`
+These settings live under `bot.<side>.unstuck`. Effective WEL includes the resolved excess
+allowance: `effective_wel = wallet_exposure_limit * (1 + effective_we_excess_allowance_pct)`.
+
+- **unstuck.close_pct**:
+  - Fraction of the effective exposure budget used to size each close, not a fraction of the current position.
+  - Before quantity rounding and other constraints, `close_qty_abs = balance * effective_wel * close_pct / (close_price * c_mult)`.
+  - Rust applies quantity-step rounding, exchange minimums, remaining-position sizing and loss-allowance scaling. There is no additional cap to stop precisely at `unstuck.threshold`.
+- **unstuck.ema_dist**:
+  - Offset for the EMA eligibility trigger, not the submitted order price:
+    - Long: current price must reach `upper_EMA_band * (1 + ema_dist)`, rounded up to the price tick.
+    - Short: current price must reach `lower_EMA_band * (1 - ema_dist)`, rounded down to the price tick.
+  - Once eligible, the close uses current price rounded up for longs or down for shorts.
 - **unstuck.ema_gating_enabled**:
   - Fixed boolean toggle for the auto-unstuck EMA trigger. Default is `true`.
   - When `false`, auto-unstuck skips the EMA trigger/readiness check but still requires loss allowance, exposure threshold, close sizing, and valid market/exchange inputs.
-- **unstuck_loss_allowance_pct**:
-  - Weighted percentage below past peak balance to allow losses.
-  - `loss_allowance = past_peak_balance * (1 - unstuck_loss_allowance_pct * total_wallet_exposure_limit)`
-  - Example: If past peak balance was `$10,000`, `unstuck_loss_allowance_pct = 0.02`, and `total_wallet_exposure_limit = 1.5`, the bot stops taking losses when balance reaches `$10,000 * (1 - 0.02 * 1.5) = $9,700`.
+- **unstuck.loss_allowance_pct**:
+  - Sets a realized-loss budget weighted by the side's `total_wallet_exposure_limit`.
+  - `balance_peak = balance + (realized_pnl_cumsum_max - realized_pnl_cumsum_last)`.
+  - `loss_floor = balance_peak * (1 - loss_allowance_pct * total_wallet_exposure_limit)`; remaining allowance is `max(0, balance - loss_floor)`.
+  - Example: A reconstructed peak balance of `$10,000`, `loss_allowance_pct = 0.02`, and `total_wallet_exposure_limit = 1.5` give a `$9,700` floor. At a current balance of `$9,800`, the remaining allowance is `$100`.
+  - This is a pacing budget: exchange minimum sizing may exceed it. See the [loss-allowance contract](risk_management.md#auto-unstuck-loss-allowance-contract).
   - Per-coin overrides may set `bot.<side>.unstuck.loss_allowance_pct`; the selected coin+side then uses that percentage in the same account-wide formula.
-- **unstuck_threshold**:
-  - If a position is larger than the threshold, consider it stuck and activate unstucking.
-  - `if wallet_exposure / wallet_exposure_limit > unstuck_threshold: unstucking enabled`
-  - Example: If a position size is `$500` and max allowed position size is `$1000`, the position is 50% full. If `unstuck_threshold = 0.45`, unstuck the position until its size is `$450`.
+- **unstuck.threshold**:
+  - Exposure eligibility trigger: `wallet_exposure / effective_wel > threshold`. Equality does not qualify.
+  - Wallet exposure uses the position's average entry price: `abs(position_size) * position_price * c_mult / balance`.
+  - This is not a target remaining exposure or a floor on the close. An eligible position can finish below the threshold after a close sized by `close_pct`.
+  - For an illustrative long at 100% of effective WEL, `threshold = 0.90` and `close_pct = 0.12` would leave about 88% if close price equals entry price and balance is unchanged, before rounding and other constraints. The order is not reduced to leave exactly 90%.
+  - When close price differs from entry price, the exposure reduction also differs from `close_pct`; see the [sizing formulas](config.bot.md#auto-unstucking).
 
 One non-panic protective reducer (TWEL/WEL auto-reduce or auto-unstuck) may coexist with ordinary
 grid, trailing, or EMA-anchor closes for the same position. Passivbot reserves the reducer quantity
@@ -457,7 +473,8 @@ See [docs/forager.md](forager.md) for a full description of motivation, ranking 
 - **max_n_cancellations_per_batch**: Cancels `n` open orders per execution. Must be greater than `max_n_creations_per_batch` so the bot can make room before posting replacement orders.
 - **max_n_creations_per_batch**: Creates `n` new orders per execution. Must be lower than `max_n_cancellations_per_batch`.
 - **max_n_restarts_per_day**: If the bot crashes, restart up to `n` times per day before stopping completely.
-- **risk_input_max_attempts**: Maximum failed attempts to establish valid current and required HSL replay balances per recovery episode. Default `10`, integer `>= 1`; the first failure counts. Retries stay in the same process with increasing delays. Changing failure reasons does not renew the budget. Successful recovery resets it; exhaustion logs an error and stops without full-bot auto-restart or spending `max_n_restarts_per_day`. Every attempt logs its count, limit, safe inputs, and next delay; first and final failures include bounded tracebacks. `1` stops immediately; there is no unlimited setting.
+- **hsl_unavailable_grace_seconds**: Continuous HSL signal-unavailability delay before emergency loss evaluation. Default `120.0`, finite and nonnegative; fractional seconds are accepted and `0` explicitly enables immediate evaluation. Normal usable/degraded evaluation resets its scope's clock; failed refreshes, partial repairs, changing causes, and process restarts with an intact continuity journal do not. After expiry, current unrealized loss over budget is compared with the configured HSL RED threshold without EMA. Coin mode also includes current-episode realized loss when fill coverage and episode evidence remain coherent; unavailable optional evidence leaves the raw-UPNL fallback intact (coin budget: raw balance / configured positions; pside/unified: raw balance). Exposure with no fills at all triggers an exit after grace even if profitable. HSL-only history failures do not block valid martingale adds; independent ordinary-input requirements remain. See [HSL recovery](ai/features/equity_hard_stop_loss.md#live-risk-input-recovery) for restart, journal-loss, and reopening semantics.
+- **risk_input_max_attempts**: Failed-attempt limit for current-balance and HSL-history/evidence repair. Default `10`, integer `>= 1`. With HSL enabled, the limit escalates diagnostics to errors while capped retries and protection continue. With HSL disabled, exhaustion stops without automatic restart. First and limit-reaching failures include bounded tracebacks. This limit does not replace or restart the HSL grace timer.
 - **max_active_candle_tail_gap_minutes**: Maximum open-ended 1m candle tail gap tolerated for active symbols before staged live planning blocks that symbol's trading-critical candle surface. Default is `10`. Within this bound, Passivbot projects provisional no-trade EMA inputs for close, quote-volume, and log-range without persisting synthetic candles or normal EMA cache entries. Real candles returned later always replace prior projections on the next read; bounded historical gaps still need real candles before and after before synthetic no-trade candles are replayed.
 - **max_ohlcv_fetches_per_minute**: Live OHLCV/network budget for candle-backed indicators such as forager ranking and warm-up maintenance. Default is `24`. Set lower to reduce REST pressure; set to `0` to disallow new fetches and rely only on what is already cached.
 - **max_forager_candle_staleness_minutes**: Optional cap on acceptable completed-candle staleness for broad forager-candidate ranking and refresh budgeting. `null` lets Passivbot derive the target from `max_ohlcv_fetches_per_minute` and candidate count, with `max_active_candle_tail_gap_minutes` as the minimum grace period so the refresh budget cannot make flat candidates nontradable earlier than active symbols. Setting an explicit positive value is an operator override and may shorten that grace period.
@@ -738,3 +755,57 @@ Passivbot stores a few metadata keys alongside the normalized config:
 
 Additional reserved keys may appear in future releases; all keys beginning with an underscore are
 ignored by persistence helpers to keep user configs tidy.
+
+## Experimental revised HSL configuration
+
+See [Revised Equity Hard Stop Loss](hsl_revised.md) for signal formulas, estimation and lifecycle behavior.
+
+The startup-only selector `live.hsl_engine` accepts `legacy` (default) or `revised`.
+It applies to live, backtest and optimization together, and cannot be changed by
+scenario or fixed optimizer overrides. Revised `coin`, `pside` and `unified` modes
+are available in live execution, the offline fake runner, backtests and CPU optimization
+(`deap` and `pymoo`), including scenario evaluation and checkpoint resume. The GPU backend
+rejects revised HSL. There is no silent legacy fallback; existing configs continue using legacy
+HSL. Offline validation does not establish exchange-specific live readiness. Follow the
+[live validation and rollback checklist](hsl_revised_live_validation.md) for a separately
+authorized trial; selecting revised does not switch an already-running process.
+Use `backtest.offline=true` with a complete local market-data cache for offline runs;
+selecting the revised engine alone does not disable public market-data downloads.
+
+Revised backtests save HSL summaries and RED/flat/restart transitions by default.
+Set `backtest.hsl_detailed_report=true` (CLI: `--backtest.hsl_detailed_report true`)
+to also retain per-minute drawdown, EMA and controller samples and enable HSL drawdown
+plots. This diagnostic option increases runtime and memory use; it does not change fills,
+equity or analysis metrics. Disabling plots does not override an explicit report opt-in.
+Metrics-only optimizer evaluations always omit sample and event lists. Legacy HSL is unaffected.
+
+For revised `coin`/`pside`, use `bot.long.hsl` and `bot.short.hsl`. Revised `unified`
+requires an explicitly supplied `bot.hsl` block, even when side settings match or HSL
+is disabled. Supply all six fields: `enabled`, `red_threshold`, `ema_span_minutes`,
+`panic_close_order_type`, `cooldown_minutes_after_red`, and `restart_after_red_policy`.
+No side or template is silently promoted to portfolio authority.
+
+An enabled active scope must explicitly choose `restart_after_red_policy="always"`
+or `"never"`; missing choices and legacy `"threshold"` fail with migration guidance.
+A disabled scope can defer this choice, but later CLI/scenario/coin enablement must
+supply it. New revised configurations generated by `config.hsl_revised.generated_template`
+write `"always"` explicitly. Existing configs are never assigned that choice by hydration.
+
+Revised HSL removes `tier_ratios`, `orange_tier_mode`, and
+`no_restart_drawdown_threshold`. Ordinary supplied fields are removed with migration
+warnings; optimizer bounds, explicit patches, and fixed overrides targeting them are
+rejected. Removed yellow/orange time metrics are rejected as objectives or limits.
+`live.hsl_position_during_cooldown_policy` is also removed from revised configurations
+with a warning; any renewed exposure clears cooldown. Legacy retains its existing policy.
+Explicit revised optimizer/scenario overrides targeting the removed parameter are rejected.
+Enabled HSL requires
+`live.pnls_max_lookback_days` in **[1, 90]**, including fractional days; invalid values
+fail rather than being clamped. EMA spans remain fractional and at least one minute.
+
+Unified optimizer bounds use `optimize.bounds.hsl` and resolve to `bot.hsl` fields;
+fixed overrides use explicit paths such as `bot.hsl.restart_after_red_policy`.
+Side HSL bounds/overrides and per-coin HSL patches are rejected in unified mode.
+Per-coin HSL patches are supported only in coin mode. Engine selection and effective HSL parameters
+participate in the saved-fitness contract; legacy scores cannot be treated as revised
+results. To return to legacy, use a legacy-compatible config as well as selecting
+`legacy`; revised portfolio config is not silently converted to legacy side settings.
