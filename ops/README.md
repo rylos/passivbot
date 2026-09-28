@@ -151,3 +151,5 @@ Genera la pagina backtest di una singola config (artefatto claude.ai) partendo d
 4. `python3 ops/report/make_art.py --template tpl.html --art DIR --name <nome> --end YYYY-MM-DD --generated GG/MM/AAAA --out pagina.html --title ... --h1 ... --code ... --role ... --note ... [--compare "etichetta=tag"] [--footer ...]`, poi pubblicare con Artifact.
 
 Pagina di 4e066c8d (live su entrambi i bot dal 2026-09-28): https://claude.ai/artifact/J8DWWt9C3bsGK4znwgfgzz
+
+Con lo stop sull'equity: backtest con `bot.long.hsl.enabled` nei run `<nome>_*`, più `--hsl-windows FILE` (finestre di partenza a freddo in cui lo stop scatta: serie di equity con e senza stop ed evento di stop, estratte dalle suite `configs/robust/hsl2_*` e `starts_n4e_*` su debian) e `--hsl-summary FILE` (testo e tabella dell'esito su 224 partenze, esempio in `ops/report/data/hsl_summary_4e066c8d.json`). La sezione "Stop sull'equity: dove scatta" mostra per ogni finestra l'equity con e senza stop e una linea al momento dello stop.

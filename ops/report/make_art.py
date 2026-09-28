@@ -32,6 +32,8 @@ ap.add_argument("--note", required=True)
 ap.add_argument("--footer", default="")
 ap.add_argument("--compare", action="append", default=[], help="etichetta=tag")
 ap.add_argument("--cur", default="USDT")
+ap.add_argument("--hsl-windows", default="", help="JSON con le finestre in cui scatta lo stop (con/senza HSL)")
+ap.add_argument("--hsl-summary", default="", help="JSON: esito delle partenze a freddo con/senza HSL")
 ARGS = ap.parse_args()
 CUR = ARGS.cur
 
@@ -102,7 +104,85 @@ def params_html(lg):
                                       ("Quota per gradino", pct(cl["grid_qty_pct"], 0)),
                                       ("Quota trailing", pct(cl["trailing_grid_ratio"], 0)),
                                       ("Trailing soglia / ritraccio", f"{pct(cl['trailing_threshold_pct'], 2)} / {pct(cl['trailing_retracement_pct'], 2)}")]),
-    ])
+    ] + ([group("Stop sull'equity (HSL)", [("Soglia rossa (drawdown)", pct(h["red_threshold"], 0)),
+                                         ("Media del drawdown", f"{h['ema_span_minutes']:.0f} min"),
+                                         ("Pausa dopo lo stop", f"{h['cooldown_minutes_after_red'] / 60:.0f} h"),
+                                         ("Chiusura", h["panic_close_order_type"]),
+                                         ("Soglie gialla / arancione", f"{pct(h['tier_ratios']['yellow'] * h['red_threshold'], 1)} / {pct(h['tier_ratios']['orange'] * h['red_threshold'], 1)}")])]
+         if (h := lg.get("hsl", {})).get("enabled") else []))
+
+
+def rome(ts):
+    """Timestamp UTC 'YYYY-MM-DD HH:MM' -> ora italiana."""
+    from datetime import timezone
+    from zoneinfo import ZoneInfo
+    d = datetime.fromisoformat(ts).replace(tzinfo=timezone.utc).astimezone(ZoneInfo("Europe/Rome"))
+    return d.strftime("%d/%m/%Y alle %H:%M")
+
+
+def hsl_section(win, summ):
+    """Dove scatta lo stop: esito sulle partenze a freddo e le finestre in cui interviene."""
+    rows = "".join(
+        f"<tr class='{'base' if r['hsl'] else ''}'><td>{r['label']}</td><td class='num'>{pct(r['adg0'], 2)} / {pct(r['adg5'], 2)}</td>"
+        f"<td class='num'>{pct(r['dd0'])} / {pct(r['dd5'])}</td><td class='num'>{r['bad']} su {r['n']}</td><td class='num'>{r['rec']:.0f} g</td></tr>"
+        for r in summ["rows"])
+    cards = []
+    for i, w in enumerate(win):
+        ev = w["hsl"]["ev"]
+        start = w["label"][1:9]
+        start = f"{start[6:8]}/{start[4:6]}/{start[:4]}"
+        buf = " · buffer 0,05%" if w["label"].endswith("_b5") else ""
+        cards.append(f"""<div class="hslw">
+      <h3>Partenza {start}{buf}</h3>
+      <p class="sub">Stop il {rome(ev['t'])} (ora italiana): chiude {it(ev['qty'], 1)} HYPE a {it(ev['price'])}, perdita {it(-ev['pnl'], 0)} {CUR}, poi {summ['pause_h']} ore di pausa.</p>
+      <div class="chart"><div class="legend"><span><i style="background:var(--acc)"></i>Con stop</span><span><i style="background:var(--mute)"></i>Senza stop</span><span><i style="background:var(--neg)"></i>Stop</span></div><div class="box s"><canvas id="hw{i}"></canvas></div></div>
+      <dl class="hsld"><dt>Drawdown con / senza stop</dt><dd>{pct(w['hsl']['dd'])} / {pct(w['off']['dd'])}</dd>
+      <dt>Equity a fine finestra</dt><dd>{it(w['hsl']['end'], 0)} / {it(w['off']['end'], 0)} {CUR}</dd>
+      <dt>Giorni per tornare ai massimi</dt><dd>{w['hsl']['rec']:.0f} / {'mai (liquidato)' if w['off']['dd'] > 0.9 else format(w['off']['rec'], '.0f')}</dd></dl>
+    </div>""")
+    data = json.dumps([dict(s=w["hsl"]["series"], o=w["off"]["series"], t=w["hsl"]["ev"]["t"][:13]) for w in win], separators=(",", ":"))
+    return f"""<section>
+  <h2>Stop sull'equity: dove scatta</h2>
+  <p class="sub">{summ['intro']}</p>
+  <div class="tbl wr" style="max-height:none;margin-bottom:16px"><table><thead><tr><th>Variante</th><th class="num">ADG buffer 0 / 0,05%</th><th class="num">DD max</th><th class="num">Finestre oltre il 40%</th><th class="num">Recupero max</th></tr></thead><tbody>{rows}</tbody></table></div>
+  <div class="hslgrid">{"".join(cards)}</div>
+</section>
+<script>const HSLW={data};</script>"""
+
+
+HSL_JS = """<script>
+(function(){
+  const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+  let hc=[];
+  const vline={id:'vline',afterDatasetsDraw(c,a,o){const i=o.idx;if(i<0)return;const x=c.scales.x.getPixelForValue(i);const g=c.ctx;g.save();g.strokeStyle=o.color;g.lineWidth=1.5;g.setLineDash([4,3]);g.beginPath();g.moveTo(x,c.chartArea.top);g.lineTo(x,c.chartArea.bottom);g.stroke();g.restore();}};
+  function hbuild(){
+    hc.forEach(c=>c.destroy());hc=[];
+    const acc=css('--acc'),mute=css('--mute'),neg=css('--neg'),grid=css('--grid');
+    HSLW.forEach((w,i)=>{
+      const lab=w.s.map(p=>p[0]);const om=Object.fromEntries(w.o.map(p=>[p[0],p[1]]));
+      const idx=lab.findIndex(t=>t>=w.t);
+      hc.push(new Chart(document.getElementById('hw'+i),{type:'line',data:{labels:lab,datasets:[
+        {label:'Con stop',data:w.s.map(p=>p[1]),borderColor:acc,borderWidth:2,pointRadius:0,pointHitRadius:10,tension:0},
+        {label:'Senza stop',data:lab.map(t=>om[t]??null),borderColor:mute,borderWidth:1.5,borderDash:[5,4],pointRadius:0,pointHitRadius:10,tension:0,spanGaps:true}]},
+        options:{animation:false,responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},
+          plugins:{legend:{display:false},vline:{idx,color:neg},tooltip:{mode:'index',intersect:false,displayColors:false,callbacks:{label:c=>`${c.dataset.label}: ${Math.round(c.parsed.y).toLocaleString('it-IT')}`}}},
+          scales:{x:{ticks:{autoSkip:false,maxRotation:0,callback:(v,j)=>{const t=lab[j];return t&&t.slice(8,13)==='01 00'?t.slice(0,7):null}},grid:{color:grid,drawTicks:false},border:{display:false}},
+                  y:{grid:{color:grid,drawTicks:false},border:{display:false},ticks:{callback:v=>v.toLocaleString('it-IT'),font:{family:'"JetBrains Mono",monospace'}}}}},plugins:[vline]}));
+    });
+  }
+  hbuild();
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change',hbuild);
+  new MutationObserver(hbuild).observe(document.documentElement,{attributes:true,attributeFilter:['data-theme']});
+})();
+</script>"""
+
+HSL_CSS = """.hslgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:20px}
+.hslw h3{font-size:14px;margin:0 0 4px;font-weight:600}
+.hslw .sub{font-size:13px;min-height:3.2em}
+.hsld{margin-top:10px}
+.params.p5{grid-template-columns:repeat(5,1fr)}
+@media (max-width:900px){.hslgrid,.params.p5{grid-template-columns:1fr}}
+"""
 
 
 def risk_section(name, cyc, wins, loss):
@@ -247,7 +327,14 @@ s = replace_tbody(s, "Cicli di posizione", "".join(trs))
 # --- win rate / sensibilità ai fill, parametri
 s = re.sub(r'<section class="two">\s*<div>\s*<h2>Win rate e rischio</h2>.*?</section>\n?', "", s, count=1, flags=re.S)
 s = s.replace("<section>\n  <h2>Parametri della config</h2>", risk_section(name, cyc, wins, loss) + "\n<section>\n  <h2>Parametri della config</h2>", 1)
-s = re.sub(r'<div class="params">.*?</dl></div></div>', lambda _: f'<div class="params">{params_html(cfg["bot"]["long"])}</div>', s, count=1, flags=re.S)
+hsl_on = cfg["bot"]["long"].get("hsl", {}).get("enabled")
+s = re.sub(r'<div class="params">.*?</dl></div></div>', lambda _: f'<div class="params{" p5" if hsl_on else ""}">{params_html(cfg["bot"]["long"])}</div>', s, count=1, flags=re.S)
+if ARGS.hsl_windows:
+    win = json.load(open(ARGS.hsl_windows))
+    summ = json.loads(open(ARGS.hsl_summary).read())
+    s = s.replace("<section>\n  <h2>Parametri della config</h2>", hsl_section(win, summ) + "\n<section>\n  <h2>Parametri della config</h2>", 1)
+    s = s.replace("</style>", HSL_CSS + "</style>", 1)
+    s = s.replace("</body></html>", HSL_JS + "\n</body></html>", 1) if "</body></html>" in s else s + HSL_JS
 
 # --- dati grafici e piè di pagina
 data = json.dumps({"series": series, "monthly": monthly}, separators=(",", ":"))
