@@ -248,6 +248,7 @@ def main() -> None:
             pnl = 0.0
             fees = 0.0
             n_fills = 0
+            n_manual = 0
             for line in lines:
                 if "[fill]" not in line:
                     continue
@@ -266,6 +267,8 @@ def main() -> None:
                 if m.group(5) and ("close" in m.group(2) or float(m.group(3)) < 0):
                     pnl += float(m.group(5))
                     n_fills += 1
+                    if "close" not in m.group(2):
+                        n_manual += 1
             pnl += fees
             # attesa sull'orologio, non sull'ultima riga del log: a bot piatto il
             # log puo' restare fermo 15 minuti e il messaggio restava in sospeso
@@ -291,6 +294,14 @@ def main() -> None:
             # Missile sopra ROCKET_PCT del wallet (0.5%, scelto da Marco il
             # 2026-09-15 sui cicli reali: ~1 su 8). Soglia relativa, non in
             # valuta, cosi' vale per entrambi i bot e segue il wallet.
+            # Richiesto da Marco il 29/09: le chiusure fatte a mano si distinguono
+            # (fuori dal confronto live/backtest)
+            if n_manual and n_manual == n_fills:
+                manual = " <b>a mano</b>"
+            elif n_manual:
+                manual = " (in parte <b>a mano</b>)"
+            else:
+                manual = ""
             if pnl < 0:
                 icon = "❌"
             elif wallet and pnl >= wallet * ROCKET_PCT:
@@ -298,7 +309,7 @@ def main() -> None:
             else:
                 icon = "✅"
             send(
-                f"{icon} <b>{NAME} chiusa</b> · <b>{pnl:+.2f}</b> {CCY}{grad}{bal}"
+                f"{icon} <b>{NAME} chiusa</b>{manual} · <b>{pnl:+.2f}</b> {CCY}{grad}{bal}"
                 f" · {rome(ev['day'], ev['time'])}"
             )
             steps = 0
