@@ -18,7 +18,7 @@ switch); questo file si occupa solo di raccontare i trade.
 from __future__ import annotations
 
 import glob
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import os
 import re
@@ -38,6 +38,12 @@ INSTANCE = sys.argv[1] if len(sys.argv) > 1 else "hl"
 P = PROFILES[INSTANCE]
 NAME = P["name"]
 CCY = P["ccy"]
+# Coin letto dalla config live (approved_coins.long[0]): cambiare coin sul bot
+# (es. HYPE -> POPCAT del 25/09) non richiede di toccare questo script.
+try:
+    COIN = json.load(open(Path(P["logdir"]).parent / "configs/live" / P["config"]))["live"]["approved_coins"]["long"][0]
+except Exception:
+    COIN = "HYPE"
 
 
 def rome(day: str, hhmm: str) -> str:
@@ -55,10 +61,10 @@ LOGDIR = Path(P["logdir"])
 LOG_GLOB = str(LOGDIR / f"*{P['config']}.log")
 
 POS_RE = re.compile(
-    r"^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}):\d{2}Z.*\[pos\]\s+(new|added|reduced|closed)\s+HYPE\s+"
+    r"^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}):\d{2}Z.*\[pos\]\s+(new|added|reduced|closed)\s+" + re.escape(COIN) + r"\s+"
     r"long\s+[\d.]+ @ [\d.]+\s+-> ([\d.]+) @ ([\d.]+)"
 )
-FILL_RE = re.compile(r"\[fill\] (\S+)? ?HYPE long (\S+) ([+\-\d.]+) @ ([\d.]+)(?:, pnl=([+\-\d.]+))?(?: USDT fee=([+\-\d.]+))?")
+FILL_RE = re.compile(r"\[fill\] (\S+)? ?" + re.escape(COIN) + r" long (\S+) ([+\-\d.]+) @ ([\d.]+)(?:, pnl=([+\-\d.]+))?(?: USDT fee=([+\-\d.]+))?")
 FEE_RE = re.compile(r" fee=([+\-\d.]+)")
 # Il wallet va letto dalla riga piu' recente fra due sorgenti: [health] esce
 # ogni ~15 minuti, quindi alla chiusura di un trade e' quasi sempre vecchia e
@@ -201,7 +207,7 @@ def main() -> None:
             before = [v for st, v in bal_lines if st <= opened_at]
             bal = f" · wallet {before[-1]:.2f}" if before else ""
             send(
-                f"📈 <b>{NAME} aperta</b> · {ev['size']:.2f} HYPE @ {ev['price']:.3f}"
+                f"📈 <b>{NAME} aperta</b> · {ev['size']:.2f} {COIN} @ {ev['price']:.5g}"
                 f" · {ev['size'] * ev['price']:,.0f} {CCY}{bal}"
                 f" · {rome(ev['day'], ev['time'])}"
             )
@@ -254,16 +260,18 @@ def main() -> None:
                 f = FEE_RE.search(line)
                 if f:
                     fees += float(f.group(1))
-                if "close" in m.group(2) and m.group(5):
+                # anche i fill "unknown": una chiusura fatta a mano sull'exchange
+                # il bot la logga cosi' (29/09: messaggio mai partito e pnl a 0);
+                # per un long ogni riduzione ha qty negativa
+                if m.group(5) and ("close" in m.group(2) or float(m.group(3)) < 0):
                     pnl += float(m.group(5))
                     n_fills += 1
             pnl += fees
-            try:
-                log_end = datetime.strptime(lines[-1][:16], "%Y-%m-%dT%H:%M")
-            except ValueError:
-                log_end = None
+            # attesa sull'orologio, non sull'ultima riga del log: a bot piatto il
+            # log puo' restare fermo 15 minuti e il messaggio restava in sospeso
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
             close_at = datetime.strptime(end, "%Y-%m-%dT%H:%M")
-            if n_fills == 0 and log_end is not None and log_end <= close_at + timedelta(minutes=2):
+            if n_fills == 0 and now <= close_at + timedelta(minutes=2):
                 # log non ancora arrivato al fill: riprovo al giro dopo
                 deferred = True
                 break
@@ -299,7 +307,7 @@ def main() -> None:
     if pending_step is not None:
         ev = pending_step
         send(
-            f"➕ <b>{NAME} gradino {steps}</b> · pos {ev['size']:.2f} HYPE @ {ev['price']:.3f}"
+            f"➕ <b>{NAME} gradino {steps}</b> · pos {ev['size']:.2f} {COIN} @ {ev['price']:.5g}"
             f" · {ev['size'] * ev['price']:,.0f} {CCY} · {rome(ev['day'], ev['time'])}"
         )
 
