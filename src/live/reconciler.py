@@ -2116,7 +2116,13 @@ def validate_rust_orchestrator_output(
             qty,
             price,
         )
-        if execution_type != expected_execution_type:
+        # rylos: la chiusura panic e' l'uscita 4RSI (limit) oppure uno stop (HSL in modo Panic
+        # o crash stop sul prezzo, market); lo decide Rust dal modo e dal book, qui basta
+        # che sia uno dei due tipi validi
+        rylos_panic_close = submitted_rylos_4rsi_enabled[pair] and order_type.startswith(
+            "close_panic_"
+        )
+        if execution_type != expected_execution_type and not rylos_panic_close:
             raise FatalBotException(
                 f"Rust orchestrator order {order_idx} has execution_type "
                 "inconsistent with its submitted input"
