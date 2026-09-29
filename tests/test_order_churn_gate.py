@@ -3825,3 +3825,29 @@ def test_console_projection_throttle():
 def test_invalid_matching_tolerance_rejected():
     with pytest.raises(ValueError, match="non-negative"):
         deterministic_one_to_one_matches([], [], -1.0)
+
+
+@pytest.mark.parametrize("execution_type", ["limit", "market"], ids=["4rsi-exit-limit", "stop-market"])
+def test_raw_rust_output_accepts_rylos_panic_close_outside_panic_mode(execution_type):
+    # rylos (fork-local): l'uscita 4RSI passa da close_panic in modo normale ed e' limit
+    # anche con HSL a market; gli stop (HSL, crash stop) sono market. Il 29/09/2026 il
+    # validatore si aspettava market e ha fermato i due bot live al primo segnale di uscita.
+    order = _raw_rust_order(
+        qty=-1.0,
+        price=99.99,  # prezzo panic limit: ask meno un tick
+        order_type="close_panic_long",
+        execution_type=execution_type,
+        execution_priority="risk_critical",
+    )
+    orchestrator_input = _raw_rust_input(
+        long_hsl_enabled=True,
+        long_hsl_panic_close_order_type="market",
+        market_orders_allowed=False,
+    )
+    orchestrator_input["symbols"][0]["long"]["bot_params"]["rylos_4rsi_enabled"] = True
+
+    assert reconciler.validate_rust_orchestrator_output(
+        _raw_rust_output([order]),
+        {0: SYMBOL},
+        orchestrator_input,
+    ) == [order]
