@@ -7,7 +7,7 @@ Porta in passivbot v8 l'entry della strategia RyLoS Classic di freqtrade (`~/dev
 - `stoch_k` = fast %D di STOCHF(14,3) = SMA(3) dello stocastico raw.
 - Colore candela 5m: open = close della 5m precedente (i dati HLCV non hanno open).
 - Entry gate (solo initial entry, size==0): osc < soglia AND stoch < soglia AND candela rossa.
-- Exit: osc > soglia AND stoch > soglia AND candela verde AND gain prezzo > `exit_min_gain` → chiusura totale via `calc_panic_close` (`close_panic_long` = limit aggressivo a 1 tick sotto il best ask, NON market; vedi `orchestrator.rs::calc_panic_close`).
+- Exit: osc > soglia AND stoch > soglia AND candela verde AND gain prezzo > `exit_min_gain` → chiusura totale via `calc_panic_close` (`close_panic_long`, limit NON market). Dal 29/09 (`50a76022c`) il prezzo è `rylos_maker_exit_price` = max(ask−1 tick, bid+1 tick) e il live la manda post-only rimettendola a ogni ciclo (maker; vedi `mem:live_deployment`). Il backtest (bid == ask = close) la mette a close−1 tick con fee maker, invariato.
 
 ## Architettura
 - Indicatori precalcolati in Python: `src/rylos_signal.py` (backtest: array (T,N,3) con warmup NaN; live: `compute_rylos_signal_live`, min 100 candele 5m ≈ 8h20m di storico, scaricato all'avvio).
