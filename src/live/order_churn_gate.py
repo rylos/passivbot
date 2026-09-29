@@ -26,6 +26,13 @@ ORDER_CHURN_CONSOLE_REPEAT_SECONDS = 5.0 * 60.0
 ORDER_CHURN_ADMISSION_SUMMARY_SECONDS = 10.0 * 60.0
 
 
+def is_maker_panic_close(order: Mapping[str, object]) -> bool:
+    """Limit close_panic (rylos 4RSI exit): post-only, re-placed at every new price."""
+    return str(order.get("pb_order_type") or "").startswith("close_panic_") and (
+        str(order.get("type") or order.get("execution_type") or "limit").lower() == "limit"
+    )
+
+
 def connector_supports_order_churn_gate(bot) -> bool:
     """Return the explicit setup-time rollout decision for this connector."""
     marker = getattr(bot, "_order_churn_gate_enabled_for_connector", None)

@@ -15,6 +15,7 @@ from live.order_churn_gate import (
     ChurnDecision,
     OrderChurnGateState,
     connector_supports_order_churn_gate,
+    is_maker_panic_close,
     deterministic_one_to_one_matches,
     normalize_ideal_orders,
 )
@@ -1323,14 +1324,20 @@ def _validate_rust_panic_price(price, pside, order_book, price_step, context):
             _rust_tolerant_touch_step_count(bid, price_step, round_up=True) + 1
         )
     expected_price = expected_step_count * price_step
-    representation_tolerance = (
-        sys.float_info.epsilon * max(abs(price), abs(expected_price)) * 4.0
-    )
-    if not math.isclose(
-        price,
-        expected_price,
-        rel_tol=0.0,
-        abs_tol=representation_tolerance,
+    accepted_prices = [expected_price]
+    if pside == "long" and ask > bid:
+        # rylos: l'uscita 4RSI maker sta un tick sopra il bid (spread di 1 tick
+        # -> sull'ask), mai sul bid (rylos_maker_exit_price in Rust)
+        above_bid_count = _rust_tolerant_touch_step_count(bid, price_step, round_up=True) + 1
+        accepted_prices.append(max(expected_step_count, above_bid_count) * price_step)
+    if not any(
+        math.isclose(
+            price,
+            accepted,
+            rel_tol=0.0,
+            abs_tol=sys.float_info.epsilon * max(abs(price), abs(accepted)) * 4.0,
+        )
+        for accepted in accepted_prices
     ):
         raise FatalBotException(
             f"{context} panic limit price is inconsistent with submitted order book"
@@ -3780,6 +3787,17 @@ def apply_order_match_tolerance(
     tolerance = float(bot.live_value("order_match_tolerance_pct"))
     if tolerance <= 0.0:
         return to_cancel, to_create, 0
+    # rylos: l'uscita 4RSI maker (close_panic limit) insegue il book a ogni
+    # ciclo, quindi resta fuori dalla tolleranza: ogni nuovo prezzo la rimette
+    chase_cancel = [o for o in to_cancel if is_maker_panic_close(o)]
+    chase_create = [o for o in to_create if is_maker_panic_close(o)]
+    if chase_cancel or chase_create:
+        rest_cancel, rest_create, skipped = apply_order_match_tolerance(
+            bot,
+            [o for o in to_cancel if not is_maker_panic_close(o)],
+            [o for o in to_create if not is_maker_panic_close(o)],
+        )
+        return rest_cancel + chase_cancel, rest_create + chase_create, skipped
 
     def pct_diff(a: float, b: float) -> float:
         if b == 0:

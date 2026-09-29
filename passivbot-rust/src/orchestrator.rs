@@ -2586,6 +2586,21 @@ mod core {
         })
     }
 
+    /// RyLoS 4RSI exit price (long): one tick under the ask, but never at or
+    /// below the bid, so the post-only sell rests as maker at the top of the
+    /// ask side (1-tick spread -> the ask itself). With bid == ask (backtest
+    /// book) it is the plain panic price, so backtests are unchanged.
+    fn rylos_maker_exit_price(panic_price: f64, ob: &OrderBook, price_step: f64) -> f64 {
+        if !(ob.ask > ob.bid && ob.bid > 0.0 && price_step > 0.0) {
+            return panic_price;
+        }
+        let above_bid = tolerant_round_up_preserve_step(
+            tolerant_round_up_preserve_step(ob.bid, price_step) + price_step,
+            price_step,
+        );
+        panic_price.max(above_bid)
+    }
+
     fn should_generate_entries(mode: TradingMode, has_pos: bool, allow_initial: bool) -> bool {
         match mode {
             TradingMode::Manual => false,
@@ -3902,13 +3917,20 @@ mod core {
                     );
 
                 if mode == TradingMode::Panic || rylos_exit || rylos_crash_stop {
-                    if let Some(p) = calc_panic_close(
+                    if let Some(mut p) = calc_panic_close(
                         s.symbol_idx,
                         PositionSide::Long,
                         &s.long.position,
                         &s.order_book,
                         &s.exchange,
                     ) {
+                        if rylos_exit && !rylos_crash_stop && mode != TradingMode::Panic {
+                            p.price = rylos_maker_exit_price(
+                                p.price,
+                                &s.order_book,
+                                s.exchange.price_step,
+                            );
+                        }
                         closes.push(p);
                     }
                 } else {
@@ -5618,6 +5640,24 @@ mod core {
             bp.rylos_4rsi_enabled = false;
             assert!(!rylos_crash_stop_triggered(&bp, &pos, &OrderBook { bid: 50.0, ask: 50.1 }));
             assert!(!rylos_entries_paused(&bp, Some(&sig(0.9))));
+        }
+
+        #[test]
+        fn rylos_maker_exit_price_rests_on_the_ask_side() {
+            let step = 0.001;
+            let panic = |ob: &OrderBook| {
+                panic_close_order(0, PositionSide::Long, 1.0, ob, step).unwrap().price
+            };
+            // spread di 1 tick: il prezzo panic e' il bid, quello maker e' l'ask
+            let ob = OrderBook { bid: 86.632, ask: 86.633 };
+            assert!((panic(&ob) - 86.632).abs() < 1e-9);
+            assert!((rylos_maker_exit_price(panic(&ob), &ob, step) - 86.633).abs() < 1e-9);
+            // spread largo: un tick sotto l'ask, dentro lo spread
+            let ob = OrderBook { bid: 86.620, ask: 86.633 };
+            assert!((rylos_maker_exit_price(panic(&ob), &ob, step) - 86.632).abs() < 1e-9);
+            // book del backtest (bid == ask): prezzo invariato
+            let ob = OrderBook { bid: 86.633, ask: 86.633 };
+            assert_eq!(rylos_maker_exit_price(panic(&ob), &ob, step), panic(&ob));
         }
 
         #[test]

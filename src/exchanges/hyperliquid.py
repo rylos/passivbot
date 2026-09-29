@@ -20,6 +20,7 @@ from live import hsl_revised_live
 from passivbot_exceptions import FatalBotException
 from utils import MarketIdentifierResolutionError, symbol_to_coin, ts_to_date, utc_ms
 from config.access import require_live_value
+from live.order_churn_gate import is_maker_panic_close
 from pure_funcs import calc_hash
 from procedures import print_async_exception, assert_correct_ccxt_version
 
@@ -1782,7 +1783,10 @@ class HyperliquidBot(CCXTBot):
         params = {
             "reduceOnly": order["reduce_only"],
             "timeInForce": (
-                "Alo" if require_live_value(self.config, "time_in_force") == "post_only" else "Gtc"
+                "Alo"
+                if require_live_value(self.config, "time_in_force") == "post_only"
+                or is_maker_panic_close(order)
+                else "Gtc"
             ),
             "clientOrderId": order["custom_id"],
         }
@@ -1795,6 +1799,14 @@ class HyperliquidBot(CCXTBot):
         try:
             return await super().execute_order(order)
         except Exception as e:
+            if is_maker_panic_close(order) and "Post only order would have immediately matched" in str(e):
+                # rylos: il book si e' mosso fra lettura e invio, l'uscita maker
+                # viene rimessa al prezzo nuovo al ciclo successivo
+                logging.info(
+                    "[order] post-only exit rejected (would cross), re-placing next cycle: %s",
+                    symbol_to_coin(order["symbol"], verbose=False) or order["symbol"],
+                )
+                return {}
             # Try to recover from Hyperliquid's "$10 minimum" errors by adjusting min_cost
             try:
                 if self.adjust_min_cost_on_error(e, order):
