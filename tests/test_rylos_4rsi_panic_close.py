@@ -161,13 +161,22 @@ def test_maker_panic_close_detection():
     assert not is_maker_panic_close(_order("close_grid_long", 100.0))
 
 
-@pytest.mark.parametrize("pb_order_type, expected", [("close_panic_long", True), ("close_grid_long", False)])
-def test_connectors_send_maker_exit_post_only(pb_order_type, expected):
+@pytest.mark.parametrize(
+    "pb_order_type, type_, expected",
+    [
+        ("close_panic_long", "limit", True),
+        ("entry_initial_normal_long", "limit", True),
+        ("entry_grid_normal_long", "limit", True),
+        ("close_grid_long", "limit", True),
+        ("close_panic_long", "market", False),
+    ],
+)
+def test_connectors_send_limit_orders_post_only(pb_order_type, type_, expected):
     from exchanges.bybit import BybitBot
     from exchanges.hyperliquid import HyperliquidBot
 
     config = {"live": {"time_in_force": "good_till_cancelled"}}
-    order = dict(_order(pb_order_type, 100.0), custom_id="x")
+    order = dict(_order(pb_order_type, 100.0, type_), custom_id="x")
     hl = object.__new__(HyperliquidBot)
     hl.config = config
     hl.user_info = {"is_vault": False}
@@ -187,6 +196,16 @@ def test_hyperliquid_post_only_reject_of_maker_exit_is_not_an_error(monkeypatch)
 
     monkeypatch.setattr(CCXTBot, "execute_order", reject)
     hl = object.__new__(HyperliquidBot)
+    invalidated = []
+    hl.market_snapshot_provider = type("P", (), {"invalidate": lambda self, s: invalidated.append(s)})()
     assert asyncio.run(hl.execute_order(_order("close_panic_long", 100.0))) == {}
-    with pytest.raises(Exception, match="Post only"):
-        asyncio.run(hl.execute_order(_order("close_grid_long", 100.0)))
+    assert invalidated == [SYMBOL]
+    # anche un ingresso rifiutato post-only si riprova al ciclo dopo
+    assert asyncio.run(hl.execute_order(_order("entry_initial_normal_long", 100.0))) == {}
+
+    async def other_error(self, order):
+        raise Exception("hyperliquid Insufficient margin to place order")
+
+    monkeypatch.setattr(CCXTBot, "execute_order", other_error)
+    with pytest.raises(Exception, match="Insufficient margin"):
+        asyncio.run(hl.execute_order(_order("entry_initial_normal_long", 100.0)))

@@ -33,6 +33,13 @@ def is_maker_panic_close(order: Mapping[str, object]) -> bool:
     )
 
 
+def is_post_only_limit(order: Mapping[str, object]) -> bool:
+    """rylos: every limit order is meant to rest as maker (the backtest fills
+    them at maker fee); post-only keeps a quote gone stale while the order was
+    in flight from turning it into a taker fill. Market orders are untouched."""
+    return str(order.get("type") or order.get("execution_type") or "limit").lower() == "limit"
+
+
 def connector_supports_order_churn_gate(bot) -> bool:
     """Return the explicit setup-time rollout decision for this connector."""
     marker = getattr(bot, "_order_churn_gate_enabled_for_connector", None)

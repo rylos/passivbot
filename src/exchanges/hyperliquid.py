@@ -20,7 +20,7 @@ from live import hsl_revised_live
 from passivbot_exceptions import FatalBotException
 from utils import MarketIdentifierResolutionError, symbol_to_coin, ts_to_date, utc_ms
 from config.access import require_live_value
-from live.order_churn_gate import is_maker_panic_close
+from live.order_churn_gate import is_post_only_limit
 from pure_funcs import calc_hash
 from procedures import print_async_exception, assert_correct_ccxt_version
 
@@ -1785,7 +1785,7 @@ class HyperliquidBot(CCXTBot):
             "timeInForce": (
                 "Alo"
                 if require_live_value(self.config, "time_in_force") == "post_only"
-                or is_maker_panic_close(order)
+                or is_post_only_limit(order)
                 else "Gtc"
             ),
             "clientOrderId": order["custom_id"],
@@ -1799,11 +1799,16 @@ class HyperliquidBot(CCXTBot):
         try:
             return await super().execute_order(order)
         except Exception as e:
-            if is_maker_panic_close(order) and "Post only order would have immediately matched" in str(e):
-                # rylos: il book si e' mosso fra lettura e invio, l'uscita maker
-                # viene rimessa al prezzo nuovo al ciclo successivo
+            if is_post_only_limit(order) and "Post only order would have immediately matched" in str(e):
+                # rylos: il book si e' mosso fra lettura e invio; l'ordine maker
+                # viene rimesso al ciclo successivo col book riletto (non quello
+                # in cache, che puo' avere fino a 5 s e ripeterebbe il rifiuto)
+                provider = getattr(self, "market_snapshot_provider", None)
+                if provider is not None:
+                    provider.invalidate(order["symbol"])
                 logging.info(
-                    "[order] post-only exit rejected (would cross), re-placing next cycle: %s",
+                    "[order] post-only %s rejected (would cross), re-placing next cycle: %s",
+                    order.get("pb_order_type") or "order",
                     symbol_to_coin(order["symbol"], verbose=False) or order["symbol"],
                 )
                 return {}

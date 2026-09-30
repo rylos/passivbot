@@ -81,6 +81,10 @@ class MarketSnapshotProvider:
         self._closing = False
         self._shutdown_tasks: tuple[asyncio.Task, ...] = ()
 
+    def invalidate(self, symbol: str) -> None:
+        """Drop the cached quote so the next read fetches a fresh one."""
+        self._cache.pop(symbol, None)
+
     def get_cached(self, symbol: str, *, now_ms: int, max_age_ms: int) -> Optional[MarketSnapshot]:
         snap = self._cache.get(symbol)
         if snap is None:

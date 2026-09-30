@@ -8,7 +8,7 @@ from copy import deepcopy
 from collections import defaultdict
 from utils import symbol_to_coin, ts_to_date, utc_ms
 from config.access import require_live_value
-from live.order_churn_gate import is_maker_panic_close
+from live.order_churn_gate import is_post_only_limit
 from passivbot_exceptions import FatalBotException
 from pure_funcs import (
     floatify,
@@ -547,7 +547,7 @@ class BybitBot(CCXTBot):
             "timeInForce": (
                 "postOnly"
                 if require_live_value(self.config, "time_in_force") == "post_only"
-                or is_maker_panic_close(order)
+                or is_post_only_limit(order)
                 else "GTC"
             ),
             "orderLinkId": order["custom_id"],
