@@ -22362,15 +22362,60 @@ class Passivbot:
             and not order.get("_dedicated_protective_market_panic", False)
         ):
             return executor.DeferredOrderCreation()
+        amend_from = order.get("_amend_from")
+        if amend_from and self._maker_exit_amend_keeps_custom_id:
+            # rylos: the amended order keeps its exchange client id (Bybit).
+            order["custom_id"] = amend_from["custom_id"]
         # No await between this per-order admission and entering the connector.
         executor.record_create_connector_admission(self, order)
         self._emit_execution_connector_call_started_event(
             order=order,
             action="create",
-            connector_route="base",
+            connector_route="amend" if amend_from else "base",
         )
+        if amend_from:
+            # rylos: re-price the resting maker exit in one write (HL modify,
+            # Bybit amend) instead of cancel + create over two cycles.
+            try:
+                return await self.cca.edit_order(
+                    amend_from["id"],
+                    order["symbol"],
+                    "limit",
+                    order["side"],
+                    **self._maker_exit_amend_args(order),
+                )
+            except Exception as exc:
+                if "Post only order would have immediately matched" in str(exc):
+                    raise  # HL connector handles it (re-reads the book)
+                # Order filled/cancelled meanwhile or amend refused: the next
+                # cycle re-plans from a fresh account read (cancel + create).
+                # Fall back to cancel + create on this symbol for a while so a
+                # refused amend can never pin the exit at a stale price.
+                self._maker_exit_amend_backoff_until[order["symbol"]] = utc_ms() + 120_000
+                logging.warning(
+                    "[order] maker exit amend failed, cancel+create for 2 min: %s | %s",
+                    symbol_to_coin(order["symbol"], verbose=False) or order["symbol"],
+                    str(exc)[:200],
+                )
+                return {}
         executed = await self.cca.create_order(**params)
         return executed
+
+    # rylos: connectors whose documented amend endpoint re-prices a post-only
+    # exit in place (HL modify with always_place=false, Bybit /v5/order/amend).
+    _supports_maker_exit_amend = False
+    _maker_exit_amend_keeps_custom_id = False
+
+    @property
+    def _maker_exit_amend_backoff_until(self) -> dict:
+        backoff = self.__dict__.get("_maker_exit_amend_backoff")
+        if backoff is None:
+            backoff = self.__dict__["_maker_exit_amend_backoff"] = {}
+        return backoff
+
+    def _maker_exit_amend_args(self, order: dict) -> dict:
+        """Hook: edit_order amount/price/params for a maker exit amend."""
+        raise NotImplementedError
 
     async def execute_orders(self, orders: [dict]) -> [dict]:
         """Execute a batch of order creations using the helper pipeline."""

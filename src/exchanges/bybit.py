@@ -553,6 +553,16 @@ class BybitBot(CCXTBot):
             "orderLinkId": order["custom_id"],
         }
 
+    # rylos: /v5/order/amend changes the price of the resting exit and keeps its
+    # orderId/orderLinkId. Amending a PostOnly order to a crossing price cancels
+    # it (EC_PostOnlyWillTakeLiquidity, verified live 2026-09-30), never a taker
+    # fill. Only the price is sent: extra params would be forwarded to the API.
+    _supports_maker_exit_amend = True
+    _maker_exit_amend_keeps_custom_id = True
+
+    def _maker_exit_amend_args(self, order: dict) -> dict:
+        return {"amount": None, "price": order["price"], "params": {}}
+
     async def update_exchange_config_by_symbols(self, symbols):
         for symbol in symbols:
             log_symbol = symbol_to_coin(symbol, verbose=False) or symbol

@@ -1794,6 +1794,21 @@ class HyperliquidBot(CCXTBot):
             params["vaultAddress"] = self.user_info["wallet_address"]
         return params
 
+    # rylos: the modify action cancels the resting exit and places the new one;
+    # with always_place=false (ccxt omits the flag) the new order is ALO and is
+    # placed only if the cancel succeeded, so two exits never rest together.
+    _supports_maker_exit_amend = True
+
+    def _maker_exit_amend_args(self, order: dict) -> dict:
+        params = {
+            "timeInForce": "Alo",
+            "reduceOnly": order["reduce_only"],
+            "clientOrderId": order["custom_id"],
+        }
+        if self.user_info["is_vault"]:
+            params["vaultAddress"] = self.user_info["wallet_address"]
+        return {"amount": abs(order["qty"]), "price": order["price"], "params": params}
+
     async def execute_order(self, order: dict) -> dict:
         """Hyperliquid: Execute order with min_cost auto-adjustment on specific errors."""
         try:

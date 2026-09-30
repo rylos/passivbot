@@ -225,6 +225,63 @@ def _hold_entry_cancels_behind_maker_exit(
     return [order for order in to_cancel if id(order) not in held_ids]
 
 
+def _is_rylos_maker_exit(bot, order: dict) -> bool:
+    return (
+        is_maker_panic_close(order)
+        and _order_is_reduce_only(order)
+        and _rylos_4rsi_enabled(bot, order)
+    )
+
+
+def _pair_maker_exit_amends(bot, to_cancel: list[dict], to_create: list[dict]) -> list[dict]:
+    """rylos: re-price a resting 4RSI maker exit in place (one write) instead of
+    cancel + create, which the cancel-first barrier and the revised HSL spread
+    over two cycles. Pairs only an untouched exit (same side and qty: the
+    snapshot qty is the original size, so a partial fill falls back to
+    cancel + create). The new create carries the old order in `_amend_from`."""
+    if not getattr(bot, "_supports_maker_exit_amend", False):
+        return to_cancel
+    now = _utc_ms()
+    backoff = getattr(bot, "_maker_exit_amend_backoff_until", None) or {}
+    olds = [
+        order
+        for order in to_cancel
+        if _is_rylos_maker_exit(bot, order)
+        and order.get("id")
+        and order.get("custom_id")
+        and backoff.get(order.get("symbol"), 0) <= now
+    ]
+    paired: set[int] = set()
+    for new in to_create:
+        if not _is_rylos_maker_exit(bot, new) or new.get("_amend_from"):
+            continue
+        for old in olds:
+            if id(old) in paired:
+                continue
+            if (
+                old.get("symbol") == new.get("symbol")
+                and old.get("position_side") == new.get("position_side")
+                and old.get("side") == new.get("side")
+                and abs(float(old.get("qty") or 0.0)) == abs(float(new.get("qty") or 0.0))
+            ):
+                new["_amend_from"] = {
+                    "id": old["id"],
+                    "custom_id": old["custom_id"],
+                    "price": old.get("price"),
+                }
+                paired.add(id(old))
+                logging.info(
+                    "[order] maker exit amend %s | %s -> %s",
+                    _pb_attr("Passivbot")._log_symbol(new["symbol"]),
+                    old.get("price"),
+                    new.get("price"),
+                )
+                break
+    if not paired:
+        return to_cancel
+    return [order for order in to_cancel if id(order) not in paired]
+
+
 def _filter_hsl_replay_pending_creates(
     bot, passivbot_cls, orders: list[dict], order_wave
 ) -> list[dict]:
@@ -652,6 +709,7 @@ async def execute_order_plan(
     )
     order_wave = passivbot_cls._begin_order_wave(bot, to_cancel, to_create)
     to_cancel = _hold_entry_cancels_behind_maker_exit(bot, to_cancel, to_create, order_wave)
+    to_cancel = _pair_maker_exit_amends(bot, to_cancel, to_create)
     cancel_first_barrier = (
         bool(to_cancel)
         and not bot.debug_mode

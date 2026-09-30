@@ -282,3 +282,118 @@ def test_entry_cancels_untouched_without_rylos():
     assert executor._hold_entry_cancels_behind_maker_exit(
         _HoldBot(rylos=False), entries, [exit_], None
     ) == entries
+
+
+class _AmendBot(_HoldBot):
+    _supports_maker_exit_amend = True
+
+    def __init__(self, backoff=None):
+        super().__init__()
+        self._maker_exit_amend_backoff_until = backoff or {}
+
+
+def _resting_exit(price, qty=1.0, oid="old-1"):
+    return dict(
+        _live_order("close_panic_long", "sell", True, price), qty=qty, id=oid, custom_id="cid-old"
+    )
+
+
+def test_maker_exit_reprice_is_paired_as_amend():
+    from live import executor
+
+    old = _resting_exit(100.5)
+    entry = _live_order("entry_grid_normal_long", "buy", False, 90.0)
+    new = _live_order("close_panic_long", "sell", True, 101.0)
+    kept = executor._pair_maker_exit_amends(_AmendBot(), [old, entry], [new])
+    assert kept == [entry]
+    assert new["_amend_from"] == {"id": "old-1", "custom_id": "cid-old", "price": 100.5}
+
+
+@pytest.mark.parametrize(
+    "bot, old",
+    [
+        (_AmendBot(), _resting_exit(100.5, qty=0.6)),  # partial fill / size change
+        (_AmendBot(backoff={SYMBOL: 10**15}), _resting_exit(100.5)),  # after a failed amend
+        (_HoldBot(), _resting_exit(100.5)),  # connector without amend
+    ],
+)
+def test_maker_exit_falls_back_to_cancel_create(bot, old):
+    from live import executor
+
+    new = _live_order("close_panic_long", "sell", True, 101.0)
+    assert executor._pair_maker_exit_amends(bot, [old], [new]) == [old]
+    assert "_amend_from" not in new
+
+
+def _amend_connector(cls, monkeypatch, edit):
+    from live import executor
+
+    monkeypatch.setattr(executor, "record_create_connector_admission", lambda bot, order: None)
+    bot = object.__new__(cls)
+    bot.config = {"live": {"time_in_force": "good_till_cancelled"}}
+    bot.user_info = {"is_vault": True, "wallet_address": "0xvault"}
+    bot._emit_execution_connector_call_started_event = lambda **kw: None
+    bot.cca = type("C", (), {"edit_order": edit})()
+    return bot
+
+
+def _new_exit():
+    return dict(
+        _live_order("close_panic_long", "sell", True, 101.0),
+        custom_id="cid-new",
+        _amend_from={"id": "old-1", "custom_id": "cid-old", "price": 100.5},
+    )
+
+
+def test_hyperliquid_amend_is_an_alo_modify(monkeypatch):
+    import asyncio
+    from exchanges.hyperliquid import HyperliquidBot
+
+    calls = []
+
+    async def edit(self, *args, **kwargs):
+        calls.append((args, kwargs))
+        return {"id": "new-oid", "info": {"resting": {"oid": 1}}}
+
+    hl = _amend_connector(HyperliquidBot, monkeypatch, edit)
+    assert asyncio.run(hl.execute_order(_new_exit()))["id"] == "new-oid"
+    (args, kwargs), = calls
+    assert args == ("old-1", SYMBOL, "limit", "sell")
+    assert kwargs["amount"] == 1.0 and kwargs["price"] == 101.0
+    assert kwargs["params"] == {
+        "timeInForce": "Alo",
+        "reduceOnly": True,
+        "clientOrderId": "cid-new",
+        "vaultAddress": "0xvault",
+    }
+
+
+def test_bybit_amend_sends_only_the_price_and_keeps_the_client_id(monkeypatch):
+    import asyncio
+    from exchanges.bybit import BybitBot
+
+    calls = []
+
+    async def edit(self, *args, **kwargs):
+        calls.append((args, kwargs))
+        return {"id": "old-1", "clientOrderId": "cid-old", "info": {"retCode": 0}}
+
+    by = _amend_connector(BybitBot, monkeypatch, edit)
+    order = _new_exit()
+    assert asyncio.run(by.execute_order(order))["id"] == "old-1"
+    (args, kwargs), = calls
+    assert args == ("old-1", SYMBOL, "limit", "sell")
+    assert kwargs == {"amount": None, "price": 101.0, "params": {}}
+    assert order["custom_id"] == "cid-old"
+
+
+def test_failed_amend_backs_off_to_cancel_create(monkeypatch):
+    import asyncio
+    from exchanges.bybit import BybitBot
+
+    async def edit(self, *args, **kwargs):
+        raise Exception('bybit {"retCode":110001,"retMsg":"order not exists or too late to replace"}')
+
+    by = _amend_connector(BybitBot, monkeypatch, edit)
+    assert asyncio.run(by.execute_order(_new_exit())) == {}
+    assert by._maker_exit_amend_backoff_until[SYMBOL] > 0
