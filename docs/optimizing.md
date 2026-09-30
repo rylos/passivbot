@@ -298,13 +298,18 @@ The supported slice is intentionally narrow:
   multi-coin runs and compatible suites also support auto-unstuck, including static per-coin
   overrides. Metal
   models the enable and EMA-gating toggles, tunable close percentage, EMA distance, loss allowance,
-  and exposure threshold. It derives the allowance from a conservative all-history realized
-  net-PnL peak, admits at most one least-stuck eligible position per portfolio, scales a
+  and exposure threshold. Trailing Martingale multi-coin runs derive the allowance from
+  the configured rolling realized net-PnL window, including fees and a shared long/short
+  history. The history retains at most one event per candle, preserves intrabar peaks,
+  and uses bounded candidate batches when its buffers would exceed the scratch budget.
+  History buffers are omitted when auto-unstuck is disabled on every effective side/coin.
+  Other topologies use a conservative all-history realized net-PnL peak. Metal admits
+  at most one least-stuck eligible position per portfolio, scales a
   losing close to its own allowance subject to exchange minimums, and lets that close compete with
   the position's WEL/TWEL reducer before ordinary closes consume the remaining realized-loss
   budget. The fused dual-side multi-coin kernel chooses globally across both directional surfaces
   using exact Rust's price-difference, symbol-index, and long-before-short tie ordering. Exact Rust
-  remains authoritative for the configured rolling PnL lookback
+  remains authoritative for final validation
 - single- and multi-coin EMA Anchor and Trailing Martingale runs support bounded and legacy-raw
   `risk.we_excess_allowance_pct`, `risk.total_exposure_entry_gate_enabled`, and
   `risk.total_exposure_enforcer_threshold` across long-only, short-only, dual-side, and compatible
@@ -488,6 +493,23 @@ The supported slice is intentionally narrow:
   stricter contiguous-candle requirement documented above, and a forced-delist endpoint must remain
   finite and positive after float32 packing because it supplies an executable close
 
+GPU screening supports `backtest.limit_order_fill_buffer_pct` as a fixed simulation setting,
+including scenario overrides. Its units are a fraction of the limit price: `0.0015` is 15 basis
+points (0.15%). Buffered strict fill boundaries are prepared once; the GPU kernels and their
+per-candidate work are unchanged. Different buffers may change the trading path and therefore
+runtime. Raw candles, market execution, and original limit fill prices remain unchanged.
+Changing the buffer requires a fresh search; checkpoints and prepared suite tensors include it
+in their execution identity. For a fill-sensitivity suite, set `backtest.suite_enabled` to
+`true` and add scenarios such as:
+
+```json
+"scenarios": [
+  {"label": "baseline", "overrides": {"backtest.limit_order_fill_buffer_pct": 0.0}},
+  {"label": "buffer_0_0001", "overrides": {"backtest.limit_order_fill_buffer_pct": 0.0001}},
+  {"label": "buffer_0_0005", "overrides": {"backtest.limit_order_fill_buffer_pct": 0.0005}}
+]
+```
+
 #### Deliberate current limitations
 
 Independent unstuck EMA horizons are supported on Apple MPS for EMA Anchor and Trailing Martingale,
@@ -497,8 +519,6 @@ exact CPU validation still owns accepted results. Start a fresh GPU run after th
 change; old screening checkpoints are incompatible.
 
 The following boundaries are intentional rather than silent fallbacks:
-
-- `backtest.limit_order_fill_buffer_pct` must be zero. Use a CPU optimizer (`pymoo` or `deap`) for nonzero limit-fill buffers; the GPU screening model does not implement them.
 
 - `trailing_grid_v7` is outside the Apple MPS implementation. Use `optimize.backend: "pymoo"` or
   `"deap"` for it; GPU optimization never substitutes EMA Anchor or Trailing Martingale behavior.
@@ -690,6 +710,8 @@ available in normal Rust backtests, exact optimizer validation output, and CPU o
 The backend is hybrid rather than a replacement backtester:
 
 1. pymoo NSGA-II proposes large normalized candidate batches.
+   GPU parameter preparation mirrors exact validation's forager-weight normalization
+   and subsequent optimizer bound/step quantization before screening each candidate.
 2. A Rust-owned Metal screening program evaluates every candidate against candle data resident on
    MPS; Python only prepares buffers and dispatches the program. EMA-anchor and
    trailing-martingale use separate single-coin and multi-coin kernels. Directional runs keep
@@ -700,8 +722,13 @@ The backend is hybrid rather than a replacement backtester:
    from the original float64 data. EMA uses Rust-compatible directional ticks. Trailing-martingale
    uses those ticks to choose the controlling raw/target value before float32 can collapse nearby
    prices, then mirrors Rust's directional entry finalization and nearest-tick close finalization.
+   Entry quantities are sized at the controlling raw/target price, with exposure cropping
+   and exchange minimums checked again after finalizing the executable price.
    The multi-coin trailing-martingale screening kernel retains per-coin EMA, volatility, trailing,
-   position, cooldown, and pending-order state plus shared portfolio allocation. It stages one
+   position, cooldown, and pending-order state plus shared portfolio allocation. Flat candidates
+   are reranked each candle; score hysteresis applies only to coins with outstanding entry
+   orders, while held positions remain selected, matching exact Rust.
+   It stages one
    entry and close per coin per candle; exact Rust validation remains responsible for authoritative
    recursive same-candle ladders, and the normal constraint/rank/drift gates halt if that screening
    approximation stops ordering candidates reliably.
@@ -912,10 +939,17 @@ duplicate-elimination controls as the ordinary pymoo optimizer.
   It must be at least `validate_per_generation` so throttling cannot change the configured
   proxy-front/broad-probe evidence allocation; the backend waits for that capacity before
   screening another generation.
-- `checkpoint_interval_seconds` bounds generation-level optimizer-state checkpoint writes. Exact
-   result batches are checkpointed immediately, and each durable result carries the proxy/exact
-   safety evidence needed to recover if its flush outruns the companion checkpoint. A final
-   evidence-budget check applies to fresh and resumed runs and includes recovered class membership,
+- Completed exact CPU results are recorded in submission order while the next GPU proxy pass
+   runs, with structured `exact_progress` events after each collected batch. A collector failure
+   reaches the main thread when the current proxy pass returns; no next generation or additional
+   exact jobs are submitted after that failure. The collector is joined before shutdown.
+- GPU optimizer state is checkpointed after every completed generation and after exact-result
+   batches collected outside a proxy pass. `checkpoint_interval_seconds` does not throttle these
+   forced safety checkpoints. During a proxy pass, only the durable result stream advances;
+   checkpoints wait until the ask/tell transaction is complete. Each durable result carries the
+   candidate identity and proxy/exact safety evidence needed to recover results ahead of the last
+   safe checkpoint after interruption or a failure following a successful result flush. A final evidence-budget check applies
+   to fresh and resumed runs and includes recovered class membership,
    the rolling-window suffix, discarded pending work, and all full or partial validation batches.
    Exact worker results are consumed in submission order even if workers finish out of order,
    preserving the modeled batch sequence. Resume fails closed if the mandatory proxy-front gate can
