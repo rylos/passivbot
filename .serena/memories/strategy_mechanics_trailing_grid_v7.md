@@ -100,7 +100,7 @@ Mediana **+1,278%** di prezzo vs `pprice`, p5 +0,552%, max +7,346%. **Oltre +2% 
 Terzo cancello che non è un parametro e non sta nella config: `candle_color > 0.0` — l'ultima candela 5m chiusa dev'essere **verde** (`orchestrator.rs:2575`), in AND con osc, stoch e gain.
 
 ## Disattivato nel candidato live
-- **`hsl` (hard stop loss)**: `enabled: false`. La meccanica esiste (tier giallo/arancione/rosso, `red_threshold` 0.0522, cooldown 2780 min dopo un rosso). ⚠️ **Non verificato** se sia stato bocciato in ablazione o semplicemente non selezionato dal fronte — non spacciare la non-selezione per bocciatura.
+- **`hsl` (hard stop loss)**: `enabled: false`. La meccanica esiste (tier giallo/arancione/rosso, `red_threshold` 0.0522, cooldown 2780 min dopo un rosso). ⚠️ **Non verificato** se sia stato bocciato in ablazione o semplicemente non selezionato dal fronte — non spacciare la non-selezione per bocciatura. **Aggiornamento 30/09/2026**: nel live l'HSL è acceso (revised, red 0,25, ema 189, cooldown 720; vedi `mem:live_deployment`); il revised non ha tier giallo/arancione.
 - short completamente disattivato.
 
 Vedi anche `mem:rylos_4rsi_prototype`, `mem:optimize_workflow`.
