@@ -209,3 +209,76 @@ def test_hyperliquid_post_only_reject_of_maker_exit_is_not_an_error(monkeypatch)
     monkeypatch.setattr(CCXTBot, "execute_order", other_error)
     with pytest.raises(Exception, match="Insufficient margin"):
         asyncio.run(hl.execute_order(_order("entry_initial_normal_long", 100.0)))
+
+
+def _live_order(pb_order_type, side, reduce_only, price, symbol=SYMBOL):
+    return {
+        "symbol": symbol,
+        "side": side,
+        "position_side": "long",
+        "qty": 1.0,
+        "price": price,
+        "reduce_only": reduce_only,
+        "type": "limit",
+        "pb_order_type": pb_order_type,
+    }
+
+
+class _HoldBot:
+    _config_hedge_mode = False
+    hedge_mode = False
+
+    def __init__(self, rylos=True):
+        self.rylos = rylos
+
+    def bp(self, pside, key, symbol):
+        assert key == "rylos_4rsi_enabled"
+        return self.rylos
+
+
+def test_maker_exit_goes_out_before_entry_cancels():
+    from live import executor
+
+    entries = [_live_order("entry_grid_normal_long", "buy", False, 90.0 - i) for i in range(9)]
+    other = _live_order("entry_grid_normal_long", "buy", False, 1.0, symbol="ETH/USDC:USDC")
+    exit_ = _live_order("close_panic_long", "sell", True, 101.0)
+    wave = {"skipped_cancel": 0}
+    kept = executor._hold_entry_cancels_behind_maker_exit(
+        _HoldBot(), entries + [other], [exit_], wave
+    )
+    assert kept == [other]  # other scopes untouched
+    assert wave["skipped_cancel"] == 9
+
+
+def test_previous_exit_price_is_still_cancelled_first():
+    from live import executor
+
+    old_exit = _live_order("close_panic_long", "sell", True, 100.5)
+    entry = _live_order("entry_grid_normal_long", "buy", False, 90.0)
+    new_exit = _live_order("close_panic_long", "sell", True, 101.0)
+    kept = executor._hold_entry_cancels_behind_maker_exit(
+        _HoldBot(), [old_exit, entry], [new_exit], None
+    )
+    assert kept == [old_exit]
+
+
+def test_entry_cancels_untouched_without_maker_exit():
+    from live import executor
+
+    entries = [_live_order("entry_grid_normal_long", "buy", False, 90.0)]
+    market_panic = dict(_live_order("close_panic_long", "sell", True, 101.0), type="market")
+    grid = _live_order("entry_grid_normal_long", "buy", False, 89.0)
+    for creates in ([], [grid], [market_panic]):
+        assert executor._hold_entry_cancels_behind_maker_exit(
+            _HoldBot(), entries, creates, None
+        ) == entries
+
+
+def test_entry_cancels_untouched_without_rylos():
+    from live import executor
+
+    entries = [_live_order("entry_grid_normal_long", "buy", False, 90.0)]
+    exit_ = _live_order("close_panic_long", "sell", True, 101.0)
+    assert executor._hold_entry_cancels_behind_maker_exit(
+        _HoldBot(rylos=False), entries, [exit_], None
+    ) == entries

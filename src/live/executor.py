@@ -12,7 +12,7 @@ from live import hsl_protection, hsl_revised_live, position_fill_sync
 from live.diagnostic_safety import bounded_exception_type
 from live.event_bus import EventTypes, ReasonCodes
 from live.fresh_entry_eligibility import FreshEntryEligibilityTrace
-from live.order_churn_gate import connector_supports_order_churn_gate
+from live.order_churn_gate import connector_supports_order_churn_gate, is_maker_panic_close
 from pure_funcs import shorten_custom_id
 from utils import utc_ms as _utils_utc_ms
 
@@ -174,6 +174,55 @@ def _cancel_first_scope(bot, order: dict) -> tuple[str, str] | None:
     if position_side not in {"long", "short"}:
         return None
     return symbol, position_side
+
+
+def _rylos_4rsi_enabled(bot, order: dict) -> bool:
+    bp = getattr(bot, "bp", None)
+    if not callable(bp):
+        return False
+    try:
+        return bool(bp(order.get("position_side"), "rylos_4rsi_enabled", order.get("symbol")))
+    except Exception:
+        return False
+
+
+def _hold_entry_cancels_behind_maker_exit(
+    bot, to_cancel: list[dict], to_create: list[dict], order_wave
+) -> list[dict]:
+    """rylos: a maker exit (limit close_panic) goes out before the stale entry
+    cancels of its scope. The revised HSL admits one write per fresh account
+    read, and the cancel-first barrier holds same-scope creates until every
+    cancel is confirmed, so N resting grid entries used to delay the exit by N
+    cycles. Entry cancels only reduce exposure and follow in later cycles;
+    reduce-only cancels (the previous exit price) still go first."""
+    exit_scopes = {
+        _cancel_first_scope(bot, order)
+        for order in to_create
+        if is_maker_panic_close(order)
+        and _order_is_reduce_only(order)
+        and _rylos_4rsi_enabled(bot, order)
+    }
+    exit_scopes.discard(None)
+    if not exit_scopes:
+        return to_cancel
+    held = [
+        order
+        for order in to_cancel
+        if _order_pb_type(order).startswith("entry_")
+        and not _order_is_reduce_only(order)
+        and _cancel_first_scope(bot, order) in exit_scopes
+    ]
+    if not held:
+        return to_cancel
+    if order_wave is not None:
+        order_wave["skipped_cancel"] = int(order_wave.get("skipped_cancel", 0) or 0) + len(held)
+    logging.info(
+        "[order] maker exit first: holding %d entry cancel(s) for %s until next cycle",
+        len(held),
+        _pb_attr("Passivbot")._log_symbols(sorted({o["symbol"] for o in held}), limit=8),
+    )
+    held_ids = {id(order) for order in held}
+    return [order for order in to_cancel if id(order) not in held_ids]
 
 
 def _filter_hsl_replay_pending_creates(
@@ -602,6 +651,7 @@ async def execute_order_plan(
         getattr(snapshot, "account_invalidation_generation", 0) or 0
     )
     order_wave = passivbot_cls._begin_order_wave(bot, to_cancel, to_create)
+    to_cancel = _hold_entry_cancels_behind_maker_exit(bot, to_cancel, to_create, order_wave)
     cancel_first_barrier = (
         bool(to_cancel)
         and not bot.debug_mode
