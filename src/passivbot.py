@@ -62,6 +62,7 @@ from live.order_churn_gate import (
     ORDER_CHURN_GATE_SUPPORTED_EXCHANGES,
     OrderChurnGateState,
     connector_supports_order_churn_gate,
+    is_maker_panic_close,
 )
 from live.balance_composition import (
     balance_composition_signature,
@@ -22386,6 +22387,10 @@ class Passivbot:
                 )
             except Exception as exc:
                 if "Post only order would have immediately matched" in str(exc):
+                    # HL modify: the old exit is cancelled, the new one refused.
+                    retried = await self._maker_exit_retry_on_fresh_book(order, params)
+                    if retried is not None:
+                        return retried
                     raise  # HL connector handles it (re-reads the book)
                 # Order filled/cancelled meanwhile or amend refused: the next
                 # cycle re-plans from a fresh account read (cancel + create).
@@ -22398,8 +22403,77 @@ class Passivbot:
                     str(exc)[:200],
                 )
                 return {}
-        executed = await self.cca.create_order(**params)
+        try:
+            executed = await self.cca.create_order(**params)
+        except Exception as exc:
+            if "Post only order would have immediately matched" in str(exc):
+                retried = await self._maker_exit_retry_on_fresh_book(order, params)
+                if retried is not None:
+                    return retried
+            raise
         return executed
+
+    # rylos: a post-only maker exit refused because the planning quote was
+    # stale is re-placed at once on a book read now, inside the same connector
+    # admission (the refused write had no effect), instead of a cycle later.
+    _supports_maker_exit_fresh_book_retry = False
+
+    def _maker_exit_retry_price(self, symbol: str, price: float) -> float:
+        """Hook: round a re-placed maker exit price to the venue's rules."""
+        step = float(self.price_steps[symbol])
+        return float(pbr.round_(price, step))
+
+    async def _maker_exit_retry_on_fresh_book(self, order: dict, params: dict):
+        """Re-place a refused 4RSI maker exit once at max(ask - tick, bid + tick)
+        from a fresh book; None when not applicable (caller keeps the old path)."""
+        if not self._supports_maker_exit_fresh_book_retry or order.get("_maker_exit_retry"):
+            return None
+        symbol = order["symbol"]
+        if not (
+            order.get("position_side") == "long"
+            and order.get("side") == "sell"
+            and is_maker_panic_close(order)
+            and bool(self.bp("long", "rylos_4rsi_enabled", symbol))
+        ):
+            return None
+        coin = symbol_to_coin(symbol, verbose=False) or symbol
+        try:
+            book = await self.cca.fetch_order_book(symbol, 5)
+            bid = float(book["bids"][0][0])
+            ask = float(book["asks"][0][0])
+        except Exception as exc:
+            logging.info("[order] maker exit retry skipped, book unavailable: %s | %s", coin, str(exc)[:120])
+            return None
+        pprice = float(((self.positions.get(symbol) or {}).get("long") or {}).get("price") or 0.0)
+        min_gain = float(self.bp("long", "rylos_exit_min_gain", symbol))
+        if not (ask > bid > 0.0) or pprice <= 0.0 or bid <= pprice * (1.0 + min_gain):
+            # same bound as the 4RSI exit: below it the exit is no longer wanted
+            logging.info(
+                "[order] maker exit retry skipped: %s | bid %s ask %s pprice %s",
+                coin, bid, ask, pprice,
+            )
+            return None
+        step = float(self.price_steps[symbol])
+        price = self._maker_exit_retry_price(symbol, max(ask - step, bid + step))
+        if price <= bid:
+            return None
+        old_price = order["price"]
+        cid = str(order.get("custom_id") or "")
+        new_cid = (cid[:6] + uuid4().hex)[: len(cid)] if len(cid) > 6 else cid
+        # the executor records the order dict it passed in: keep it truthful
+        order["price"] = price
+        order["custom_id"] = new_cid
+        order["_maker_exit_retry"] = True
+        retry_params = dict(params)
+        retry_params["price"] = price
+        retry_params["params"] = dict(params.get("params") or {})
+        if "clientOrderId" in retry_params["params"]:
+            retry_params["params"]["clientOrderId"] = new_cid
+        logging.info(
+            "[order] maker exit re-placed on fresh book %s | %s -> %s (bid %s ask %s)",
+            coin, old_price, price, bid, ask,
+        )
+        return await self.cca.create_order(**retry_params)
 
     # rylos: connectors whose documented amend endpoint re-prices a post-only
     # exit in place (HL modify with always_place=false, Bybit /v5/order/amend).

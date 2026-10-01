@@ -408,3 +408,105 @@ def test_revised_hsl_does_not_retire_the_4rsi_exit(rylos, type_, retired):
 
     order = dict(_live_order("close_panic_long", "sell", True, 101.0), type=type_)
     assert hsl_revised_live._rylos_4rsi_exit(_HoldBot(rylos=rylos), order) is (not retired)
+
+
+POST_ONLY_REJECT = (
+    'hyperliquid {"status":"ok","response":{"type":"order","data":{"statuses":'
+    '[{"error":"Post only order would have immediately matched, bbo was 99.99@100.0. asset=159"}]}}}'
+)
+
+
+def _retry_connector(monkeypatch, *, bid, ask, pprice=95.0, edit=None, rejects=1):
+    from exchanges.hyperliquid import HyperliquidBot
+
+    creates = []
+    state = {"rejects": rejects}
+
+    async def create_order(self, **kwargs):
+        creates.append(kwargs)
+        if state["rejects"] > 0:
+            state["rejects"] -= 1
+            raise Exception(POST_ONLY_REJECT)
+        return {"id": "retry-oid", "clientOrderId": kwargs["params"]["clientOrderId"]}
+
+    async def fetch_order_book(self, symbol, limit=None):
+        return {"bids": [[bid, 5.0]], "asks": [[ask, 5.0]]}
+
+    hl = _amend_connector(HyperliquidBot, monkeypatch, edit)
+    hl.cca = type(
+        "C", (), {"edit_order": edit, "create_order": create_order, "fetch_order_book": fetch_order_book}
+    )()
+    hl.price_steps = {SYMBOL: 0.001}
+    hl.n_decimal_places = 6
+    hl.n_significant_figures = 5
+    hl.positions = {SYMBOL: {"long": {"size": 1.0, "price": pprice}}}
+    hl.bp = lambda pside, key, symbol: {"rylos_4rsi_enabled": True, "rylos_exit_min_gain": 0.0026}[key]
+    hl.market_snapshot_provider = type("P", (), {"invalidate": lambda self, s: None})()
+    return hl, creates
+
+
+def _exit_order(price=100.0, cid="0x0a1b" + "c" * 28):
+    return dict(_live_order("close_panic_long", "sell", True, price), custom_id=cid)
+
+
+def test_hl_rejected_maker_exit_is_replaced_at_once_on_fresh_book(monkeypatch):
+    import asyncio
+
+    hl, creates = _retry_connector(monkeypatch, bid=99.5, ask=99.502)
+    order = _exit_order()
+    first_cid = order["custom_id"]
+    assert asyncio.run(hl.execute_order(order))["id"] == "retry-oid"
+    first, retry = creates
+    assert first["price"] == 100.0
+    assert retry["price"] == 99.501  # max(ask - tick, bid + tick)
+    assert retry["params"]["timeInForce"] == "Alo" and retry["params"]["reduceOnly"] is True
+    new_cid = retry["params"]["clientOrderId"]
+    assert new_cid.startswith("0x0a1b") and len(new_cid) == 34 and new_cid != first_cid
+    # the executor records the dict it passed in: it must describe the real order
+    assert order["price"] == 99.501 and order["custom_id"] == new_cid
+
+
+def test_hl_rejected_modify_is_replaced_at_once_on_fresh_book(monkeypatch):
+    import asyncio
+
+    async def edit(self, *args, **kwargs):
+        raise Exception("hyperliquid Error placing new order during modify: " + POST_ONLY_REJECT)
+
+    hl, creates = _retry_connector(monkeypatch, bid=99.5, ask=99.51, edit=edit, rejects=0)
+    order = dict(_exit_order(), _amend_from={"id": "old-1", "custom_id": "cid-old", "price": 100.2})
+    assert asyncio.run(hl.execute_order(order))["id"] == "retry-oid"
+    (retry,) = creates
+    assert retry["price"] == 99.509
+
+
+@pytest.mark.parametrize(
+    "bid, ask, pprice, pb_type",
+    [
+        (95.2, 95.21, 95.0, "close_panic_long"),  # bid under pprice*(1+exit_min_gain): exit no longer wanted
+        (99.5, 99.5, 95.0, "close_panic_long"),  # locked book
+        (99.5, 99.51, 95.0, "entry_initial_normal_long"),  # entries are not chased
+    ],
+)
+def test_hl_maker_exit_retry_is_skipped_outside_the_exit_bounds(monkeypatch, bid, ask, pprice, pb_type):
+    import asyncio
+
+    hl, creates = _retry_connector(monkeypatch, bid=bid, ask=ask, pprice=pprice)
+    order = dict(_exit_order(), pb_order_type=pb_type)
+    if pb_type.startswith("entry"):
+        order.update(side="buy", reduce_only=False)
+    assert asyncio.run(hl.execute_order(order)) == {}
+    assert len(creates) == 1  # only the refused write, no retry
+
+
+def test_hl_maker_exit_retry_happens_once(monkeypatch):
+    import asyncio
+
+    hl, creates = _retry_connector(monkeypatch, bid=99.5, ask=99.502, rejects=2)
+    assert asyncio.run(hl.execute_order(_exit_order())) == {}  # back to the next-cycle path
+    assert len(creates) == 2
+
+
+def test_bybit_has_no_fresh_book_retry():
+    from exchanges.bybit import BybitBot
+
+    assert BybitBot._supports_maker_exit_fresh_book_retry is False

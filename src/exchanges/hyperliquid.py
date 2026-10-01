@@ -1798,6 +1798,13 @@ class HyperliquidBot(CCXTBot):
     # with always_place=false (ccxt omits the flag) the new order is ALO and is
     # placed only if the cancel succeeded, so two exits never rest together.
     _supports_maker_exit_amend = True
+    # rylos: an Alo refusal ("would have immediately matched") is synchronous,
+    # so the exit can be re-placed at once on a fresh l2Book (weight 2).
+    _supports_maker_exit_fresh_book_retry = True
+
+    def _maker_exit_retry_price(self, symbol: str, price: float) -> float:
+        price = round_dynamic(round(price, self.n_decimal_places), self.n_significant_figures)
+        return float(round_(price, self.price_steps[symbol]))
 
     def _maker_exit_amend_args(self, order: dict) -> dict:
         params = {
