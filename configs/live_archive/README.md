@@ -40,3 +40,8 @@ Pagine backtest (artefatti claude.ai): ry-bybit precedente https://claude.ai/art
 
 ## Stato live dal 2026-09-28 14:05
 Entrambi i bot: `bot.long` = 4e066c8d con HSL legacy acceso (red 0,25, ema 189 min, cooldown 720 min), codice `65877b070` (merge upstream fino a 4d30330f5). Test: su 112 partenze a freddo ogni 5 giorni × buffer 0/0,05% adg medio 0,736%/0,704%, dd max 32%, nessun fallimento (senza HSL: 3 su 224, dd max 95%); periodo intero invariato (lo stop non scatta).
+
+## Punto di ritorno 2026-10-01 (tag `stabile-1coin-20261001`)
+Config live di ry-hl e ry-bybit al 01/10/2026 (4e066c8d, HYPE solo, HSL revised, uscita maker con amend), codice `1d9f717c3`. Identiche salvo `live.user`. Copiate prima del lavoro a due coin (branch `rylos-duo`).
+- `ry-hl_4e066c8d_live_2026-10-01.json`
+- `ry-bybit_4e066c8d_live_2026-10-01.json`
