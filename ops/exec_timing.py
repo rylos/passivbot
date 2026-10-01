@@ -35,6 +35,7 @@ AMEND_RE = re.compile(r"maker exit amend ")
 AMEND_FAIL_RE = re.compile(r"maker exit amend failed")
 ROME = ZoneInfo("Europe/Rome")
 MAX_GAP = timedelta(minutes=6)  # fra un ordine e il successivo dello stesso episodio
+MAX_REST = timedelta(minutes=60)  # ordine rimasto fermo sul book fino al fill
 
 
 def utc(s):
@@ -108,7 +109,7 @@ def analyse(ep, lines, maker_fee):
     for t, p in reversed(posts):
         if chain and chain[-1][0] - t > MAX_GAP:
             break
-        if not chain and first_fill - t > MAX_GAP:
+        if not chain and first_fill - t > MAX_REST:
             break
         chain.append((t, p))
     if not chain:
