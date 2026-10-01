@@ -17032,6 +17032,7 @@ class Passivbot:
                     skip_historical_gap_fill=True,
                 )
                 if arr is None or len(arr) == 0:
+                    self._log_rylos_entry_gate(symbol, None, "no candles")
                     return symbol, None
                 arr = arr[arr["ts"] <= end_ts]  # exclude in-progress candle
                 sig = compute_rylos_signal_live(
@@ -17047,6 +17048,9 @@ class Passivbot:
                         arr["c"].astype(np.float64),
                         self._rylos_crash_window(symbol),
                     )
+                self._log_rylos_entry_gate(
+                    symbol, sig, _rylos_candles_info(arr["ts"], end_ts)
+                )
                 return symbol, sig
             except Exception as exc:
                 logging.warning(
@@ -17054,10 +17058,53 @@ class Passivbot:
                     symbol,
                     exc,
                 )
+                self._log_rylos_entry_gate(symbol, None, f"error {type(exc).__name__}")
                 return symbol, None
+
+        def _rylos_candles_info(ts, end_ts_ms: int) -> str:
+            ts = np.asarray(ts, dtype=np.int64)
+            if len(ts) == 0:
+                return "candles 0"
+            gaps = int(((ts[-1] - ts[0]) // 60_000) + 1 - len(ts))
+            lag = int((end_ts_ms - int(ts[-1])) // 60_000)
+            return f"candles {len(ts)} gaps {gaps} last_lag {lag}m"
 
         results = await asyncio.gather(*(one(s) for s in symbols))
         return {symbol: sig for symbol, sig in results if sig is not None}
+
+    def _log_rylos_entry_gate(self, symbol: str, sig: dict | None, info: str) -> None:
+        """Log the 4RSI initial-entry gate (same rule as Rust
+        rylos_entry_allowed) only when it opens/closes, with the signal values
+        and the candle state behind it."""
+        try:
+            if sig is None:
+                is_open, detail = False, "signal unavailable"
+            else:
+                osc_thr = float(self.bp("long", "rylos_osc_entry_threshold", symbol))
+                stoch_thr = float(self.bp("long", "rylos_entry_stoch_threshold", symbol))
+                osc, stoch, color = (
+                    float(sig["osc_4rsi"]),
+                    float(sig["stoch_k"]),
+                    float(sig["candle_color"]),
+                )
+                is_open = osc < osc_thr and stoch < stoch_thr and color < 0.0
+                detail = (
+                    f"osc {osc:.2f}/{osc_thr:g} stoch {stoch:.2f}/{stoch_thr:g} "
+                    f"color {color:+g}"
+                )
+        except Exception as exc:
+            is_open, detail = False, f"gate check failed {exc}"
+        states = self.__dict__.setdefault("_rylos_entry_gate_state", {})
+        if states.get(symbol) == is_open:
+            return
+        states[symbol] = is_open
+        logging.info(
+            "[rylos] entry gate %s %s | %s | %s",
+            symbol,
+            "open" if is_open else "closed",
+            detail,
+            info,
+        )
 
     def _rylos_crash_window(self, symbol: str) -> int:
         """Window (1m candles) of the crash stop drop; 0 when the stop is off."""
