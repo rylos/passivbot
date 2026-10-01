@@ -79,6 +79,8 @@ def episodes(fills):
     for f in fills:
         t = f.get("pb_order_type")
         if t not in KINDS:
+            if t:  # griglia, trailing, unstuck...: solo maker sì/no
+                eps.append([f])
             continue
         if cur and (cur[-1]["pb_order_type"] != t or utc(f["datetime"]) - utc(cur[-1]["datetime"]) > timedelta(minutes=10)):
             eps.append(cur)
@@ -95,6 +97,16 @@ def episodes(fills):
 
 def analyse(ep, lines, maker_fee):
     kind = ep[0]["pb_order_type"]
+    if kind not in KINDS:
+        f = ep[0]
+        fr = round(abs(float(f.get("fee_ratio") or 0)), 6)
+        maker = fr <= maker_fee * 1.05
+        key = f"{kind}|{f['datetime'][:19]}"
+        text = (
+            f"{kind} {rome(utc(f['datetime']), '%d/%m %H:%M:%S')} | {f['side']} {abs(float(f['qty'])):g} @ {float(f['price']):g}"
+            f" | fee {fr*100:.3f}% {'maker' if maker else 'NON maker'}"
+        )
+        return key, text
     end = utc(ep[-1]["datetime"])
     first_fill = utc(ep[0]["datetime"])
     posts = []
@@ -147,7 +159,7 @@ def main():
     days = int(sys.argv[3]) if len(sys.argv) > 3 else 3
     log_glob, fdir, maker_fee = PROFILES[inst]
     fills = load_fills(fdir, days)
-    eps = episodes(fills)
+    eps = sorted(episodes(fills), key=lambda ep: ep[-1]["datetime"])
     if mode == "last":
         eps = eps[-1:]
     if not eps:
