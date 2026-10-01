@@ -31,8 +31,8 @@ from pathlib import Path
 # Istanza dal primo argomento (`trade_report.py bybit`); default "hl" per non
 # toccare il cron storico. Stato separato per istanza.
 PROFILES = {
-    "hl": dict(name="ry-hl", logdir="/opt/passivbot-hl/logs", config="config_hl_4rsi.json", state="trades_state.json", ccy="USDC", extra_creds=["telegram_rylos_group.json"]),
-    "bybit": dict(name="ry-bybit", logdir="/opt/passivbot-bybit/logs", config="config_bybit_4rsi.json", state="trades_state_bybit.json", ccy="USDT", extra_creds=[]),
+    "hl": dict(name="ry-hl", logdir="/opt/passivbot-hl/logs", config="config_hl_4rsi.json", fills="/opt/passivbot-hl/caches/fill_events/hyperliquid/hyperliquid_vault", monitor="/opt/passivbot-hl/monitor/hyperliquid/hyperliquid_vault", state="trades_state.json", ccy="USDC", extra_creds=["telegram_rylos_group.json"]),
+    "bybit": dict(name="ry-bybit", logdir="/opt/passivbot-bybit/logs", config="config_bybit_4rsi.json", fills="/opt/passivbot-bybit/caches/fill_events/bybit/bybit_02", monitor="/opt/passivbot-bybit/monitor/bybit/bybit_02", state="trades_state_bybit.json", ccy="USDT", extra_creds=[]),
 }
 INSTANCE = sys.argv[1] if len(sys.argv) > 1 else "hl"
 P = PROFILES[INSTANCE]
@@ -60,21 +60,14 @@ STATE = BASE / P["state"]
 LOGDIR = Path(P["logdir"])
 LOG_GLOB = str(LOGDIR / f"*{P['config']}.log")
 
-POS_RE = re.compile(
-    r"^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}):\d{2}Z.*\[pos\]\s+(new|added|reduced|closed)\s+" + re.escape(COIN) + r"\s+"
-    r"long\s+[\d.]+ @ [\d.]+\s+-> ([\d.]+) @ ([\d.]+)"
-)
-FILL_RE = re.compile(r"\[fill\] (\S+)? ?" + re.escape(COIN) + r" long (\S+) ([+\-\d.]+) @ ([\d.]+)(?:, pnl=([+\-\d.]+))?(?: USDT fee=([+\-\d.]+))?")
-FEE_RE = re.compile(r" fee=([+\-\d.]+)")
-# Il wallet va letto dalla riga piu' recente fra due sorgenti: [health] esce
-# ogni ~15 minuti, quindi alla chiusura di un trade e' quasi sempre vecchia e
-# riporta il saldo PRE-chiusura (visto il 28/08: messaggio con 12290.05 quando
-# il wallet reale era gia' 12521.68). [balance] invece viene emessa nello
-# stesso secondo del fill che muove il saldo: e' quella che vale.
+# Il wallet si legge dallo stato che il bot riscrive ogni minuto
+# (`monitor/.../state.latest.json`, account.balance_raw): dal merge upstream
+# del 30/09 le righe [health] bal= e [balance] equity= non ci sono piu'. Alla
+# chiusura vale solo uno stato scritto DOPO il fill, altrimenti e' il saldo
+# PRE-chiusura (28/08: 12290.05 contro 12521.68 reali) e si riprova al giro dopo.
 ROCKET_PCT = 0.005
 # Oltre questo numero di eventi in un log nuovo non si rigioca (raffica).
 MAX_REPLAY = 10
-BAL_RE = re.compile(r"\[health\].*bal=([\d.]+)|\[balance\].*equity=([\d.]+)")
 
 
 def _send_one(creds: dict, text: str) -> None:
@@ -112,6 +105,32 @@ def current_log() -> str | None:
     return max(files, key=os.path.getmtime) if files else None
 
 
+def current_wallet() -> tuple:
+    """(saldo, istante UTC naive della scrittura) dallo stato del bot."""
+    try:
+        path = Path(P["monitor"]) / "state.latest.json"
+        bal = float(json.loads(path.read_text())["account"]["balance_raw"])
+        at = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).replace(tzinfo=None)
+        return bal, at
+    except Exception:  # noqa: BLE001
+        return None, None
+
+
+def load_fills(days: int = 3) -> list:
+    """Fill degli ultimi `days` giorni UTC dalla cache del bot, in ordine."""
+    out = []
+    today = datetime.now(timezone.utc).date()
+    for i in range(days - 1, -1, -1):
+        path = Path(P["fills"]) / f"{today - timedelta(days=i)}.json"
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        out += [fl for fl in data if str(fl.get("symbol", "")).startswith(COIN + "/")
+                and str(fl.get("position_side", "long")) == "long"]
+    return sorted(out, key=lambda fl: (fl["datetime"], str(fl["id"])))
+
+
 def load_state() -> dict:
     if STATE.exists():
         try:
@@ -133,20 +152,31 @@ def main() -> None:
         f.seek(max(0, os.path.getsize(path) - 2_000_000))
         lines = f.read().decode(errors="replace").splitlines()
 
+    # Eventi dalla cache dei fill del bot (`caches/fill_events/...`): ogni
+    # fill porta la posizione DOPO il fill (psize/pprice), pnl e fee. Fino al
+    # 30/09 si leggevano le righe "[pos] new/added/reduced/closed" del log, che
+    # il merge upstream di quel giorno (84cae05ab) ha tolto: da allora nessun
+    # messaggio partiva (aperture e chiusure del 30/09 e del 01/10 perse).
+    fills = load_fills()
     events = []
-    for line in lines:
-        m = POS_RE.match(line)
-        if m:
-            events.append(
-                {
-                    "key": f"{m.group(1)}T{m.group(2)}|{m.group(3)}|{m.group(4)}",
-                    "day": m.group(1),
-                    "time": m.group(2),
-                    "kind": m.group(3),
-                    "size": float(m.group(4)),
-                    "price": float(m.group(5)),
-                }
-            )
+    for fl in fills:
+        qty, psize = float(fl["qty"]), float(fl.get("psize") or 0.0)
+        if qty > 0:
+            kind = "new" if abs(psize - qty) < 1e-9 else "added"
+        else:
+            kind = "closed" if abs(psize) < 1e-9 else "reduced"
+        ts = fl["datetime"][:19]
+        events.append(
+            {
+                "key": f"{ts}|{fl['id']}",
+                "ts": ts,
+                "day": ts[:10],
+                "time": ts[11:16],
+                "kind": kind,
+                "size": psize,
+                "price": float(fl.get("pprice") or fl["price"]),
+            }
+        )
     if not events:
         return
 
@@ -184,14 +214,7 @@ def main() -> None:
         return
 
     steps = state.get("steps", 0)
-    # (stamp, saldo) di ogni riga [health]/[balance]: alla chiusura serve la
-    # prima riga DOPO il fill, non l'ultima del log (07/09: wallet 12700.81
-    # da un [health] di 16 secondi prima del fill, reale 12713.84).
-    bal_lines = []
-    for line in lines:
-        b = BAL_RE.search(line)
-        if b:
-            bal_lines.append((line[:16], float(b.group(1) or b.group(2))))
+    wallet_now, wallet_at = current_wallet()
 
     opened_at = state.get("opened_at")
 
@@ -201,11 +224,10 @@ def main() -> None:
         if ev["kind"] == "new":
             pending_step = None
             steps = 1
-            opened_at = f"{ev['day']}T{ev['time']}"
+            opened_at = ev["ts"]
             # All'apertura il saldo realizzato non cambia: vale l'ultima riga
             # [health]/[balance] prima del fill.
-            before = [v for st, v in bal_lines if st <= opened_at]
-            bal = f" · wallet {before[-1]:.2f}" if before else ""
+            bal = f" · wallet {wallet_now:.2f}" if wallet_now else ""
             send(
                 f"📈 <b>{NAME} aperta</b> · {ev['size']:.2f} {COIN} @ {ev['price']:.5g}"
                 f" · {ev['size'] * ev['price']:,.0f} {CCY}{bal}"
@@ -229,68 +251,38 @@ def main() -> None:
             #  - la finestra di 3 minuti che chiudeva il buco sopra escludeva
             #    pero' le riduzioni intermedie della griglia di chiusura:
             #    +237,81 dove la posizione aveva reso +246,57 (28/08).
-            # L'istante di apertura e' in stato, quindi la finestra e' esatta.
-            # Senza (risincronizzazione) resto sui 3 minuti prudenziali.
-            start = opened_at or f"{ev['day']}T{ev['time']}"
-            end = f"{ev['day']}T{ev['time']}"
-            if opened_at is None:
-                end_min = int(ev["time"][:2]) * 60 + int(ev["time"][3:])
-                start = f"{ev['day']}T{(end_min - 3) // 60:02d}:{(end_min - 3) % 60:02d}"
-            # La riga [fill] arriva anche 40-50 s dopo la riga [pos] (14/09:
-            # chiusura 16:55:18, fill loggato 16:56:04 -> "+0.00 USDT" dove
-            # il pnl era +15,37). Per la finestra vale quindi l'orario del
-            # fill stesso, non quello della riga di log; e se il fill non c'e'
-            # ancora, l'evento resta in sospeso fino al giro successivo.
-            # Dal 15/09 il bot scrive anche "fee=" (cashflow con segno, negativo
-            # se pagata) su ogni fill, ingressi compresi: il messaggio riporta
-            # il netto, che e' quello che mostra l'exchange (14/09: lordo
-            # +15,37, Bybit +14,76). Con log vecchi senza fee resta il lordo.
+            # Finestra della posizione: dall'apertura (stato, o l'ultimo "new"
+            # nella cache se lo stato non c'e') alla chiusura, al secondo.
+            # PnL e fee dalla cache: esatti, senza aspettare la riga [fill].
+            end = ev["ts"]
+            start = opened_at or next(
+                (e["ts"] for e in reversed(events) if e["kind"] == "new" and e["ts"] <= end), end
+            )
             pnl = 0.0
-            fees = 0.0
             n_fills = 0
             n_manual = 0
-            for line in lines:
-                if "[fill]" not in line:
+            for fl in fills:
+                ts = fl["datetime"][:19]
+                if not (start <= ts <= end):
                     continue
-                m = FILL_RE.search(line)
-                if not m:
-                    continue
-                stamp = (m.group(1) or line)[:16]  # YYYY-MM-DDTHH:MM
-                if not (start <= stamp <= end):
-                    continue
-                f = FEE_RE.search(line)
-                if f:
-                    fees += float(f.group(1))
+                pnl += float(fl.get("fee_paid") or 0.0)  # fee con segno, ingressi compresi
                 # anche i fill "unknown": una chiusura fatta a mano sull'exchange
-                # il bot la logga cosi' (29/09: messaggio mai partito e pnl a 0);
-                # per un long ogni riduzione ha qty negativa
-                if m.group(5) and ("close" in m.group(2) or float(m.group(3)) < 0):
-                    pnl += float(m.group(5))
+                # (29/09); per un long ogni riduzione ha qty negativa
+                if float(fl["qty"]) < 0:
+                    pnl += float(fl.get("pnl") or 0.0)
                     n_fills += 1
-                    if "close" not in m.group(2):
+                    if not str(fl.get("pb_order_type") or "").startswith("close"):
                         n_manual += 1
-            pnl += fees
-            # attesa sull'orologio, non sull'ultima riga del log: a bot piatto il
-            # log puo' restare fermo 15 minuti e il messaggio restava in sospeso
-            now = datetime.now(timezone.utc).replace(tzinfo=None)
-            close_at = datetime.strptime(end, "%Y-%m-%dT%H:%M")
-            if n_fills == 0 and now <= close_at + timedelta(minutes=2):
-                # log non ancora arrivato al fill: riprovo al giro dopo
-                deferred = True
-                break
             opened_at = None
             grad = f" · {steps} gradini" if steps > 1 else ""
-            after = [v for st, v in bal_lines if st >= end]
-            before = [v for st, v in bal_lines if st < end]
-            wallet = None
-            if after:
-                wallet = after[0]
-                bal = f" · wallet {wallet:.2f}"
-            elif before:
-                wallet = before[-1] + pnl
-                bal = f" · wallet ≈{wallet:.2f}"
-            else:
-                bal = ""
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            close_at = datetime.strptime(end, "%Y-%m-%dT%H:%M:%S")
+            if (wallet_at is None or wallet_at <= close_at) and now <= close_at + timedelta(minutes=5):
+                # stato non ancora riscritto dopo il fill: riprovo al giro dopo
+                deferred = True
+                break
+            wallet = wallet_now if wallet_at and wallet_at > close_at else None
+            bal = f" · wallet {wallet:.2f}" if wallet else ""
             # Missile sopra ROCKET_PCT del wallet (0.5%, scelto da Marco il
             # 2026-09-15 sui cicli reali: ~1 su 8). Soglia relativa, non in
             # valuta, cosi' vale per entrambi i bot e segue il wallet.

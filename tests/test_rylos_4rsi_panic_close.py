@@ -397,3 +397,14 @@ def test_failed_amend_backs_off_to_cancel_create(monkeypatch):
     by = _amend_connector(BybitBot, monkeypatch, edit)
     assert asyncio.run(by.execute_order(_new_exit())) == {}
     assert by._maker_exit_amend_backoff_until[SYMBOL] > 0
+
+
+@pytest.mark.parametrize(
+    "rylos, type_, retired",
+    [(True, "limit", False), (False, "limit", True), (True, "market", True)],
+)
+def test_revised_hsl_does_not_retire_the_4rsi_exit(rylos, type_, retired):
+    from live import hsl_revised_live
+
+    order = dict(_live_order("close_panic_long", "sell", True, 101.0), type=type_)
+    assert hsl_revised_live._rylos_4rsi_exit(_HoldBot(rylos=rylos), order) is (not retired)

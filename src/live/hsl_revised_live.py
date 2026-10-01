@@ -75,6 +75,19 @@ def connector_write(action):
     return decorate
 
 
+def _rylos_4rsi_exit(bot, order):
+    """rylos: the 4RSI exit is a limit close_panic planned by Rust outside Panic
+    mode. It is not an HSL panic order, so a GREEN scope must not retire it
+    (that cancelled the resting exit every cycle, 01/10). Stale ones are still
+    cancelled by the ordinary reconciliation when the signal ends."""
+    if str(order.get("type") or "limit").lower() != "limit":
+        return False
+    try:
+        return bool(bot.bp(order["position_side"], "rylos_4rsi_enabled", order["symbol"]))
+    except Exception:
+        return False
+
+
 def matches(scope, symbol, side):
     return ((scope.symbol is None or scope.symbol == symbol)
             and (scope.pside is None or scope.pside == side))
@@ -266,7 +279,8 @@ class Owner:
                        for order in orders
                        if wave.permission(symbol, order["position_side"])[0] == "normal"
                        and order["pb_order_type"].rsplit("_", 1)[0] == "close_panic"
-                       and bot.get_forced_PB_mode(order["position_side"], symbol) not in {"panic", "manual"}]
+                       and bot.get_forced_PB_mode(order["position_side"], symbol) not in {"panic", "manual"}
+                       and not _rylos_4rsi_exit(bot, order)]
             if not targets and not retired:
                 return False
             bot._record_market_snapshot_surface(sorted(quotes), quotes)
