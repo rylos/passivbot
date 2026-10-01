@@ -510,3 +510,147 @@ def test_bybit_has_no_fresh_book_retry():
     from exchanges.bybit import BybitBot
 
     assert BybitBot._supports_maker_exit_fresh_book_retry is False
+
+
+class _CapBot(_HoldBot):
+    _maker_exit_taker_fee_gap = 0.0003
+
+    def __init__(self, open_orders=None):
+        super().__init__()
+        self.open_orders = open_orders or {}
+
+
+def _cap_exit(price):
+    return _live_order("close_panic_long", "sell", True, price)
+
+
+def test_taker_cap_waits_while_the_market_holds(monkeypatch):
+    from live import executor
+
+    bot = _CapBot()
+    monkeypatch.setattr(executor, "_utc_ms", lambda: 1_000_000)
+    new = _cap_exit(100.0)
+    assert executor._apply_maker_exit_taker_cap(bot, [], [new]) == []
+    assert "_rylos_taker" not in new
+    # a move smaller than the fee gap keeps the exit maker
+    monkeypatch.setattr(executor, "_utc_ms", lambda: 1_010_000)
+    new = _cap_exit(99.98)
+    executor._apply_maker_exit_taker_cap(bot, [], [new])
+    assert "_rylos_taker" not in new
+
+
+def test_taker_cap_triggers_when_price_runs_away(monkeypatch):
+    from live import executor
+
+    resting = dict(_cap_exit(100.0), id="old-1", custom_id="cid-old")
+    bot = _CapBot()
+    monkeypatch.setattr(executor, "_utc_ms", lambda: 1_000_000)
+    executor._apply_maker_exit_taker_cap(bot, [], [_cap_exit(100.0)])
+    bot.open_orders = {SYMBOL: [resting]}
+    monkeypatch.setattr(executor, "_utc_ms", lambda: 1_005_000)
+    new = _cap_exit(99.96)  # -0.04% > gap 0.03%
+    to_cancel = executor._apply_maker_exit_taker_cap(bot, [], [new])
+    assert new["_rylos_taker"] is True
+    assert to_cancel == [resting]  # maker exit cancelled first (cancel-first barrier)
+    # a taker exit is never paired as an amend
+    assert executor._pair_maker_exit_amends(_AmendBot(), to_cancel, [new]) == to_cancel
+
+
+def test_taker_cap_time_cap_cancels_the_resting_exit(monkeypatch):
+    from live import executor
+
+    resting = dict(_cap_exit(100.0), id="old-1", custom_id="cid-old")
+    bot = _CapBot(open_orders={SYMBOL: [resting]})
+    monkeypatch.setattr(executor, "_utc_ms", lambda: 1_000_000)
+    assert executor._apply_maker_exit_taker_cap(bot, [], []) == []
+    monkeypatch.setattr(executor, "_utc_ms", lambda: 1_000_000 + executor.MAKER_EXIT_TAKER_CAP_MS)
+    assert executor._apply_maker_exit_taker_cap(bot, [], []) == [resting]
+    # next cycle the replanned exit goes out as taker
+    new = _cap_exit(100.0)
+    bot.open_orders = {}
+    executor._apply_maker_exit_taker_cap(bot, [], [new])
+    assert new["_rylos_taker"] is True
+
+
+def test_taker_cap_episode_ends_with_the_exit(monkeypatch):
+    from live import executor
+
+    bot = _CapBot()
+    monkeypatch.setattr(executor, "_utc_ms", lambda: 1_000_000)
+    executor._apply_maker_exit_taker_cap(bot, [], [_cap_exit(100.0)])
+    executor._apply_maker_exit_taker_cap(bot, [], [])
+    assert bot._maker_exit_episodes == {}
+    # disabled when the venue has no fee gap
+    plain = _HoldBot()
+    new = _cap_exit(90.0)
+    assert executor._apply_maker_exit_taker_cap(plain, [], [new]) == []
+    assert "_rylos_taker" not in new
+
+
+def _ioc_connector(cls, monkeypatch, *, bid, pprice=95.0, fail=None):
+    creates = []
+
+    async def create_order(self, **kwargs):
+        creates.append(kwargs)
+        if fail:
+            raise Exception(fail)
+        return {"id": "ioc-1"}
+
+    async def fetch_order_book(self, symbol, limit=None):
+        return {"bids": [[bid, 5.0]], "asks": [[bid + 0.001, 5.0]]}
+
+    bot = _amend_connector(cls, monkeypatch, None)
+    bot.cca = type("C", (), {"create_order": create_order, "fetch_order_book": fetch_order_book})()
+    bot.positions = {SYMBOL: {"long": {"size": 1.0, "price": pprice}}}
+    bot.bp = lambda pside, key, symbol: {"rylos_4rsi_enabled": True, "rylos_exit_min_gain": 0.0026}[key]
+    bot.market_snapshot_provider = type("P", (), {"invalidate": lambda self, s: None})()
+    return bot, creates
+
+
+def _taker_exit():
+    return dict(_cap_exit(100.0), custom_id="0x0a1b" + "c" * 28, _rylos_taker=True)
+
+
+def test_hl_taker_cap_sends_an_ioc_at_the_bid(monkeypatch):
+    import asyncio
+    from exchanges.hyperliquid import HyperliquidBot
+
+    hl, creates = _ioc_connector(HyperliquidBot, monkeypatch, bid=99.9)
+    order = _taker_exit()
+    assert asyncio.run(hl.execute_order(order))["id"] == "ioc-1"
+    (call,) = creates
+    assert call["price"] == 99.9 and call["params"]["timeInForce"] == "Ioc"
+    assert call["params"]["reduceOnly"] is True
+    assert order["price"] == 99.9
+
+
+def test_bybit_taker_cap_sends_an_ioc_at_the_bid(monkeypatch):
+    import asyncio
+    from exchanges.bybit import BybitBot
+
+    by, creates = _ioc_connector(BybitBot, monkeypatch, bid=99.9)
+    assert asyncio.run(by.execute_order(_taker_exit()))["id"] == "ioc-1"
+    (call,) = creates
+    assert call["price"] == 99.9 and call["params"]["timeInForce"] == "IOC"
+    assert call["params"]["positionIdx"] == 1
+
+
+def test_taker_cap_never_sells_below_the_exit_floor(monkeypatch):
+    import asyncio
+    from exchanges.hyperliquid import HyperliquidBot
+
+    hl, creates = _ioc_connector(HyperliquidBot, monkeypatch, bid=95.2, pprice=95.0)
+    assert asyncio.run(hl.execute_order(_taker_exit())) == {}
+    assert creates == []
+
+
+def test_hl_unfilled_ioc_is_not_an_error(monkeypatch):
+    import asyncio
+    from exchanges.hyperliquid import HyperliquidBot
+
+    hl, creates = _ioc_connector(
+        HyperliquidBot, monkeypatch, bid=99.9,
+        fail="hyperliquid Order could not immediately match against any resting orders. asset=159",
+    )
+    assert asyncio.run(hl.execute_order(_taker_exit())) == {}
+    assert len(creates) == 1

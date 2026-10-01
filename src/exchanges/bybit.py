@@ -559,6 +559,8 @@ class BybitBot(CCXTBot):
     # fill. Only the price is sent: extra params would be forwarded to the API.
     _supports_maker_exit_amend = True
     _maker_exit_amend_keeps_custom_id = True
+    # rylos: fees from the bybit_02 fills (maker 0.02%, taker 0.055%)
+    _maker_exit_taker_fee_gap = 0.00035
 
     def _maker_exit_amend_args(self, order: dict) -> dict:
         return {"amount": None, "price": order["price"], "params": {}}

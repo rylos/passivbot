@@ -33,6 +33,8 @@ POST_RE = re.compile(r"\[order\]\s+post \S+ \| (?:buy|sell) long [\d.]+@([\d.]+)
 REJ_RE = re.compile(r"post-only (entry_initial_normal_long|close_panic_long) rejected")
 AMEND_RE = re.compile(r"maker exit amend ")
 AMEND_FAIL_RE = re.compile(r"maker exit amend failed")
+CAP_RE = re.compile(r"maker exit taker cap \S+ \| (price moved|time cap)")
+IOC_RE = re.compile(r"maker exit taker IOC ")
 ROME = ZoneInfo("Europe/Rome")
 MAX_GAP = timedelta(minutes=6)  # fra un ordine e il successivo dello stesso episodio
 MAX_REST = timedelta(minutes=60)  # ordine rimasto fermo sul book fino al fill
@@ -133,6 +135,8 @@ def analyse(ep, lines, maker_fee):
     n_rej = sum(1 for ln in win if (m := REJ_RE.search(ln)) and m.group(1) == kind)
     n_amend = sum(1 for ln in win if AMEND_RE.search(ln) and not AMEND_FAIL_RE.search(ln))
     n_amend_fail = sum(1 for ln in win if AMEND_FAIL_RE.search(ln))
+    cap = next((m.group(1) for ln in win if (m := CAP_RE.search(ln))), None)
+    n_ioc = sum(1 for ln in win if IOC_RE.search(ln))
     qty = sum(abs(float(f["qty"])) for f in ep)
     vwap = sum(abs(float(f["qty"])) * float(f["price"]) for f in ep) / qty
     side = 1 if kind == "close_panic_long" else -1  # + = a favore
@@ -147,6 +151,7 @@ def analyse(ep, lines, maker_fee):
         f" → 1° ordine +{dur(first_t - signal)} → fill +{dur(end - signal)}"
         f" ({len(ep)} fill) | {len(chain)} ordini, {n_amend} amend"
         f"{f' ({n_amend_fail} falliti)' if n_amend_fail else ''}, {n_rej} rifiuti post-only"
+        f"{f', tetto taker ({cap}, {n_ioc} IOC)' if cap else ''}"
         f" | 1° prezzo {first_p:g} → fill {vwap:.5g} ({slip:+.3f}% a favore)"
         f" | fee {', '.join(f'{x*100:.3f}%' for x in fees)} {'maker' if maker else 'NON maker'}"
     )

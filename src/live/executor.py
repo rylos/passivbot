@@ -233,6 +233,74 @@ def _is_rylos_maker_exit(bot, order: dict) -> bool:
     )
 
 
+# rylos: taker cap of the 4RSI maker exit. The exit signal fires on overbought
+# peaks, where price tends to fall right away: chasing it down as maker cost
+# 0.1-0.3% on several live exits, against a taker/maker fee gap of ~0.03%.
+# The exit stays post-only while the market holds; once it has moved against
+# the first exit price by more than the fee gap (or after a time cap) the
+# exit becomes an IOC sell at the bid, bounded by the 4RSI exit floor.
+MAKER_EXIT_TAKER_CAP_MS = 60_000
+
+
+def _apply_maker_exit_taker_cap(bot, to_cancel: list[dict], to_create: list[dict]) -> list[dict]:
+    gap = float(getattr(bot, "_maker_exit_taker_fee_gap", 0.0) or 0.0)
+    if gap <= 0.0:
+        return to_cancel
+    episodes = bot.__dict__.setdefault("_maker_exit_episodes", {})
+    now = _utc_ms()
+    wanted = {
+        order["symbol"]: order
+        for order in to_create
+        if _is_rylos_maker_exit(bot, order)
+        and order.get("position_side") == "long"
+        and order.get("side") == "sell"
+    }
+    resting: dict[str, list[dict]] = {}
+    for symbol, orders in (getattr(bot, "open_orders", None) or {}).items():
+        for order in orders or []:
+            if _order_pb_type(order) == "close_panic_long":
+                resting.setdefault(symbol, []).append(order)
+    active = set(wanted) | set(resting)
+    for symbol in list(episodes):
+        if symbol not in active:
+            del episodes[symbol]
+    def _key(order):
+        return order.get("id") or order.get("custom_id") or id(order)
+
+    cancel_ids = {_key(order) for order in to_cancel}
+    for symbol in sorted(active):
+        new = wanted.get(symbol)
+        price = float((new or resting[symbol][0]).get("price") or 0.0)
+        ep = episodes.get(symbol)
+        if ep is None:
+            if not (price > 0.0):
+                continue
+            ep = episodes[symbol] = {"start": now, "first": price, "taker": False}
+        if not ep["taker"]:
+            moved = new is not None and price <= ep["first"] * (1.0 - gap)
+            if moved or now - ep["start"] >= MAKER_EXIT_TAKER_CAP_MS:
+                ep["taker"] = True
+                logging.info(
+                    "[order] maker exit taker cap %s | %s since first exit %s (now %s, %.0fs)",
+                    _pb_attr("Passivbot")._log_symbol(symbol),
+                    "price moved" if moved else "time cap",
+                    ep["first"],
+                    price,
+                    (now - ep["start"]) / 1000.0,
+                )
+        if not ep["taker"]:
+            continue
+        if new is not None:
+            new["_rylos_taker"] = True
+        for order in resting.get(symbol, []):
+            # the resting maker exit goes first; the cancel-first barrier holds
+            # the IOC until it is confirmed gone, so two exits never overlap
+            if _key(order) not in cancel_ids:
+                to_cancel.append(order)
+                cancel_ids.add(_key(order))
+    return to_cancel
+
+
 def _pair_maker_exit_amends(bot, to_cancel: list[dict], to_create: list[dict]) -> list[dict]:
     """rylos: re-price a resting 4RSI maker exit in place (one write) instead of
     cancel + create, which the cancel-first barrier and the revised HSL spread
@@ -253,7 +321,7 @@ def _pair_maker_exit_amends(bot, to_cancel: list[dict], to_create: list[dict]) -
     ]
     paired: set[int] = set()
     for new in to_create:
-        if not _is_rylos_maker_exit(bot, new) or new.get("_amend_from"):
+        if not _is_rylos_maker_exit(bot, new) or new.get("_amend_from") or new.get("_rylos_taker"):
             continue
         for old in olds:
             if id(old) in paired:
@@ -708,6 +776,7 @@ async def execute_order_plan(
         getattr(snapshot, "account_invalidation_generation", 0) or 0
     )
     order_wave = passivbot_cls._begin_order_wave(bot, to_cancel, to_create)
+    to_cancel = _apply_maker_exit_taker_cap(bot, list(to_cancel), to_create)
     to_cancel = _hold_entry_cancels_behind_maker_exit(bot, to_cancel, to_create, order_wave)
     to_cancel = _pair_maker_exit_amends(bot, to_cancel, to_create)
     cancel_first_barrier = (

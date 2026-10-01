@@ -1801,6 +1801,9 @@ class HyperliquidBot(CCXTBot):
     # rylos: an Alo refusal ("would have immediately matched") is synchronous,
     # so the exit can be re-placed at once on a fresh l2Book (weight 2).
     _supports_maker_exit_fresh_book_retry = True
+    # rylos: fees from the vault fills (maker 0.015%, taker 0.045%)
+    _maker_exit_taker_fee_gap = 0.0003
+    _taker_ioc_time_in_force = "Ioc"
 
     def _maker_exit_retry_price(self, symbol: str, price: float) -> float:
         price = round_dynamic(round(price, self.n_decimal_places), self.n_significant_figures)

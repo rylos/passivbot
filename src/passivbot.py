@@ -22403,6 +22403,8 @@ class Passivbot:
                     str(exc)[:200],
                 )
                 return {}
+        if order.get("_rylos_taker"):
+            return await self._maker_exit_taker_ioc(order, params)
         try:
             executed = await self.cca.create_order(**params)
         except Exception as exc:
@@ -22412,6 +22414,45 @@ class Passivbot:
                     return retried
             raise
         return executed
+
+    # rylos: taker cap of the 4RSI exit (see executor._apply_maker_exit_taker_cap).
+    # Taker minus maker fee of the venue; 0 disables the cap.
+    _maker_exit_taker_fee_gap = 0.0
+    _taker_ioc_time_in_force = "IOC"
+
+    async def _maker_exit_taker_ioc(self, order: dict, params: dict):
+        """Sell the 4RSI exit IOC at the bid read now; never below the exit
+        floor pprice * (1 + exit_min_gain). An unfilled IOC is not an error:
+        the next cycle plans the exit again."""
+        symbol = order["symbol"]
+        coin = symbol_to_coin(symbol, verbose=False) or symbol
+        book = await self.cca.fetch_order_book(symbol, 5)
+        bid = float(book["bids"][0][0])
+        pprice = float(((self.positions.get(symbol) or {}).get("long") or {}).get("price") or 0.0)
+        floor = pprice * (1.0 + float(self.bp("long", "rylos_exit_min_gain", symbol)))
+        if pprice <= 0.0 or bid <= floor:
+            logging.info(
+                "[order] maker exit taker cap skipped %s | bid %s at or below exit floor %.6g",
+                coin, bid, floor,
+            )
+            return {}
+        maker_price = order["price"]
+        order["price"] = bid
+        ioc_params = dict(params)
+        ioc_params["price"] = bid
+        ioc_params["params"] = dict(params.get("params") or {})
+        ioc_params["params"]["timeInForce"] = self._taker_ioc_time_in_force
+        logging.info(
+            "[order] maker exit taker IOC %s | sell %s @ %s (maker price was %s)",
+            coin, abs(order["qty"]), bid, maker_price,
+        )
+        try:
+            return await self.cca.create_order(**ioc_params)
+        except Exception as exc:
+            if "could not immediately match" in str(exc):
+                logging.info("[order] maker exit taker IOC not filled %s, next cycle", coin)
+                return {}
+            raise
 
     # rylos: a post-only maker exit refused because the planning quote was
     # stale is re-placed at once on a book read now, inside the same connector
