@@ -93,6 +93,14 @@ OVERRIDABLE_SHARED_BOT_PATHS = frozenset(
         "unstuck.enabled",
         "unstuck.loss_allowance_pct",
         "unstuck.threshold",
+        # rylos: 4RSI thresholds per coin (multi-coin, each coin its own signal)
+        "rylos_4rsi.osc_entry_threshold",
+        "rylos_4rsi.entry_stoch_threshold",
+        "rylos_4rsi.osc_exit_threshold",
+        "rylos_4rsi.exit_stoch_threshold",
+        "rylos_4rsi.exit_min_gain",
+        "rylos_4rsi.crash_stop_pct",
+        "rylos_4rsi.crash_window_minutes",
     }
     | CONDITIONAL_HSL_OVERRIDE_PATHS
 )
