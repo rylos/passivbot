@@ -1804,6 +1804,10 @@ class HyperliquidBot(CCXTBot):
     # rylos: fees from the vault fills (maker 0.015%, taker 0.045%)
     _maker_exit_taker_fee_gap = 0.0003
     _taker_ioc_time_in_force = "Ioc"
+    # rylos: modify turns the resting Alo exit into an Ioc in one action; the
+    # cancel-first path waited for a full account read (~11 s with 9 HIP-3 dexes)
+    # plus a replan, ~25 s between the taker cap and the IOC (live 02/10 01:36).
+    _maker_exit_taker_via_modify = True
 
     def _maker_exit_retry_price(self, symbol: str, price: float) -> float:
         price = round_dynamic(round(price, self.n_decimal_places), self.n_significant_figures)

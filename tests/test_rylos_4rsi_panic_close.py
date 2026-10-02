@@ -654,3 +654,74 @@ def test_hl_unfilled_ioc_is_not_an_error(monkeypatch):
     )
     assert asyncio.run(hl.execute_order(_taker_exit())) == {}
     assert len(creates) == 1
+
+
+def test_taker_cap_via_modify_turns_the_resting_exit_into_the_ioc(monkeypatch):
+    from live import executor
+
+    class _ModifyBot(_CapBot):
+        _maker_exit_taker_via_modify = True
+
+    resting = dict(_cap_exit(100.0), id="old-1", custom_id="cid-old")
+    bot = _ModifyBot()
+    monkeypatch.setattr(executor, "_utc_ms", lambda: 1_000_000)
+    executor._apply_maker_exit_taker_cap(bot, [], [_cap_exit(100.0)])
+    bot.open_orders = {SYMBOL: [resting]}
+    monkeypatch.setattr(executor, "_utc_ms", lambda: 1_005_000)
+    new = _cap_exit(99.96)
+    # the planner's replace-cancel of the resting exit is dropped: one modify
+    to_cancel = executor._apply_maker_exit_taker_cap(bot, [resting], [new])
+    assert to_cancel == []
+    assert new["_rylos_taker"] is True
+    assert new["_amend_from"] == {"id": "old-1", "custom_id": "cid-old", "price": 100.0}
+
+
+def _modify_ioc_connector(monkeypatch, *, bid, pprice=95.0, fail=None):
+    from exchanges.hyperliquid import HyperliquidBot
+
+    hl, creates = _ioc_connector(HyperliquidBot, monkeypatch, bid=bid, pprice=pprice)
+    edits = []
+
+    async def edit_order(self, id, symbol, type, side, amount=None, price=None, params=None):
+        edits.append({"id": id, "type": type, "side": side, "amount": amount, "price": price, "params": params})
+        if fail:
+            raise Exception(fail)
+        return {"id": "ioc-mod"}
+
+    hl.cca.__class__.edit_order = edit_order
+    return hl, creates, edits
+
+
+def _modify_taker_exit():
+    return dict(_taker_exit(), _amend_from={"id": "old-1", "custom_id": "cid-old", "price": 100.0})
+
+
+def test_hl_taker_cap_via_modify_sends_one_ioc_modify(monkeypatch):
+    import asyncio
+
+    hl, creates, edits = _modify_ioc_connector(monkeypatch, bid=99.9)
+    assert asyncio.run(hl.execute_order(_modify_taker_exit()))["id"] == "ioc-mod"
+    assert creates == []
+    (call,) = edits
+    assert call["id"] == "old-1" and call["price"] == 99.9 and call["side"] == "sell"
+    assert call["params"]["timeInForce"] == "Ioc" and call["params"]["reduceOnly"] is True
+
+
+def test_hl_taker_cap_via_modify_respects_the_floor_and_unfilled_ioc(monkeypatch):
+    import asyncio
+
+    hl, creates, edits = _modify_ioc_connector(monkeypatch, bid=95.2, pprice=95.0)
+    assert asyncio.run(hl.execute_order(_modify_taker_exit())) == {}
+    assert edits == [] and creates == []  # the maker exit stays on the book
+    hl, creates, edits = _modify_ioc_connector(
+        monkeypatch, bid=99.9,
+        fail="hyperliquid Order could not immediately match against any resting orders. asset=159",
+    )
+    assert asyncio.run(hl.execute_order(_modify_taker_exit())) == {}
+    assert len(edits) == 1
+
+
+def test_bybit_taker_cap_keeps_cancel_first():
+    from exchanges.bybit import BybitBot
+
+    assert BybitBot._maker_exit_taker_via_modify is False

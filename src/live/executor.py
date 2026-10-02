@@ -292,6 +292,22 @@ def _apply_maker_exit_taker_cap(bot, to_cancel: list[dict], to_create: list[dict
             continue
         if new is not None:
             new["_rylos_taker"] = True
+            rest = resting.get(symbol, [])
+            if (
+                getattr(bot, "_maker_exit_taker_via_modify", False)
+                and len(rest) == 1
+                and rest[0].get("id")
+                and rest[0].get("custom_id")
+            ):
+                # one modify turns the resting maker exit into the IOC
+                new["_amend_from"] = {
+                    "id": rest[0]["id"],
+                    "custom_id": rest[0]["custom_id"],
+                    "price": rest[0].get("price"),
+                }
+                to_cancel = [o for o in to_cancel if _key(o) != _key(rest[0])]
+                cancel_ids.discard(_key(rest[0]))
+                continue
         for order in resting.get(symbol, []):
             # the resting maker exit goes first; the cancel-first barrier holds
             # the IOC until it is confirmed gone, so two exits never overlap

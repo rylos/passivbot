@@ -22421,6 +22421,10 @@ class Passivbot:
             action="create",
             connector_route="amend" if amend_from else "base",
         )
+        if amend_from and order.get("_rylos_taker"):
+            # rylos: taker cap via modify (HL): the resting maker exit becomes
+            # the IOC in one write, no cancel-first wait.
+            return await self._maker_exit_taker_ioc(order, params, amend_from=amend_from)
         if amend_from:
             # rylos: re-price the resting maker exit in one write (HL modify,
             # Bybit amend) instead of cancel + create over two cycles.
@@ -22466,11 +22470,16 @@ class Passivbot:
     # Taker minus maker fee of the venue; 0 disables the cap.
     _maker_exit_taker_fee_gap = 0.0
     _taker_ioc_time_in_force = "IOC"
+    # rylos: the venue can turn the resting maker exit into the IOC with one
+    # modify (cancel + place atomically); otherwise cancel, confirm, then IOC.
+    _maker_exit_taker_via_modify = False
 
-    async def _maker_exit_taker_ioc(self, order: dict, params: dict):
+    async def _maker_exit_taker_ioc(self, order: dict, params: dict, amend_from: dict | None = None):
         """Sell the 4RSI exit IOC at the bid read now; never below the exit
         floor pprice * (1 + exit_min_gain). An unfilled IOC is not an error:
-        the next cycle plans the exit again."""
+        the next cycle plans the exit again. With `amend_from` the resting
+        maker exit is modified into the IOC (HL modify: cancel + place in one
+        action, so two exits never rest together)."""
         symbol = order["symbol"]
         coin = symbol_to_coin(symbol, verbose=False) or symbol
         book = await self.cca.fetch_order_book(symbol, 5)
@@ -22490,10 +22499,19 @@ class Passivbot:
         ioc_params["params"] = dict(params.get("params") or {})
         ioc_params["params"]["timeInForce"] = self._taker_ioc_time_in_force
         logging.info(
-            "[order] maker exit taker IOC %s | sell %s @ %s (maker price was %s)",
+            "[order] maker exit taker IOC %s | sell %s @ %s (maker price was %s)%s",
             coin, abs(order["qty"]), bid, maker_price,
+            " via modify" if amend_from else "",
         )
         try:
+            if amend_from:
+                args = self._maker_exit_amend_args(order)
+                args["price"] = bid
+                args["params"] = dict(args.get("params") or {})
+                args["params"]["timeInForce"] = self._taker_ioc_time_in_force
+                return await self.cca.edit_order(
+                    amend_from["id"], symbol, "limit", order["side"], **args
+                )
             return await self.cca.create_order(**ioc_params)
         except Exception as exc:
             if "could not immediately match" in str(exc):
