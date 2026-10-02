@@ -86,6 +86,7 @@ RESTART_WAIT_S = 90
 STALE_MIN = 35
 # Il warning di trailing warmup dura ~5 min dopo un fill/restart: serve persistenza.
 BLOCK_PERSIST_MIN = 20
+BLOCK_MIN_LINES = 5
 # Soglia del contatore errori nella riga [health] (il limite del bot è 10).
 ERR_COUNTER_MIN = 3
 # Canale unico: healthchecks.io (che notifica su Telegram RyLoS e via email) —
@@ -110,7 +111,8 @@ BLOCK_PATTERNS = (
     "tradable=false",
 )
 TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z")
-HEALTH_RE = re.compile(r"\[health\].*?err=(\d+)/(\d+)")
+# Dal merge upstream del 28/09 la riga [health] riporta errors_1h=N/10 al posto di err=N/10.
+HEALTH_RE = re.compile(r"\[health\].*?(?:errors_1h|err)=(\d+)/(\d+)")
 
 
 def hc_url() -> str | None:
@@ -349,6 +351,13 @@ def main() -> None:
     # restart: allarme solo se il blocco PERSISTE (l'incidente vero del 28/07 è durato
     # 27 ore). Serve quindi che il pattern sia presente da almeno BLOCK_PERSIST_MIN.
     blocked = [l for l in lines if any(p in l for p in BLOCK_PATTERNS)]
+    # Una riga per fill (es. position_fill_confirmation_pending subito dopo ogni
+    # gradino) e' normale: con gradini ogni 10 min il pattern compariva in ogni
+    # giro e dopo 20 min scattava "trading bloccato" (falso allarme 02/10 20:50,
+    # healthchecks down su entrambi i bot). Un blocco vero ripete la riga a ogni
+    # ciclo (centinaia per giro): conta solo da BLOCK_MIN_LINES righe in su.
+    if len(blocked) < BLOCK_MIN_LINES:
+        blocked = []
     if blocked:
         first = state.get("block_first_ts")
         if not first:
