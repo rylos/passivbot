@@ -175,6 +175,7 @@ def main() -> None:
                 "kind": kind,
                 "size": psize,
                 "price": float(fl.get("pprice") or fl["price"]),
+                "order": str(fl.get("client_order_id") or ""),
             }
         )
     if not events:
@@ -213,6 +214,27 @@ def main() -> None:
         STATE.write_text(json.dumps(state))
         return
 
+    # Un ordine eseguito a pezzi (fill parziali, es. Bybit 02/10 17:25: 0,78 +
+    # 7,29 dello stesso entry_initial) e' un solo gradino: i pezzi consecutivi
+    # dello stesso ordine diventano un evento con la posizione dopo l'ultimo,
+    # e un pezzo arrivato in un giro successivo non conta come gradino nuovo.
+    merged = []
+    for ev in fresh:
+        prev = merged[-1] if merged else None
+        if (
+            prev is not None
+            and ev["order"]
+            and ev["order"] == prev["order"]
+            and ev["kind"] in ("new", "added")
+            and prev["kind"] in ("new", "added")
+        ):
+            prev.update(key=ev["key"], ts=ev["ts"], day=ev["day"], time=ev["time"],
+                        size=ev["size"], price=ev["price"])
+        else:
+            merged.append(dict(ev))
+    fresh = merged
+    last_inc_order = state.get("last_inc_order", "")
+
     steps = state.get("steps", 0)
     wallet_now, wallet_at = current_wallet()
 
@@ -221,6 +243,10 @@ def main() -> None:
     pending_step = None
     deferred = False
     for ev in fresh:
+        if ev["kind"] == "added" and ev["order"] and ev["order"] == last_inc_order:
+            continue  # resto di un ordine gia' notificato nel giro prima
+        if ev["kind"] in ("new", "added"):
+            last_inc_order = ev["order"]
         if ev["kind"] == "new":
             pending_step = None
             steps = 1
@@ -324,6 +350,7 @@ def main() -> None:
         state["last_key"] = fresh[-1]["key"]
     state["steps"] = steps
     state["opened_at"] = opened_at
+    state["last_inc_order"] = last_inc_order
     STATE.write_text(json.dumps(state))
 
     if not bot_alive():
