@@ -182,6 +182,20 @@ def _raw_after_size(fl: dict) -> float | None:
     return None
 
 
+EXIT_STALL_MIN = 10
+
+
+def _order_cancelled_log(lines: list, pb_type: str, price: float, after: str) -> bool:
+    """True se dopo `after` il bot ha cancellato l'ordine (stesso tipo e prezzo)."""
+    for ln in lines:
+        if ln[:19] <= after or "[order] cancel" not in ln or pb_type not in ln:
+            continue
+        for m in POST_RE.finditer(ln):
+            if m.group(5) == pb_type and abs(float(m.group(4)) - price) <= 1e-9 * max(price, 1.0):
+                return True
+    return False
+
+
 def _order_qty_log(lines: list, pb_type: str, price: float, ts: str, since: str = "") -> float | None:
     """Quantita' dall'ultima riga "post" con stesso tipo e prezzo fra `since`
     (chiusura precedente: un ordine di ingresso non puo' essere piu' vecchio)
@@ -345,20 +359,33 @@ def main() -> None:
     exit_ = state.get("exit") or {}
 
     def exit_text(x: dict, ev: dict) -> str:
+        x["snap"] = {k: ev[k] for k in ("size", "day", "time")}
+        x["last_ts"] = ev.get("ts", x.get("last_ts", ""))
         pct = min(x["sold"] / x["start"], 1.0) * 100 if x["start"] > 0 else 0.0
         avg = x["value"] / x["sold"] if x["sold"] > 0 else 0.0
+        if x.get("ended"):
+            head = f"📉 <b>{NAME} uscita parziale</b> (finita, poi nuovo ingresso)"
+        elif x.get("stalled"):
+            head = f"📉 <b>{NAME} uscita parziale</b> (ferma da {EXIT_STALL_MIN} min)"
+        else:
+            head = f"📉 <b>{NAME} in uscita</b>"
         return (
-            f"📉 <b>{NAME} in uscita</b> · venduti {x['sold']:.2f}/{x['start']:.2f} {COIN}"
+            f"{head} · venduti {x['sold']:.2f}/{x['start']:.2f} {COIN}"
             f" @ {avg:.5g} · fill {pct:.0f}% · resta {ev['size']:.2f}"
             f" · {rome(ev['day'], ev['time'])}"
         )
 
     def inc_text(o: dict, ev: dict) -> str:
+        o["snap"] = {k: ev[k] for k in ("size", "price", "day", "time")}
+        o["last_ts"] = ev.get("ts", o.get("last_ts", ""))
         if o.get("order_qty") and o["filled"] > o["order_qty"] * 1.0001:
             o["order_qty"] = None  # riga "post" di un altro ordine: niente %
         pct = ""
         if o.get("order_qty"):
             pct = f" · fill {min(o['filled'] / o['order_qty'], 1.0) * 100:.0f}%"
+            if o.get("done") and o["filled"] < o["order_qty"] * 0.9999:
+                # ordine tolto dal bot prima del 100%: la % resta quella vera
+                pct += f" (ordine {o['done']})"
         if o["label"] == "aperta":
             head = f"📈 <b>{NAME} aperta</b> · "
         else:
@@ -386,6 +413,10 @@ def main() -> None:
             edit(o.get("msgs"), inc_text(o, ev))
             continue
         if ev["kind"] in ("new", "added"):
+            if exit_.get("msgs"):
+                # uscita rimasta parziale: il messaggio lo dice, poi si azzera
+                exit_["ended"] = True
+                edit(exit_["msgs"], exit_text(exit_, exit_["snap"]))
             exit_ = {}  # un ingresso chiude l'episodio di uscita parziale
         if ev["kind"] == "new":
             steps = 1
@@ -394,7 +425,8 @@ def main() -> None:
             # All'apertura il saldo realizzato non cambia: vale l'ultima riga
             # [health]/[balance] prima del fill.
             bal = f" · wallet {wallet_now:.2f}" if wallet_now else ""
-            o = {"filled": ev["filled"], "order_qty": ev["order_qty"], "label": "aperta", "bal": bal}
+            o = {"filled": ev["filled"], "order_qty": ev["order_qty"], "label": "aperta", "bal": bal,
+                 "pb_type": ev["pb_type"], "fill_price": ev["fill_price"]}
             o["msgs"] = send(inc_text(o, ev))
             if ev["order"]:
                 orders[ev["order"]] = o
@@ -402,7 +434,8 @@ def main() -> None:
             # Richiesto da Marco il 10/09: un avviso a ogni gradino in piu',
             # con la posizione aggregata.
             steps += 1
-            o = {"filled": ev["filled"], "order_qty": ev["order_qty"], "label": f"gradino {steps}", "bal": ""}
+            o = {"filled": ev["filled"], "order_qty": ev["order_qty"], "label": f"gradino {steps}", "bal": "",
+                 "pb_type": ev["pb_type"], "fill_price": ev["fill_price"]}
             o["msgs"] = send(inc_text(o, ev))
             if ev["order"]:
                 orders[ev["order"]] = o
@@ -414,6 +447,7 @@ def main() -> None:
             else:
                 exit_["sold"] += ev["filled"]
                 exit_["value"] += ev["value"]
+                exit_.pop("stalled", None)
                 edit(exit_["msgs"], exit_text(exit_, ev))
         elif ev["kind"] == "closed":
             # Il PnL della posizione e' la somma dei fill di chiusura da
@@ -485,9 +519,32 @@ def main() -> None:
                 edit(exit_["msgs"], final)
             else:
                 send(final)
+            # ingressi rimasti a meta' (es. gradino eseguito in parte e
+            # cancellato alla chiusura): il loro messaggio resta con la % vera
+            for o in orders.values():
+                if o.get("order_qty") and o["filled"] < o["order_qty"] * 0.9999 and not o.get("done"):
+                    o["done"] = "chiuso"
+                    edit(o.get("msgs"), inc_text(o, o["snap"]))
             steps = 0
             orders = {}
             exit_ = {}
+
+    # Ingressi eseguiti in parte e poi tolti dal bot (es. entry_initial
+    # ritirato a fine segnale, gradino riprezzato): la riga "[order] cancel"
+    # con stesso tipo e prezzo dopo l'ultimo pezzo chiude l'avviso a quella %.
+    for o in orders.values():
+        if (not o.get("done") and o.get("order_qty") and o.get("snap")
+                and o["filled"] < o["order_qty"] * 0.9999
+                and _order_cancelled_log(lines, o.get("pb_type", ""), o.get("fill_price", 0.0), o.get("last_ts", ""))):
+            o["done"] = "cancellato"
+            edit(o.get("msgs"), inc_text(o, o["snap"]))
+    # Uscita ferma a meta' (nessun pezzo da EXIT_STALL_MIN minuti e posizione
+    # ancora aperta): il messaggio lo dice; se riprende, torna "in uscita".
+    if exit_.get("msgs") and not exit_.get("stalled") and exit_.get("last_ts"):
+        idle = datetime.now(timezone.utc).replace(tzinfo=None) - datetime.strptime(exit_["last_ts"], "%Y-%m-%dT%H:%M:%S")
+        if idle >= timedelta(minutes=EXIT_STALL_MIN):
+            exit_["stalled"] = True
+            edit(exit_["msgs"], exit_text(exit_, exit_["snap"]))
 
     if deferred:
         # l'evento "closed" non e' stato processato: il prossimo giro riparte
