@@ -330,6 +330,7 @@ def main() -> None:
                 "filled": abs(qty),
                 "fill_price": float(fl["price"]),
                 "value": abs(qty) * float(fl["price"]),
+                "pnl": float(fl.get("pnl") or 0.0),
                 "pb_type": str(fl.get("pb_order_type") or ""),
                 "order_qty": _order_qty_raw(fl),
             }
@@ -399,6 +400,7 @@ def main() -> None:
             prev.update(key=ev["key"], ts=ev["ts"], day=ev["day"], time=ev["time"],
                         size=ev["size"], kind=ev["kind"],
                         value=prev["value"] + ev["value"],
+                        pnl=prev["pnl"] + ev["pnl"],
                         filled=prev["filled"] + ev["filled"])
         else:
             merged.append(dict(ev))
@@ -442,6 +444,7 @@ def main() -> None:
             f"{_m(x['value'])} / {_m(x['value'] + rest * x.get('last_price', avg))} {CCY}",
             f"{_bar(x['sold'] / x['start'] if x['start'] > 0 else 0.0)}"
             f" · resta {_q(rest)} {COIN} ({_m(rest * x.get('last_price', avg))} {CCY})",
+            f"Guadagno finora: {_s(x.get('pnl', 0.0))} {CCY}",
             rome(ev["day"], ev["time"]),
         ])
 
@@ -518,11 +521,12 @@ def main() -> None:
         elif ev["kind"] == "reduced":
             if not exit_:
                 exit_ = {"start": ev["size"] + ev["filled"], "sold": ev["filled"],
-                         "value": ev["value"], "msgs": []}
+                         "value": ev["value"], "pnl": ev["pnl"], "msgs": []}
                 exit_["msgs"] = send(exit_text(exit_, ev))
             else:
                 exit_["sold"] += ev["filled"]
                 exit_["value"] += ev["value"]
+                exit_["pnl"] = exit_.get("pnl", 0.0) + ev["pnl"]
                 exit_.pop("stalled", None)
                 edit(exit_["msgs"], exit_text(exit_, ev))
         elif ev["kind"] == "closed":
@@ -543,6 +547,7 @@ def main() -> None:
                 (e["ts"] for e in reversed(events) if e["kind"] == "new" and e["ts"] <= end), end
             )
             pnl = 0.0
+            cost = 0.0
             n_fills = 0
             n_manual = 0
             for fl in fills:
@@ -550,6 +555,8 @@ def main() -> None:
                 if not (start <= ts <= end):
                     continue
                 pnl += float(fl.get("fee_paid") or 0.0)  # fee con segno, ingressi compresi
+                if float(fl["qty"]) > 0:
+                    cost += float(fl["qty"]) * float(fl["price"])  # capitale impegnato
                 # anche i fill "unknown": una chiusura fatta a mano sull'exchange
                 # (29/09); per un long ogni riduzione ha qty negativa
                 if float(fl["qty"]) < 0:
@@ -586,8 +593,10 @@ def main() -> None:
             value = exit_.get("value", 0.0) + ev["value"]
             exit_line = f"Uscita {_q(sold)} {COIN} @ {_px(value / sold)} · {_m(value)} {CCY}" if sold > 0 else "Uscita"
             when = rome(ev["day"], ev["time"])
+            pct = f" ({_s(pnl / cost * 100)}%)" if cost > 0 else ""
             final = "\n".join([
-                f"{icon} <b>{NAME} · CHIUSA{manual}  {_s(pnl)} {CCY}</b>",
+                f"{icon} <b>{NAME} · CHIUSA{manual}</b>",
+                f"<b>Guadagno posizione: {_s(pnl)} {CCY}{pct}</b>",
                 exit_line,
                 f"{steps} {'gradino' if steps == 1 else 'gradini'} · durata {_dur(start, end)} · {_bar(1.0)}",
                 f"Wallet {_m(wallet, 2)} {CCY} · {when}" if wallet else when,
