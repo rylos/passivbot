@@ -146,7 +146,29 @@ def load_fills(days: int = 3) -> list:
             continue
         out += [fl for fl in data if str(fl.get("symbol", "")).startswith(COIN + "/")
                 and str(fl.get("position_side", "long")) == "long"]
-    return sorted(out, key=lambda fl: (fl["datetime"], str(fl["id"])))
+    return sorted(out, key=_fill_order)
+
+
+def _fill_order(fl: dict) -> tuple:
+    """Ordine dei fill: per orario e, a parita' di millisecondo, nell'ordine in
+    cui l'exchange li ha eseguiti, ricostruito dalla posizione PRIMA del fill
+    (riduzioni dalla piu' grande, aumenti dalla piu' piccola). Ordinarli per id
+    metteva il pezzo che chiude prima di quello che riduce: il 03/10 01:06 su HL
+    (IOC in due pezzi) "chiusa" con 48,13 invece di 71,96 HYPE e un falso
+    "uscita ferma al 33%" dopo la chiusura."""
+    qty = float(fl.get("qty") or 0.0)
+    before = None
+    for raw in fl.get("raw") or []:
+        info = ((raw or {}).get("data") or {}).get("info") or {}
+        if "startPosition" in info:
+            try:
+                before = abs(float(info["startPosition"]))
+            except (TypeError, ValueError):
+                before = None
+            break
+    if before is None:
+        before = abs(float(fl.get("psize") or 0.0) - qty)
+    return (fl["datetime"], before if qty > 0 else -before, str(fl["id"]))
 
 
 # Un ordine di ingresso puo' essere eseguito a piu' pezzi (fill parziali).
