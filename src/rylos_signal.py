@@ -115,8 +115,14 @@ def _aggregate_5m(
     if len(last_rows) == 0:
         return None
     starts = np.concatenate(([0], last_rows[:-1] + 1))
-    c_high = np.maximum.reduceat(highs, starts)
-    c_low = np.minimum.reduceat(lows, starts)
+    # reduceat runs the last segment to the end of the array: cut the trailing
+    # in-progress bucket off first, or the last closed candle's high/low would
+    # absorb the 1-4 minutes of the next candle (live: the stoch of a closed
+    # candle drifted inside the following candle and opened/closed the 4RSI
+    # entry mid-candle, e.g. Bybit 2026-10-02 07:20 -> 07:21 UTC 12.09 -> 15.25).
+    n_closed = int(last_rows[-1]) + 1
+    c_high = np.maximum.reduceat(highs[:n_closed], starts)
+    c_low = np.minimum.reduceat(lows[:n_closed], starts)
     c_close = closes[last_rows]
     # Open = previous 5m close (only HLCV available); first candle unknown.
     c_color = np.empty(len(last_rows))
