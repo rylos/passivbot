@@ -594,8 +594,9 @@ def main() -> None:
             ])
             if exit_.get("msgs"):
                 edit(exit_["msgs"], final)
+                state["last_close"] = exit_["msgs"]
             else:
-                send(final)
+                state["last_close"] = send(final)  # per poterlo correggere
             # ingressi rimasti a meta' (es. gradino eseguito in parte e
             # cancellato alla chiusura): il loro messaggio resta con la % vera
             for o in orders.values():
