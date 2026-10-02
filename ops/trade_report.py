@@ -70,25 +70,43 @@ ROCKET_PCT = 0.005
 MAX_REPLAY = 10
 
 
-def _send_one(creds: dict, text: str) -> None:
-    data = urllib.parse.urlencode(
-        {"chat_id": creds["chat_id"], "text": text, "parse_mode": "HTML"}
-    ).encode()
-    url = "https://api.telegram.org/bot" + creds["token"] + "/sendMessage"
+def _tg(creds: dict, method: str, params: dict) -> dict:
+    data = urllib.parse.urlencode({"chat_id": creds["chat_id"], **params}).encode()
+    url = "https://api.telegram.org/bot" + creds["token"] + "/" + method
     with urllib.request.urlopen(url, data=data, timeout=30) as r:
-        r.read()
+        return json.loads(r.read() or b"{}")
 
 
-def send(text: str) -> None:
+def _targets() -> list:
     # Destinatario principale (Claude RyLoS Bot -> Marco) + eventuali extra del
     # profilo (per hl: @freqtradehl_bot -> gruppo RyLoS-Trading, richiesto da
     # Marco il 2026-09-10). Un errore su un destinatario non blocca gli altri.
-    targets = [CREDS] + [BASE / f for f in P.get("extra_creds", [])]
-    for path in targets:
+    return [CREDS] + [BASE / f for f in P.get("extra_creds", [])]
+
+
+def send(text: str) -> list:
+    """Manda a tutti i destinatari; ritorna [[file credenziali, message_id]]."""
+    sent = []
+    for path in _targets():
         try:
-            _send_one(json.loads(path.read_text()), text)
+            res = _tg(json.loads(path.read_text()), "sendMessage", {"text": text, "parse_mode": "HTML"})
+            mid = (res.get("result") or {}).get("message_id")
+            if mid is not None:
+                sent.append([path.name, mid])
         except Exception as e:  # noqa: BLE001
             print(f"send fallito su {path.name}: {e}", file=sys.stderr)
+    return sent
+
+
+def edit(msgs: list, text: str) -> None:
+    """Riscrive i messaggi gia' mandati (avanzamento del fill di un ordine)."""
+    for name, mid in msgs or []:
+        try:
+            _tg(json.loads((BASE / name).read_text()), "editMessageText",
+                {"message_id": mid, "text": text, "parse_mode": "HTML"})
+        except Exception as e:  # noqa: BLE001
+            if "not modified" not in str(e):
+                print(f"edit fallito su {name}: {e}", file=sys.stderr)
 
 
 def bot_alive() -> bool:
@@ -131,40 +149,36 @@ def load_fills(days: int = 3) -> list:
     return sorted(out, key=lambda fl: (fl["datetime"], str(fl["id"])))
 
 
-# Un ordine di ingresso puo' essere eseguito a piu' pezzi. L'avviso parte
-# quando l'ordine e' completo: su Bybit lo dice leavesQty del fill; su HL il
-# fill non lo dice, si aspetta che per HOLD_QUIET_S non arrivino altri pezzi.
-# Oltre HOLD_MAX_S si avvisa comunque con la posizione di quel momento; i
-# pezzi successivi mandano un aggiornamento, mai un gradino nuovo.
-HOLD_QUIET_S = 60
-HOLD_MAX_S = 600
+# Un ordine di ingresso puo' essere eseguito a piu' pezzi (fill parziali).
+# L'avviso parte al primo pezzo con la % eseguita dell'ordine e lo stesso
+# messaggio viene modificato a ogni pezzo successivo fino al 100% (Marco,
+# 02/10). Quantita' dell'ordine: Bybit la scrive nel fill (orderQty); per HL
+# si prende dall'ultima riga "[order] post" del log con stesso tipo e prezzo.
+POST_RE = re.compile(r"(buy|sell) (long|short) ([\d.]+)@([\d.]+) (\S+)")
 
 
-def _leaves_qty(fl: dict) -> float | None:
+def _order_qty_raw(fl: dict) -> float | None:
     for raw in fl.get("raw") or []:
         info = ((raw or {}).get("data") or {}).get("info") or {}
-        if "leavesQty" in info:
+        if "orderQty" in info:
             try:
-                return float(info["leavesQty"])
+                return float(info["orderQty"])
             except (TypeError, ValueError):
                 return None
     return None
 
 
-def _age_s(ts: str) -> float:
-    t = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
-    return (datetime.now(timezone.utc) - t).total_seconds()
-
-
-def _order_incomplete(ev: dict) -> bool:
-    if ev["kind"] not in ("new", "added"):
-        return False
-    age = _age_s(ev["ts"])
-    if age >= HOLD_MAX_S:
-        return False
-    if ev.get("leaves") is not None:
-        return ev["leaves"] > 1e-12
-    return age < HOLD_QUIET_S
+def _order_qty_log(lines: list, pb_type: str, price: float, ts: str) -> float | None:
+    qty = None
+    for ln in lines:
+        if ln[:19] > ts:
+            break
+        if "[order]" not in ln or " post " not in ln or pb_type not in ln:
+            continue
+        for m in POST_RE.finditer(ln):
+            if m.group(5) == pb_type and abs(float(m.group(4)) - price) <= 1e-9 * max(price, 1.0):
+                qty = float(m.group(3))
+    return qty
 
 
 def load_state() -> dict:
@@ -212,7 +226,10 @@ def main() -> None:
                 "size": psize,
                 "price": float(fl.get("pprice") or fl["price"]),
                 "order": str(fl.get("client_order_id") or ""),
-                "leaves": _leaves_qty(fl),
+                "filled": abs(qty),
+                "fill_price": float(fl["price"]),
+                "pb_type": str(fl.get("pb_order_type") or ""),
+                "order_qty": _order_qty_raw(fl),
             }
         )
     if not events:
@@ -266,14 +283,27 @@ def main() -> None:
             and prev["kind"] in ("new", "added")
         ):
             prev.update(key=ev["key"], ts=ev["ts"], day=ev["day"], time=ev["time"],
-                        size=ev["size"], price=ev["price"], leaves=ev["leaves"])
+                        size=ev["size"], price=ev["price"],
+                        filled=prev["filled"] + ev["filled"],
+                        order_qty=prev["order_qty"] or ev["order_qty"])
         else:
             merged.append(dict(ev))
     fresh = merged
-    # ordine ancora in esecuzione: si riprende al prossimo giro con tutti i pezzi
-    if fresh and _order_incomplete(fresh[-1]):
-        fresh = fresh[:-1]
-    last_inc_order = state.get("last_inc_order", "")
+    for ev in fresh:
+        if ev["kind"] in ("new", "added") and ev["order_qty"] is None:
+            ev["order_qty"] = _order_qty_log(lines, ev["pb_type"], ev["fill_price"], ev["ts"])
+    inc = state.get("inc") or {}
+
+    def inc_text(label: str, ev: dict, filled: float, order_qty, bal: str) -> str:
+        pct = ""
+        if order_qty:
+            pct = f" · fill {min(filled / order_qty, 1.0) * 100:.0f}%"
+        head = f"📈 <b>{NAME} aperta</b> · " if label == "aperta" else f"➕ <b>{NAME} {label}</b> · pos "
+        return (
+            f"{head}{ev['size']:.2f} {COIN} @ {ev['price']:.5g}"
+            f" · {ev['size'] * ev['price']:,.0f} {CCY}{pct}{bal}"
+            f" · {rome(ev['day'], ev['time'])}"
+        )
 
     steps = state.get("steps", 0)
     wallet_now, wallet_at = current_wallet()
@@ -283,17 +313,13 @@ def main() -> None:
     pending_step = None
     deferred = False
     for ev in fresh:
-        if ev["kind"] == "added" and ev["order"] and ev["order"] == last_inc_order:
-            # resto di un ordine gia' notificato (oltre HOLD_MAX_S): stesso
-            # gradino, si aggiorna la posizione
-            send(
-                f"↻ <b>{NAME} {'apertura' if steps <= 1 else f'gradino {steps}'} completata</b>"
-                f" · pos {ev['size']:.2f} {COIN} @ {ev['price']:.5g}"
-                f" · {ev['size'] * ev['price']:,.0f} {CCY} · {rome(ev['day'], ev['time'])}"
-            )
+        if ev["kind"] == "added" and ev["order"] and ev["order"] == inc.get("order"):
+            # altro pezzo di un ordine gia' notificato: stesso gradino, si
+            # modifica il messaggio con la posizione e la % eseguita
+            inc["filled"] = inc.get("filled", 0.0) + ev["filled"]
+            inc["order_qty"] = inc.get("order_qty") or ev["order_qty"]
+            edit(inc.get("msgs"), inc_text(inc["label"], ev, inc["filled"], inc["order_qty"], inc.get("bal", "")))
             continue
-        if ev["kind"] in ("new", "added"):
-            last_inc_order = ev["order"]
         if ev["kind"] == "new":
             pending_step = None
             steps = 1
@@ -301,11 +327,9 @@ def main() -> None:
             # All'apertura il saldo realizzato non cambia: vale l'ultima riga
             # [health]/[balance] prima del fill.
             bal = f" · wallet {wallet_now:.2f}" if wallet_now else ""
-            send(
-                f"📈 <b>{NAME} aperta</b> · {ev['size']:.2f} {COIN} @ {ev['price']:.5g}"
-                f" · {ev['size'] * ev['price']:,.0f} {CCY}{bal}"
-                f" · {rome(ev['day'], ev['time'])}"
-            )
+            msgs = send(inc_text("aperta", ev, ev["filled"], ev["order_qty"], bal))
+            inc = {"order": ev["order"], "filled": ev["filled"], "order_qty": ev["order_qty"],
+                   "label": "aperta", "bal": bal, "msgs": msgs}
         elif ev["kind"] == "added":
             steps += 1
             # Richiesto da Marco il 10/09: un avviso a ogni gradino in piu',
@@ -379,13 +403,14 @@ def main() -> None:
             )
             steps = 0
             pending_step = None
+            inc = {}
 
     if pending_step is not None:
         ev = pending_step
-        send(
-            f"➕ <b>{NAME} gradino {steps}</b> · pos {ev['size']:.2f} {COIN} @ {ev['price']:.5g}"
-            f" · {ev['size'] * ev['price']:,.0f} {CCY} · {rome(ev['day'], ev['time'])}"
-        )
+        label = f"gradino {steps}"
+        msgs = send(inc_text(label, ev, ev["filled"], ev["order_qty"], ""))
+        inc = {"order": ev["order"], "filled": ev["filled"], "order_qty": ev["order_qty"],
+               "label": label, "bal": "", "msgs": msgs}
 
     if deferred:
         # l'evento "closed" non e' stato processato: il prossimo giro riparte
@@ -397,7 +422,8 @@ def main() -> None:
         state["last_key"] = fresh[-1]["key"]
     state["steps"] = steps
     state["opened_at"] = opened_at
-    state["last_inc_order"] = last_inc_order
+    state["inc"] = inc
+    state.pop("last_inc_order", None)
     STATE.write_text(json.dumps(state))
 
     if not bot_alive():
