@@ -168,6 +168,20 @@ def _order_qty_raw(fl: dict) -> float | None:
     return None
 
 
+def _raw_after_size(fl: dict) -> float | None:
+    """HL: posizione dopo il fill dai dati dell'exchange (startPosition + sz),
+    esatta anche quando la psize della cache non e' ancora ricalcolata."""
+    for raw in fl.get("raw") or []:
+        info = ((raw or {}).get("data") or {}).get("info") or {}
+        if "startPosition" in info and "sz" in info and info.get("side") in ("A", "B"):
+            try:
+                start, sz = float(info["startPosition"]), float(info["sz"])
+            except (TypeError, ValueError):
+                return None
+            return abs(start + (sz if info["side"] == "B" else -sz))
+    return None
+
+
 def _order_qty_log(lines: list, pb_type: str, price: float, ts: str) -> float | None:
     qty = None
     for ln in lines:
@@ -211,6 +225,9 @@ def main() -> None:
     events = []
     for fl in fills:
         qty, psize = float(fl["qty"]), float(fl.get("psize") or 0.0)
+        raw_size = _raw_after_size(fl)
+        if raw_size is not None:
+            psize = raw_size
         if qty > 0:
             kind = "new" if abs(psize - qty) < 1e-9 else "added"
         else:
@@ -268,10 +285,12 @@ def main() -> None:
         STATE.write_text(json.dumps(state))
         return
 
-    # Un ordine eseguito a pezzi (fill parziali, es. Bybit 02/10 17:25: 0,78 +
-    # 7,29 dello stesso entry_initial) e' un solo gradino: i pezzi consecutivi
-    # dello stesso ordine diventano un evento con la posizione dopo l'ultimo,
-    # e un pezzo arrivato in un giro successivo non conta come gradino nuovo.
+    # Ordini eseguiti a pezzi (fill parziali, es. Bybit 02/10 17:25: 0,78 +
+    # 7,29 dello stesso entry_initial). Ogni ordine di ingresso e' UN avviso
+    # (apertura o gradino) che parte al primo pezzo con la % eseguita e viene
+    # modificato a ogni pezzo successivo fino al 100%, anche se i pezzi di
+    # ordini diversi si alternano o arrivano in giri diversi (Marco, 02/10).
+    # I pezzi consecutivi dello stesso ordine nello stesso giro si uniscono.
     merged = []
     for ev in fresh:
         prev = merged[-1] if merged else None
@@ -289,19 +308,32 @@ def main() -> None:
         else:
             merged.append(dict(ev))
     fresh = merged
+    # Ingresso con la posizione ancora a zero nella cache (psize non ancora
+    # ricalcolata dal bot): si riprende al giro dopo, al massimo per 10 min.
+    for i, ev in enumerate(fresh):
+        if ev["kind"] in ("new", "added") and ev["size"] <= 0.0:
+            age = (datetime.now(timezone.utc).replace(tzinfo=None)
+                   - datetime.strptime(ev["ts"], "%Y-%m-%dT%H:%M:%S")).total_seconds()
+            if age < 600:
+                fresh = fresh[:i]
+                break
     for ev in fresh:
         if ev["kind"] in ("new", "added") and ev["order_qty"] is None:
             ev["order_qty"] = _order_qty_log(lines, ev["pb_type"], ev["fill_price"], ev["ts"])
-    inc = state.get("inc") or {}
+    # ordini di ingresso della posizione aperta: {client_order_id: avviso}
+    orders = state.get("orders") or {}
 
-    def inc_text(label: str, ev: dict, filled: float, order_qty, bal: str) -> str:
+    def inc_text(o: dict, ev: dict) -> str:
         pct = ""
-        if order_qty:
-            pct = f" · fill {min(filled / order_qty, 1.0) * 100:.0f}%"
-        head = f"📈 <b>{NAME} aperta</b> · " if label == "aperta" else f"➕ <b>{NAME} {label}</b> · pos "
+        if o.get("order_qty"):
+            pct = f" · fill {min(o['filled'] / o['order_qty'], 1.0) * 100:.0f}%"
+        if o["label"] == "aperta":
+            head = f"📈 <b>{NAME} aperta</b> · "
+        else:
+            head = f"➕ <b>{NAME} {o['label']}</b> · pos "
         return (
             f"{head}{ev['size']:.2f} {COIN} @ {ev['price']:.5g}"
-            f" · {ev['size'] * ev['price']:,.0f} {CCY}{pct}{bal}"
+            f" · {ev['size'] * ev['price']:,.0f} {CCY}{pct}{o.get('bal', '')}"
             f" · {rome(ev['day'], ev['time'])}"
         )
 
@@ -310,32 +342,34 @@ def main() -> None:
 
     opened_at = state.get("opened_at")
 
-    pending_step = None
     deferred = False
     for ev in fresh:
-        if ev["kind"] == "added" and ev["order"] and ev["order"] == inc.get("order"):
-            # altro pezzo di un ordine gia' notificato: stesso gradino, si
-            # modifica il messaggio con la posizione e la % eseguita
-            inc["filled"] = inc.get("filled", 0.0) + ev["filled"]
-            inc["order_qty"] = inc.get("order_qty") or ev["order_qty"]
-            edit(inc.get("msgs"), inc_text(inc["label"], ev, inc["filled"], inc["order_qty"], inc.get("bal", "")))
+        if ev["kind"] in ("new", "added") and ev["order"] and ev["order"] in orders:
+            # altro pezzo di un ordine gia' notificato: stesso avviso, aggiornato
+            o = orders[ev["order"]]
+            o["filled"] = o.get("filled", 0.0) + ev["filled"]
+            o["order_qty"] = o.get("order_qty") or ev["order_qty"]
+            edit(o.get("msgs"), inc_text(o, ev))
             continue
         if ev["kind"] == "new":
-            pending_step = None
             steps = 1
             opened_at = ev["ts"]
+            orders = {}
             # All'apertura il saldo realizzato non cambia: vale l'ultima riga
             # [health]/[balance] prima del fill.
             bal = f" · wallet {wallet_now:.2f}" if wallet_now else ""
-            msgs = send(inc_text("aperta", ev, ev["filled"], ev["order_qty"], bal))
-            inc = {"order": ev["order"], "filled": ev["filled"], "order_qty": ev["order_qty"],
-                   "label": "aperta", "bal": bal, "msgs": msgs}
+            o = {"filled": ev["filled"], "order_qty": ev["order_qty"], "label": "aperta", "bal": bal}
+            o["msgs"] = send(inc_text(o, ev))
+            if ev["order"]:
+                orders[ev["order"]] = o
         elif ev["kind"] == "added":
-            steps += 1
             # Richiesto da Marco il 10/09: un avviso a ogni gradino in piu',
-            # con la posizione aggregata. Se in un giro (5 min) arrivano piu'
-            # gradini, vale solo l'ultimo: si manda dopo il ciclo.
-            pending_step = ev
+            # con la posizione aggregata.
+            steps += 1
+            o = {"filled": ev["filled"], "order_qty": ev["order_qty"], "label": f"gradino {steps}", "bal": ""}
+            o["msgs"] = send(inc_text(o, ev))
+            if ev["order"]:
+                orders[ev["order"]] = o
         elif ev["kind"] == "reduced":
             pass  # uscita parziale: non e' un gradino, si riassume alla chiusura
         elif ev["kind"] == "closed":
@@ -402,15 +436,7 @@ def main() -> None:
                 f" · {rome(ev['day'], ev['time'])}"
             )
             steps = 0
-            pending_step = None
-            inc = {}
-
-    if pending_step is not None:
-        ev = pending_step
-        label = f"gradino {steps}"
-        msgs = send(inc_text(label, ev, ev["filled"], ev["order_qty"], ""))
-        inc = {"order": ev["order"], "filled": ev["filled"], "order_qty": ev["order_qty"],
-               "label": label, "bal": "", "msgs": msgs}
+            orders = {}
 
     if deferred:
         # l'evento "closed" non e' stato processato: il prossimo giro riparte
@@ -422,8 +448,9 @@ def main() -> None:
         state["last_key"] = fresh[-1]["key"]
     state["steps"] = steps
     state["opened_at"] = opened_at
-    state["inc"] = inc
+    state["orders"] = orders
     state.pop("last_inc_order", None)
+    state.pop("inc", None)
     STATE.write_text(json.dumps(state))
 
     if not bot_alive():
