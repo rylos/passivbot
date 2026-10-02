@@ -292,22 +292,32 @@ def _apply_maker_exit_taker_cap(bot, to_cancel: list[dict], to_create: list[dict
             continue
         if new is not None:
             new["_rylos_taker"] = True
-            rest = resting.get(symbol, [])
-            if (
-                getattr(bot, "_maker_exit_taker_via_modify", False)
-                and len(rest) == 1
-                and rest[0].get("id")
-                and rest[0].get("custom_id")
-            ):
-                # one modify turns the resting maker exit into the IOC
-                new["_amend_from"] = {
-                    "id": rest[0]["id"],
-                    "custom_id": rest[0]["custom_id"],
-                    "price": rest[0].get("price"),
+            if getattr(bot, "_maker_exit_taker_via_modify", False):
+                # the exit to modify: the one the plan is already replacing
+                # (it carries the exchange id), else the one on the book
+                exits = {
+                    o["id"]: o
+                    for o in [*to_cancel, *resting.get(symbol, [])]
+                    if o.get("symbol") == symbol
+                    and _order_pb_type(o) == "close_panic_long"
+                    and o.get("id")
                 }
-                to_cancel = [o for o in to_cancel if _key(o) != _key(rest[0])]
-                cancel_ids.discard(_key(rest[0]))
-                continue
+                if len(exits) == 1:
+                    (old,) = exits.values()
+                    # one modify turns the resting maker exit into the IOC
+                    new["_amend_from"] = {
+                        "id": old["id"],
+                        "custom_id": old.get("custom_id"),
+                        "price": old.get("price"),
+                    }
+                    to_cancel = [o for o in to_cancel if o.get("id") != old["id"]]
+                    cancel_ids.discard(_key(old))
+                    continue
+                logging.info(
+                    "[order] maker exit taker cap %s | modify not possible (%d exits with id), cancel then IOC",
+                    _pb_attr("Passivbot")._log_symbol(symbol),
+                    len(exits),
+                )
         for order in resting.get(symbol, []):
             # the resting maker exit goes first; the cancel-first barrier holds
             # the IOC until it is confirmed gone, so two exits never overlap

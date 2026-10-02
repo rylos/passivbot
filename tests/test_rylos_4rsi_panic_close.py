@@ -725,3 +725,43 @@ def test_bybit_taker_cap_keeps_cancel_first():
     from exchanges.bybit import BybitBot
 
     assert BybitBot._maker_exit_taker_via_modify is False
+
+
+def test_taker_cap_via_modify_uses_the_exit_the_plan_replaces(monkeypatch):
+    # live 03/10 01:06 HL: the exit re-placed on a fresh book was in the plan's
+    # replace-cancel but the modify was not taken (cancel + IOC 20 s later)
+    from live import executor
+
+    class _ModifyBot(_CapBot):
+        _maker_exit_taker_via_modify = True
+
+    bot = _ModifyBot()
+    monkeypatch.setattr(executor, "_utc_ms", lambda: 1_000_000)
+    executor._apply_maker_exit_taker_cap(bot, [], [_cap_exit(100.0)])
+    monkeypatch.setattr(executor, "_utc_ms", lambda: 1_000_000 + executor.MAKER_EXIT_TAKER_CAP_MS)
+    planned = dict(_cap_exit(100.02), id="oid-9")  # no custom_id, not in open_orders
+    new = _cap_exit(100.0)
+    to_cancel = executor._apply_maker_exit_taker_cap(bot, [planned], [new])
+    assert to_cancel == []
+    assert new["_amend_from"]["id"] == "oid-9"
+
+
+def test_taker_cap_via_modify_falls_back_with_two_exits(monkeypatch, caplog):
+    import logging
+    from live import executor
+
+    class _ModifyBot(_CapBot):
+        _maker_exit_taker_via_modify = True
+
+    a = dict(_cap_exit(100.0), id="a", custom_id="ca")
+    b = dict(_cap_exit(100.1), id="b", custom_id="cb")
+    bot = _ModifyBot(open_orders={SYMBOL: [a, b]})
+    monkeypatch.setattr(executor, "_utc_ms", lambda: 1_000_000)
+    executor._apply_maker_exit_taker_cap(bot, [], [_cap_exit(100.0)])
+    monkeypatch.setattr(executor, "_utc_ms", lambda: 1_000_000 + executor.MAKER_EXIT_TAKER_CAP_MS)
+    new = _cap_exit(100.0)
+    with caplog.at_level(logging.INFO):
+        to_cancel = executor._apply_maker_exit_taker_cap(bot, [], [new])
+    assert "_amend_from" not in new and new["_rylos_taker"] is True
+    assert {o["id"] for o in to_cancel} == {"a", "b"}
+    assert any("modify not possible (2 exits with id)" in r.getMessage() for r in caplog.records)
