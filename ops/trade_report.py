@@ -182,11 +182,16 @@ def _raw_after_size(fl: dict) -> float | None:
     return None
 
 
-def _order_qty_log(lines: list, pb_type: str, price: float, ts: str) -> float | None:
+def _order_qty_log(lines: list, pb_type: str, price: float, ts: str, since: str = "") -> float | None:
+    """Quantita' dall'ultima riga "post" con stesso tipo e prezzo fra `since`
+    (chiusura precedente: un ordine di ingresso non puo' essere piu' vecchio)
+    e il fill."""
     qty = None
     for ln in lines:
         if ln[:19] > ts:
             break
+        if ln[:19] < since:
+            continue
         if "[order]" not in ln or " post " not in ln or pb_type not in ln:
             continue
         for m in POST_RE.finditer(ln):
@@ -245,6 +250,7 @@ def main() -> None:
                 "order": str(fl.get("client_order_id") or ""),
                 "filled": abs(qty),
                 "fill_price": float(fl["price"]),
+                "value": abs(qty) * float(fl["price"]),
                 "pb_type": str(fl.get("pb_order_type") or ""),
                 "order_qty": _order_qty_raw(fl),
             }
@@ -305,6 +311,16 @@ def main() -> None:
                         size=ev["size"], price=ev["price"],
                         filled=prev["filled"] + ev["filled"],
                         order_qty=prev["order_qty"] or ev["order_qty"])
+        elif (
+            prev is not None
+            and ev["kind"] in ("reduced", "closed")
+            and prev["kind"] == "reduced"
+        ):
+            # pezzi di uscita consecutivi nello stesso giro: un solo evento
+            prev.update(key=ev["key"], ts=ev["ts"], day=ev["day"], time=ev["time"],
+                        size=ev["size"], kind=ev["kind"],
+                        value=prev["value"] + ev["value"],
+                        filled=prev["filled"] + ev["filled"])
         else:
             merged.append(dict(ev))
     fresh = merged
@@ -319,11 +335,27 @@ def main() -> None:
                 break
     for ev in fresh:
         if ev["kind"] in ("new", "added") and ev["order_qty"] is None:
-            ev["order_qty"] = _order_qty_log(lines, ev["pb_type"], ev["fill_price"], ev["ts"])
+            since = max((e["ts"] for e in events if e["kind"] == "closed" and e["ts"] <= ev["ts"]), default="")
+            ev["order_qty"] = _order_qty_log(lines, ev["pb_type"], ev["fill_price"], ev["ts"], since)
     # ordini di ingresso della posizione aperta: {client_order_id: avviso}
     orders = state.get("orders") or {}
+    # uscita in corso (Marco, 02/10: come per gli ingressi, un avviso al primo
+    # pezzo con la % venduta, modificato a ogni pezzo e, a posizione chiusa,
+    # trasformato nel messaggio finale col PnL)
+    exit_ = state.get("exit") or {}
+
+    def exit_text(x: dict, ev: dict) -> str:
+        pct = min(x["sold"] / x["start"], 1.0) * 100 if x["start"] > 0 else 0.0
+        avg = x["value"] / x["sold"] if x["sold"] > 0 else 0.0
+        return (
+            f"📉 <b>{NAME} in uscita</b> · venduti {x['sold']:.2f}/{x['start']:.2f} {COIN}"
+            f" @ {avg:.5g} · fill {pct:.0f}% · resta {ev['size']:.2f}"
+            f" · {rome(ev['day'], ev['time'])}"
+        )
 
     def inc_text(o: dict, ev: dict) -> str:
+        if o.get("order_qty") and o["filled"] > o["order_qty"] * 1.0001:
+            o["order_qty"] = None  # riga "post" di un altro ordine: niente %
         pct = ""
         if o.get("order_qty"):
             pct = f" · fill {min(o['filled'] / o['order_qty'], 1.0) * 100:.0f}%"
@@ -349,8 +381,12 @@ def main() -> None:
             o = orders[ev["order"]]
             o["filled"] = o.get("filled", 0.0) + ev["filled"]
             o["order_qty"] = o.get("order_qty") or ev["order_qty"]
+            if o["order_qty"] and o["filled"] > o["order_qty"] * 1.0001:
+                o["order_qty"] = None  # riga "post" di un altro ordine: niente %
             edit(o.get("msgs"), inc_text(o, ev))
             continue
+        if ev["kind"] in ("new", "added"):
+            exit_ = {}  # un ingresso chiude l'episodio di uscita parziale
         if ev["kind"] == "new":
             steps = 1
             opened_at = ev["ts"]
@@ -371,7 +407,14 @@ def main() -> None:
             if ev["order"]:
                 orders[ev["order"]] = o
         elif ev["kind"] == "reduced":
-            pass  # uscita parziale: non e' un gradino, si riassume alla chiusura
+            if not exit_:
+                exit_ = {"start": ev["size"] + ev["filled"], "sold": ev["filled"],
+                         "value": ev["value"], "msgs": []}
+                exit_["msgs"] = send(exit_text(exit_, ev))
+            else:
+                exit_["sold"] += ev["filled"]
+                exit_["value"] += ev["value"]
+                edit(exit_["msgs"], exit_text(exit_, ev))
         elif ev["kind"] == "closed":
             # Il PnL della posizione e' la somma dei fill di chiusura da
             # quando e' stata aperta a quando si e' chiusa. Due errori gia'
@@ -431,12 +474,20 @@ def main() -> None:
                 icon = "🚀"
             else:
                 icon = "✅"
-            send(
-                f"{icon} <b>{NAME} chiusa</b>{manual} · <b>{pnl:+.2f}</b> {CCY}{grad}{bal}"
-                f" · {rome(ev['day'], ev['time'])}"
+            sold = exit_.get("sold", 0.0) + ev["filled"]
+            value = exit_.get("value", 0.0) + ev["value"]
+            avg = f" · uscita @ {value / sold:.5g}" if sold > 0 else ""
+            final = (
+                f"{icon} <b>{NAME} chiusa</b>{manual} · <b>{pnl:+.2f}</b> {CCY}{grad}{avg}"
+                f" · fill 100%{bal} · {rome(ev['day'], ev['time'])}"
             )
+            if exit_.get("msgs"):
+                edit(exit_["msgs"], final)
+            else:
+                send(final)
             steps = 0
             orders = {}
+            exit_ = {}
 
     if deferred:
         # l'evento "closed" non e' stato processato: il prossimo giro riparte
@@ -449,6 +500,7 @@ def main() -> None:
     state["steps"] = steps
     state["opened_at"] = opened_at
     state["orders"] = orders
+    state["exit"] = exit_
     state.pop("last_inc_order", None)
     state.pop("inc", None)
     STATE.write_text(json.dumps(state))
