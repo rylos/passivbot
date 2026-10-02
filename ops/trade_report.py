@@ -185,6 +185,49 @@ def _raw_after_size(fl: dict) -> float | None:
 EXIT_STALL_MIN = 10
 
 
+def _it(x: float, dec: int) -> str:
+    """Numero all'italiana: punto per le migliaia, virgola per i decimali."""
+    return f"{x:,.{dec}f}".replace(",", "_").replace(".", ",").replace("_", ".")
+
+
+def _q(x: float) -> str:  # quantita' del coin
+    return _it(x, 2)
+
+
+def _m(x: float, dec: int = 0) -> str:  # controvalore in USDT/USDC
+    return _it(x, dec)
+
+
+def _s(x: float) -> str:  # PnL col segno
+    return ("+" if x >= 0 else "-") + _it(abs(x), 2)
+
+
+def _px(p: float) -> str:  # prezzo: 5 cifre significative, almeno 2 decimali
+    import math
+    dec = max(2, 4 - int(math.floor(math.log10(abs(p))))) if p else 2
+    txt = f"{p:.{dec}f}"
+    while txt.endswith("0") and len(txt.split(".")[1]) > 2:
+        txt = txt[:-1]
+    ip, fp = txt.split(".")
+    return _it(float(ip), 0) + "," + fp
+
+
+def _bar(frac: float) -> str:
+    frac = max(0.0, min(frac, 1.0))
+    n = int(round(frac * 10))
+    return "▰" * n + "▱" * (10 - n) + f" {frac * 100:.0f}%"
+
+
+def _dur(start: str, end: str) -> str:
+    try:
+        sec = (datetime.strptime(end, "%Y-%m-%dT%H:%M:%S") - datetime.strptime(start, "%Y-%m-%dT%H:%M:%S")).total_seconds()
+    except (TypeError, ValueError):
+        return "?"
+    m = int(sec // 60)
+    d, h, mm = m // 1440, (m % 1440) // 60, m % 60
+    return f"{d}g {h}h" if d else (f"{h}h {mm}m" if h else f"{mm}m")
+
+
 def _order_cancelled_log(lines: list, pb_type: str, price: float, after: str) -> bool:
     """True se dopo `after` il bot ha cancellato l'ordine (stesso tipo e prezzo)."""
     for ln in lines:
@@ -361,40 +404,52 @@ def main() -> None:
     def exit_text(x: dict, ev: dict) -> str:
         x["snap"] = {k: ev[k] for k in ("size", "day", "time")}
         x["last_ts"] = ev.get("ts", x.get("last_ts", ""))
-        pct = min(x["sold"] / x["start"], 1.0) * 100 if x["start"] > 0 else 0.0
+        if ev.get("filled"):
+            x["last_price"] = ev["value"] / ev["filled"]
         avg = x["value"] / x["sold"] if x["sold"] > 0 else 0.0
+        rest = ev["size"]
         if x.get("ended"):
-            head = f"📉 <b>{NAME} uscita parziale</b> (finita, poi nuovo ingresso)"
+            head = f"📈 <b>{NAME} · USCITA PARZIALE</b> (poi nuovo ingresso)"
         elif x.get("stalled"):
-            head = f"📉 <b>{NAME} uscita parziale</b> (ferma da {EXIT_STALL_MIN} min)"
+            head = f"⏸️ <b>{NAME} · USCITA FERMA</b> da {EXIT_STALL_MIN} min"
         else:
-            head = f"📉 <b>{NAME} in uscita</b>"
-        return (
-            f"{head} · venduti {x['sold']:.2f}/{x['start']:.2f} {COIN}"
-            f" @ {avg:.5g} · fill {pct:.0f}% · resta {ev['size']:.2f}"
-            f" · {rome(ev['day'], ev['time'])}"
-        )
+            head = f"📈 <b>{NAME} · IN USCITA</b>"
+        return "\n".join([
+            head,
+            f"Venduti {_q(x['sold'])} / {_q(x['start'])} {COIN} @ {_px(avg)}",
+            f"{_m(x['value'])} / {_m(x['value'] + rest * x.get('last_price', avg))} {CCY}",
+            f"{_bar(x['sold'] / x['start'] if x['start'] > 0 else 0.0)}"
+            f" · resta {_q(rest)} {COIN} ({_m(rest * x.get('last_price', avg))} {CCY})",
+            rome(ev["day"], ev["time"]),
+        ])
 
     def inc_text(o: dict, ev: dict) -> str:
         o["snap"] = {k: ev[k] for k in ("size", "price", "day", "time")}
         o["last_ts"] = ev.get("ts", o.get("last_ts", ""))
         if o.get("order_qty") and o["filled"] > o["order_qty"] * 1.0001:
             o["order_qty"] = None  # riga "post" di un altro ordine: niente %
-        pct = ""
-        if o.get("order_qty"):
-            pct = f" · fill {min(o['filled'] / o['order_qty'], 1.0) * 100:.0f}%"
-            if o.get("done") and o["filled"] < o["order_qty"] * 0.9999:
-                # ordine tolto dal bot prima del 100%: la % resta quella vera
-                pct += f" (ordine {o['done']})"
-        if o["label"] == "aperta":
-            head = f"📈 <b>{NAME} aperta</b> · "
+        oq, filled, px = o.get("order_qty"), o["filled"], o.get("fill_price") or ev["price"]
+        done = ""
+        if oq and o.get("done") and filled < oq * 0.9999:
+            done = f" · ordine {o['done']}"  # tolto dal bot prima del 100%
+        complete = not oq or filled >= oq * 0.9999
+        if complete:
+            qty_line = f"{_q(filled)} @ {_px(px)} · {_m(filled * px)} {CCY}"
         else:
-            head = f"➕ <b>{NAME} {o['label']}</b> · pos "
-        return (
-            f"{head}{ev['size']:.2f} {COIN} @ {ev['price']:.5g}"
-            f" · {ev['size'] * ev['price']:,.0f} {CCY}{pct}{o.get('bal', '')}"
-            f" · {rome(ev['day'], ev['time'])}"
-        )
+            qty_line = f"{_q(filled)} / {_q(oq)} @ {_px(px)} · {_m(filled * px)} / {_m(oq * px)} {CCY}"
+        bar = [f"{_bar(filled / oq)}{done}"] if oq else []
+        when = rome(ev["day"], ev["time"])
+        if o["label"] == "aperta":
+            wallet = o.get("wallet")
+            tail = f"Wallet {_m(wallet, 2)} {CCY} · {when}" if wallet else when
+            return "\n".join([f"📉 <b>{NAME} · APERTA</b>", f"{COIN} {qty_line}", *bar, tail])
+        return "\n".join([
+            f"📉 <b>{NAME} · {o['label'].upper()}</b>",
+            f"Ordine {qty_line}",
+            *bar,
+            f"Posizione {_q(ev['size'])} {COIN} @ {_px(ev['price'])} · {_m(ev['size'] * ev['price'])} {CCY}",
+            when,
+        ])
 
     steps = state.get("steps", 0)
     wallet_now, wallet_at = current_wallet()
@@ -424,8 +479,7 @@ def main() -> None:
             orders = {}
             # All'apertura il saldo realizzato non cambia: vale l'ultima riga
             # [health]/[balance] prima del fill.
-            bal = f" · wallet {wallet_now:.2f}" if wallet_now else ""
-            o = {"filled": ev["filled"], "order_qty": ev["order_qty"], "label": "aperta", "bal": bal,
+            o = {"filled": ev["filled"], "order_qty": ev["order_qty"], "label": "aperta", "wallet": wallet_now,
                  "pb_type": ev["pb_type"], "fill_price": ev["fill_price"]}
             o["msgs"] = send(inc_text(o, ev))
             if ev["order"]:
@@ -434,7 +488,7 @@ def main() -> None:
             # Richiesto da Marco il 10/09: un avviso a ogni gradino in piu',
             # con la posizione aggregata.
             steps += 1
-            o = {"filled": ev["filled"], "order_qty": ev["order_qty"], "label": f"gradino {steps}", "bal": "",
+            o = {"filled": ev["filled"], "order_qty": ev["order_qty"], "label": f"gradino {steps}",
                  "pb_type": ev["pb_type"], "fill_price": ev["fill_price"]}
             o["msgs"] = send(inc_text(o, ev))
             if ev["order"]:
@@ -482,7 +536,6 @@ def main() -> None:
                     if not str(fl.get("pb_order_type") or "").startswith("close"):
                         n_manual += 1
             opened_at = None
-            grad = f" · {steps} gradini" if steps > 1 else ""
             now = datetime.now(timezone.utc).replace(tzinfo=None)
             close_at = datetime.strptime(end, "%Y-%m-%dT%H:%M:%S")
             if (wallet_at is None or wallet_at <= close_at) and now <= close_at + timedelta(minutes=5):
@@ -490,16 +543,15 @@ def main() -> None:
                 deferred = True
                 break
             wallet = wallet_now if wallet_at and wallet_at > close_at else None
-            bal = f" · wallet {wallet:.2f}" if wallet else ""
             # Missile sopra ROCKET_PCT del wallet (0.5%, scelto da Marco il
             # 2026-09-15 sui cicli reali: ~1 su 8). Soglia relativa, non in
             # valuta, cosi' vale per entrambi i bot e segue il wallet.
             # Richiesto da Marco il 29/09: le chiusure fatte a mano si distinguono
             # (fuori dal confronto live/backtest)
             if n_manual and n_manual == n_fills:
-                manual = " <b>a mano</b>"
+                manual = " · a mano"
             elif n_manual:
-                manual = " (in parte <b>a mano</b>)"
+                manual = " · in parte a mano"
             else:
                 manual = ""
             if pnl < 0:
@@ -510,11 +562,14 @@ def main() -> None:
                 icon = "✅"
             sold = exit_.get("sold", 0.0) + ev["filled"]
             value = exit_.get("value", 0.0) + ev["value"]
-            avg = f" · uscita @ {value / sold:.5g}" if sold > 0 else ""
-            final = (
-                f"{icon} <b>{NAME} chiusa</b>{manual} · <b>{pnl:+.2f}</b> {CCY}{grad}{avg}"
-                f" · fill 100%{bal} · {rome(ev['day'], ev['time'])}"
-            )
+            exit_line = f"Uscita {_q(sold)} {COIN} @ {_px(value / sold)} · {_m(value)} {CCY}" if sold > 0 else "Uscita"
+            when = rome(ev["day"], ev["time"])
+            final = "\n".join([
+                f"{icon} <b>{NAME} · CHIUSA{manual}  {_s(pnl)} {CCY}</b>",
+                exit_line,
+                f"{steps} {'gradino' if steps == 1 else 'gradini'} · durata {_dur(start, end)} · {_bar(1.0)}",
+                f"Wallet {_m(wallet, 2)} {CCY} · {when}" if wallet else when,
+            ])
             if exit_.get("msgs"):
                 edit(exit_["msgs"], final)
             else:
