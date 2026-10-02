@@ -131,6 +131,42 @@ def load_fills(days: int = 3) -> list:
     return sorted(out, key=lambda fl: (fl["datetime"], str(fl["id"])))
 
 
+# Un ordine di ingresso puo' essere eseguito a piu' pezzi. L'avviso parte
+# quando l'ordine e' completo: su Bybit lo dice leavesQty del fill; su HL il
+# fill non lo dice, si aspetta che per HOLD_QUIET_S non arrivino altri pezzi.
+# Oltre HOLD_MAX_S si avvisa comunque con la posizione di quel momento; i
+# pezzi successivi mandano un aggiornamento, mai un gradino nuovo.
+HOLD_QUIET_S = 60
+HOLD_MAX_S = 600
+
+
+def _leaves_qty(fl: dict) -> float | None:
+    for raw in fl.get("raw") or []:
+        info = ((raw or {}).get("data") or {}).get("info") or {}
+        if "leavesQty" in info:
+            try:
+                return float(info["leavesQty"])
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _age_s(ts: str) -> float:
+    t = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - t).total_seconds()
+
+
+def _order_incomplete(ev: dict) -> bool:
+    if ev["kind"] not in ("new", "added"):
+        return False
+    age = _age_s(ev["ts"])
+    if age >= HOLD_MAX_S:
+        return False
+    if ev.get("leaves") is not None:
+        return ev["leaves"] > 1e-12
+    return age < HOLD_QUIET_S
+
+
 def load_state() -> dict:
     if STATE.exists():
         try:
@@ -176,6 +212,7 @@ def main() -> None:
                 "size": psize,
                 "price": float(fl.get("pprice") or fl["price"]),
                 "order": str(fl.get("client_order_id") or ""),
+                "leaves": _leaves_qty(fl),
             }
         )
     if not events:
@@ -229,10 +266,13 @@ def main() -> None:
             and prev["kind"] in ("new", "added")
         ):
             prev.update(key=ev["key"], ts=ev["ts"], day=ev["day"], time=ev["time"],
-                        size=ev["size"], price=ev["price"])
+                        size=ev["size"], price=ev["price"], leaves=ev["leaves"])
         else:
             merged.append(dict(ev))
     fresh = merged
+    # ordine ancora in esecuzione: si riprende al prossimo giro con tutti i pezzi
+    if fresh and _order_incomplete(fresh[-1]):
+        fresh = fresh[:-1]
     last_inc_order = state.get("last_inc_order", "")
 
     steps = state.get("steps", 0)
@@ -244,7 +284,14 @@ def main() -> None:
     deferred = False
     for ev in fresh:
         if ev["kind"] == "added" and ev["order"] and ev["order"] == last_inc_order:
-            continue  # resto di un ordine gia' notificato nel giro prima
+            # resto di un ordine gia' notificato (oltre HOLD_MAX_S): stesso
+            # gradino, si aggiorna la posizione
+            send(
+                f"↻ <b>{NAME} {'apertura' if steps <= 1 else f'gradino {steps}'} completata</b>"
+                f" · pos {ev['size']:.2f} {COIN} @ {ev['price']:.5g}"
+                f" · {ev['size'] * ev['price']:,.0f} {CCY} · {rome(ev['day'], ev['time'])}"
+            )
+            continue
         if ev["kind"] in ("new", "added"):
             last_inc_order = ev["order"]
         if ev["kind"] == "new":
