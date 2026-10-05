@@ -59,7 +59,8 @@ def connector_write(action):
                         return await operation(bot, order)
                     instance = owner(bot)
                     async with instance._write_lock:
-                        if not instance.admit(order):
+                        if not (action == "cancel" and _rylos_flat_entry_cancel(bot, order)) \
+                                and not instance.admit(order):
                             return deferred()
                         if action == "cancel":
                             executor.record_cancel_connector_admission(bot, order)
@@ -73,6 +74,23 @@ def connector_write(action):
                 return deferred()
         return submit
     return decorate
+
+
+def _rylos_flat_entry_cancel(bot, order):
+    """rylos: cancelling a leftover entry while its position side is flat cannot
+    add exposure, so it does not need a fresh account read per write. Without
+    this, after a full close the resting grid went out one cancel per cycle."""
+    from live import executor
+    if executor._order_is_reduce_only(order) or not executor._order_pb_type(order).startswith("entry_"):
+        return False
+    positions = getattr(bot, "positions", None)
+    if not isinstance(positions, dict):
+        return False
+    pside = order.get("position_side", order.get("pside"))
+    try:
+        return float(positions.get(order.get("symbol"), {}).get(pside, {}).get("size", 0.0) or 0.0) == 0.0
+    except (TypeError, ValueError, AttributeError):
+        return False
 
 
 def _rylos_4rsi_exit(bot, order):
