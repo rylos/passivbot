@@ -22503,15 +22503,39 @@ class Passivbot:
             coin, abs(order["qty"]), bid, maker_price,
             " via modify" if amend_from else "",
         )
-        try:
-            if amend_from:
-                args = self._maker_exit_amend_args(order)
-                args["price"] = bid
-                args["params"] = dict(args.get("params") or {})
-                args["params"]["timeInForce"] = self._taker_ioc_time_in_force
+        if amend_from:
+            args = self._maker_exit_amend_args(order)
+            args["price"] = bid
+            args["params"] = dict(args.get("params") or {})
+            args["params"]["timeInForce"] = self._taker_ioc_time_in_force
+            try:
                 return await self.cca.edit_order(
                     amend_from["id"], symbol, "limit", order["side"], **args
                 )
+            except Exception as exc:
+                if "could not immediately match" in str(exc):
+                    logging.info("[order] maker exit taker IOC not filled %s, next cycle", coin)
+                    return {}
+                # 06/10 HL: the modify into IOC was refused six times in a row
+                # (ExchangeError, text not logged) while the exit kept resting.
+                # Fall back to cancel + IOC in this same write.
+                logging.warning(
+                    "[order] maker exit taker IOC via modify refused %s, cancel then IOC | %s: %s",
+                    coin, type(exc).__name__, str(exc)[:300],
+                )
+                cancel_params = {
+                    k: v for k, v in args["params"].items() if k == "vaultAddress"
+                }
+                try:
+                    await self.cca.cancel_order(amend_from["id"], symbol=symbol, params=cancel_params)
+                except Exception as cancel_exc:
+                    # Filled or already gone: the next cycle re-plans from a fresh read.
+                    logging.info(
+                        "[order] maker exit taker cancel failed %s, next cycle | %s",
+                        coin, str(cancel_exc)[:200],
+                    )
+                    return {}
+        try:
             return await self.cca.create_order(**ioc_params)
         except Exception as exc:
             if "could not immediately match" in str(exc):

@@ -721,6 +721,40 @@ def test_hl_taker_cap_via_modify_respects_the_floor_and_unfilled_ioc(monkeypatch
     assert len(edits) == 1
 
 
+def test_hl_refused_modify_falls_back_to_cancel_then_ioc(monkeypatch, caplog):
+    import asyncio
+    import logging
+
+    hl, creates, edits = _modify_ioc_connector(monkeypatch, bid=99.9, fail="hyperliquid boom")
+    cancels = []
+
+    async def cancel_order(self, id, symbol=None, params=None):
+        cancels.append({"id": id, "symbol": symbol, "params": params})
+        return {"id": id}
+
+    hl.cca.__class__.cancel_order = cancel_order
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(hl.execute_order(_modify_taker_exit()))
+    assert len(edits) == 1
+    assert [c["id"] for c in cancels] == ["old-1"]
+    (create,) = creates
+    assert create["price"] == 99.9
+    assert "via modify refused" in caplog.text and "hyperliquid boom" in caplog.text
+
+
+def test_hl_refused_modify_on_a_gone_exit_waits_next_cycle(monkeypatch):
+    import asyncio
+
+    hl, creates, edits = _modify_ioc_connector(monkeypatch, bid=99.9, fail="hyperliquid boom")
+
+    async def cancel_order(self, id, symbol=None, params=None):
+        raise Exception("Order was never placed, already canceled, or filled.")
+
+    hl.cca.__class__.cancel_order = cancel_order
+    assert asyncio.run(hl.execute_order(_modify_taker_exit())) == {}
+    assert creates == []
+
+
 def test_bybit_taker_cap_keeps_cancel_first():
     from exchanges.bybit import BybitBot
 
