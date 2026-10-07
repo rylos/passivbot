@@ -161,3 +161,5 @@ Genera la pagina backtest di una singola config (artefatto claude.ai) partendo d
 Pagina di 4e066c8d (live su entrambi i bot dal 2026-09-28): https://claude.ai/artifact/J8DWWt9C3bsGK4znwgfgzz
 
 Con lo stop sull'equity: backtest con `bot.long.hsl.enabled` nei run `<nome>_*`, più `--hsl-windows FILE` (finestre di partenza a freddo in cui lo stop scatta: serie di equity con e senza stop ed evento di stop, estratte dalle suite `configs/robust/hsl2_*` e `starts_n4e_*` su debian) e `--hsl-summary FILE` (testo e tabella dell'esito su 224 partenze, esempio in `ops/report/data/hsl_summary_4e066c8d.json`). La sezione "Stop sull'equity: dove scatta" mostra per ogni finestra l'equity con e senza stop e una linea al momento dello stop.
+
+Aggiornamento solo dei dati (nuove candele) senza i file delle finestre: `--keep-hsl` lascia com'è la sezione dello stop già presente nel template (le finestre a freddo non dipendono dalla data di fine). Config dei backtest del 07/10/2026 su debian in `~/passivbot-up/configs/art7/` (`bot.long` live + `live.hsl_engine: revised`), risultati in `backtests_art7/`.

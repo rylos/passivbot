@@ -34,6 +34,8 @@ ap.add_argument("--compare", action="append", default=[], help="etichetta=tag")
 ap.add_argument("--cur", default="USDT")
 ap.add_argument("--hsl-windows", default="", help="JSON con le finestre in cui scatta lo stop (con/senza HSL)")
 ap.add_argument("--hsl-summary", default="", help="JSON: esito delle partenze a freddo con/senza HSL")
+ap.add_argument("--keep-hsl", action="store_true",
+                help="senza --hsl-windows: tiene la sezione dello stop già presente nel template")
 ARGS = ap.parse_args()
 CUR = ARGS.cur
 
@@ -113,8 +115,11 @@ def params_html(lg):
     ] + ([group("Stop sull'equity (HSL)", [("Soglia rossa (drawdown)", pct(h["red_threshold"], 0)),
                                          ("Media del drawdown", f"{h['ema_span_minutes']:.0f} min"),
                                          ("Pausa dopo lo stop", f"{h['cooldown_minutes_after_red'] / 60:.0f} h"),
-                                         ("Chiusura", h["panic_close_order_type"]),
-                                         ("Soglie gialla / arancione", f"{pct(h['tier_ratios']['yellow'] * h['red_threshold'], 1)} / {pct(h['tier_ratios']['orange'] * h['red_threshold'], 1)}")])]
+                                         ("Chiusura", h["panic_close_order_type"])]
+                                        # soglie intermedie solo nello schema legacy; il revised ha la ripartenza
+                                        + ([("Soglie gialla / arancione", f"{pct(h['tier_ratios']['yellow'] * h['red_threshold'], 1)} / {pct(h['tier_ratios']['orange'] * h['red_threshold'], 1)}")]
+                                           if "tier_ratios" in h else
+                                           [("Ripartenza dopo lo stop", {"always": "sempre"}.get(h.get("restart_after_red_policy"), str(h.get("restart_after_red_policy"))))]))]
          if (h := lg.get("hsl", {})).get("enabled") else [])
        + ([group("Stop sul prezzo", [("Vende se il bid scende sotto il medio di", pct(r["crash_stop_pct"], 0)),
                                      ("Chiusura", "market"),
@@ -215,7 +220,7 @@ def risk_section(name, cyc, wins, loss):
             ("TWEL 2,5", f"{name}_0.0_twel25", f"{name}_0.0005_twel25", ""),
             ("TWEL 2,0", f"{name}_0.0_twel2", f"{name}_0.0005_twel2", "")]
     rows += [(lab, f"{tag}_0.0", f"{tag}_0.0005", "") for lab, tag in (c.split("=", 1) for c in ARGS.compare)]
-    trs = []
+    trs, cmp_dd5 = [], []
     for lab, t0, t5, cls in rows:
         try:
             a0, _ = load(t0)
@@ -225,6 +230,11 @@ def risk_section(name, cyc, wins, loss):
         trs.append(f"<tr class='{cls}'><td>{lab}</td><td class='num'>{pct(a0['adg_real'], 2)}</td><td class='num'>{pct(a0['drawdown_worst_strategy_eq'])}</td>"
                    f"<td class='num'>{pct(a5['adg_real'], 2)}</td><td class='num hi'>{pct(a5['drawdown_worst_strategy_eq'])}</td>"
                    f"<td class='num'>{it(a5['position_held_days_max'], 1)} g</td></tr>")
+        if rows.index((lab, t0, t5, cls)) >= 3:
+            cmp_dd5.append(a5["drawdown_worst_strategy_eq"])
+    # intervallo del drawdown col buffer 0,05% delle config di confronto, dai backtest
+    cmp_range = (f"{it(100 * min(cmp_dd5), 0)}-{it(100 * max(cmp_dd5), 0)}%" if len(cmp_dd5) > 1
+                 else f"{it(100 * cmp_dd5[0], 0)}%" if cmp_dd5 else "")
     a0, _ = load(f"{name}_0.0")
     a1, _ = load(f"{name}_0.0001")
     a5, _ = load(f"{name}_0.0005")
@@ -238,7 +248,7 @@ def risk_section(name, cyc, wins, loss):
     <h2>Sensibilità ai fill</h2>
     <p class="sub">Con <code>limit_order_fill_buffer_pct</code> un ordine limite si riempie solo se il prezzo lo oltrepassa di quel margine. Con 0,01% (≈1 tick): ADG {pct(a1['adg_real'], 2)}, dd {pct(a1['drawdown_worst_strategy_eq'])}; con 0,05%: ADG {pct(a5['adg_real'], 2)}, dd {pct(a5['drawdown_worst_strategy_eq'])}.</p>
     <div class="tbl wr"><table><thead><tr><th>Variante</th><th class="num">ADG</th><th class="num">DD</th><th class="num">ADG 0,05%</th><th class="num">DD 0,05%</th><th class="num">Held 0,05%</th></tr></thead><tbody>{"".join(trs)}</tbody></table></div>
-    <p class="sub" style="margin-top:10px">Le config precedenti dipendevano da un'uscita trailing riuscita per un soffio il 2 aprile 2025 (col buffer 0,05% il drawdown saliva al 78-80%). Questa config è stata ottimizzata con e senza buffer su 18 partenze sfasate: il drawdown quasi non cambia fra i due casi.</p>
+    <p class="sub" style="margin-top:10px">Le config precedenti dipendevano da un'uscita trailing riuscita per un soffio il 2 aprile 2025 (col buffer 0,05% il drawdown saliva al {cmp_range}). Questa config è stata ottimizzata con e senza buffer su 18 partenze sfasate: il drawdown quasi non cambia fra i due casi.</p>
   </div>
 </section>"""
 
@@ -249,9 +259,11 @@ s = open(ARGS.template).read()
 if not s.lstrip().startswith("<title>"):
     s = s[s.index("<title>"):]
 s = s.removesuffix("\n").removesuffix("</body></html>")
-# template che ha già la sezione dello stop (pagina rigenerata): si toglie e si rifà
-s = re.sub(r"<section>\n  <h2>Stop sull'equity: dove scatta</h2>.*?</section>\n<script>const HSLW=.*?</script>\n?", "", s, count=1, flags=re.S)
-s = s.replace("\n" + HSL_JS, "").replace(HSL_JS, "")
+# template che ha già la sezione dello stop (pagina rigenerata): si toglie e si rifà,
+# oppure resta com'è con --keep-hsl (le finestre non dipendono dalla data di fine)
+if not (ARGS.keep_hsl and not ARGS.hsl_windows):
+    s = re.sub(r"<section>\n  <h2>Stop sull'equity: dove scatta</h2>.*?</section>\n<script>const HSLW=.*?</script>\n?", "", s, count=1, flags=re.S)
+    s = s.replace("\n" + HSL_JS, "").replace(HSL_JS, "")
 # tabelle senza scorrimento orizzontale: colonne che possono stringersi, etichette che vanno a capo;
 # nei cicli tutto su una riga, sotto i 600px data e ora su due righe e niente colonna dei gradini.
 # Blocco fra marcatori: si sostituisce a ogni rigenerazione.
@@ -375,8 +387,9 @@ s = s.replace("WE = esposizione massima raggiunta sul wallet.</p>",
 
 # --- win rate / sensibilità ai fill, parametri
 s = re.sub(r'<section class="two">\s*<div>\s*<h2>Win rate e rischio</h2>.*?</section>\n?', "", s, count=1, flags=re.S)
-# prima delle sezioni sugli stop (quella sul crollo resta nel template), poi i parametri
-anchor = next(x for x in ("<section>\n  <h2>Stop sul prezzo", "<section>\n  <h2>Parametri della config</h2>") if x in s)
+# prima delle sezioni sugli stop (quella sul crollo, e quella sull'equity con --keep-hsl, restano nel template)
+anchor = next(x for x in ("<section>\n  <h2>Stop sull'equity: dove scatta</h2>", "<section>\n  <h2>Stop sul prezzo",
+                          "<section>\n  <h2>Parametri della config</h2>") if x in s)
 s = s.replace(anchor, risk_section(name, cyc, wins, loss) + "\n" + anchor, 1)
 ph = params_html(cfg["bot"]["long"])
 pcls = {5: " p5", 6: " p6"}.get(ph.count("<div class='pgroup'>"), "")
