@@ -19870,6 +19870,8 @@ class Passivbot:
     async def calc_ideal_orders_orchestrator(self):
         """Compute desired orders using Rust orchestrator (JSON API)."""
         self._current_planning_snapshot = None
+        # Fail closed: only a successful plan from this call may keep entries.
+        self._orchestrator_kept_entry_psides = {}
         symbols = sorted(
             set(
                 getattr(self, "active_symbols", [])
@@ -20170,6 +20172,12 @@ class Passivbot:
                     out, idx_to_symbol
                 )
             )
+            self._orchestrator_kept_entry_psides = self._entry_trailing_pending_keep(
+                reconciler.entry_trailing_pending_pairs_from_rust_output(
+                    out, idx_to_symbol
+                ),
+                now_ms=int(utc_ms()),
+            )
         except Exception as e:
             elapsed_ms = max(0, int(utc_ms()) - orchestrator_started_ms)
             msg = str(e)
@@ -20294,6 +20302,41 @@ class Passivbot:
         ideal_orders_f = self._finalize_reduce_only_orders(ideal_orders_f, last_prices)
 
         return ideal_orders_f
+
+    _ENTRY_TRAILING_PENDING_KEEP_MAX_MS = 10 * 60 * 1000
+
+    def _entry_trailing_pending_keep(
+        self, pairs: set[tuple[str, str]], *, now_ms: int
+    ) -> dict[str, set[str]]:
+        """Bound how long resting entries survive pending trailing inputs.
+
+        A fill normally confirms within ~2 minutes; past the cap the pair falls
+        back to the default behavior (entries retired) and a warning is logged.
+        """
+        since = getattr(self, "_entry_trailing_pending_since_ms", None)
+        if not isinstance(since, dict):
+            since = {}
+        since = {pair: since.get(pair, now_ms) for pair in pairs}
+        self._entry_trailing_pending_since_ms = since
+        expired_logged = getattr(self, "_entry_trailing_pending_expired", None)
+        if not isinstance(expired_logged, set):
+            expired_logged = set()
+        expired_logged &= set(pairs)
+        keep: dict[str, set[str]] = {}
+        for pair, start_ms in since.items():
+            symbol, pside = pair
+            if now_ms - start_ms <= Passivbot._ENTRY_TRAILING_PENDING_KEEP_MAX_MS:
+                keep.setdefault(symbol, set()).add(pside)
+            elif pair not in expired_logged:
+                expired_logged.add(pair)
+                logging.warning(
+                    "[order] trailing inputs pending for %ds %s %s | resting entries no longer kept",
+                    (now_ms - start_ms) // 1000,
+                    Passivbot._log_symbol(symbol),
+                    pside,
+                )
+        self._entry_trailing_pending_expired = expired_logged
+        return keep
 
     async def _get_orchestrator_last_prices(
         self, symbols: list[str]

@@ -2229,6 +2229,7 @@ def validate_rust_orchestrator_output(
         "disabled_pside_has_position": {"symbol_idx", "pside"},
         "non_tradable_has_position": {"symbol_idx", "pside"},
         "strategy_input_unavailable": {"symbol_idx", "pside", "scope"},
+        "entry_trailing_pending_with_position": {"symbol_idx", "pside"},
         "twel_repair_blocked_by_loss_gate": {
             "pside",
             "current_twe",
@@ -2263,6 +2264,7 @@ def validate_rust_orchestrator_output(
             "disabled_pside_has_position",
             "non_tradable_has_position",
             "strategy_input_unavailable",
+            "entry_trailing_pending_with_position",
         }:
             symbol_idx = details.get("symbol_idx")
             if (
@@ -2976,6 +2978,26 @@ def parse_and_validate_rust_orchestrator_output(
         out, idx_to_symbol, orchestrator_input
     )
     return out, orders
+
+
+def entry_trailing_pending_pairs_from_rust_output(
+    out: dict, idx_to_symbol: dict[int, str]
+) -> set[tuple[str, str]]:
+    """Return symbol/pside pairs whose entries Rust could not compute only
+    because trailing inputs are pending while a position is open.
+
+    Rust emits the warning only when entries were wanted, no RyLoS entry pause
+    applies and the missing input is trailing (never forager EMA authority).
+    The output must already be validated by validate_rust_orchestrator_output.
+    """
+    pairs: set[tuple[str, str]] = set()
+    for warning in out["diagnostics"]["warnings"]:
+        details = warning.get("entry_trailing_pending_with_position")
+        if details is None:
+            continue
+        symbol = idx_to_symbol[details["symbol_idx"]]
+        pairs.add((str(symbol), str(details["pside"])))
+    return pairs
 
 
 def order_churn_risk_active_pairs_from_rust_output(
@@ -3918,8 +3940,35 @@ def apply_mode_filters(
         getattr(bot, "_orchestrator_ema_entry_cancellation_order_keys", set())
         or set()
     )
+    kept_entry_psides = set(
+        (getattr(bot, "_orchestrator_kept_entry_psides", {}) or {}).get(symbol, ())
+    )
     for pside in ["long", "short"]:
         mode = bot.PB_modes[pside].get(symbol)
+        if pside in kept_entry_psides and mode in {"normal", "graceful_stop"}:
+            # RyLoS: entries for this open position are only pending trailing
+            # inputs (fill just landed). Keep the resting grid instead of
+            # retiring it; the next confirmed plan updates it as usual.
+            kept = [
+                x
+                for x in to_cancel
+                if x["position_side"] == pside and not x["reduce_only"]
+            ]
+            if kept:
+                to_cancel = [
+                    x
+                    for x in to_cancel
+                    if x["position_side"] != pside or x["reduce_only"]
+                ]
+                log_key = (symbol, pside, len(kept))
+                if getattr(bot, "_kept_entry_log_key", None) != log_key:
+                    bot._kept_entry_log_key = log_key
+                    logging.info(
+                        "[order] keep %d resting entries %s %s | trailing inputs pending after fill",
+                        len(kept),
+                        _pb_attr("Passivbot")._log_symbol(symbol),
+                        pside,
+                    )
         if mode == "manual":
             if authorized_ema_entry_cancellation_order_keys:
                 # This pair was dynamically managed by forager when its required

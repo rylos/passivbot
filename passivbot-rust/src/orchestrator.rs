@@ -155,6 +155,14 @@ mod core {
             pside: PositionSide,
             scope: StrategyInputScope,
         },
+        /// RyLoS: entries were wanted for an open position but could not be
+        /// computed because trailing inputs are temporarily unavailable (e.g.
+        /// right after a fill, before the position is confirmed). Live keeps
+        /// the resting entries instead of retiring the whole grid.
+        EntryTrailingPendingWithPosition {
+            symbol_idx: usize,
+            pside: PositionSide,
+        },
         TwelRepairBlockedByLossGate {
             pside: PositionSide,
             current_twe: f64,
@@ -2986,7 +2994,7 @@ mod core {
         wants_entries: bool,
         wants_closes: bool,
         diagnostics: &mut OrchestratorDiagnostics,
-    ) -> Result<(Vec<IdealOrder>, Vec<IdealOrder>, bool), OrchestratorError> {
+    ) -> Result<(Vec<IdealOrder>, Vec<IdealOrder>, bool, bool), OrchestratorError> {
         let side = symbol_side_input(symbol, pside);
         let requests = if (symbol.allow_missing_strategy_inputs || !side.trailing_available)
             && wants_entries
@@ -2999,6 +3007,7 @@ mod core {
         let mut entries = Vec::new();
         let mut closes = Vec::new();
         let mut close_inputs_unavailable = false;
+        let mut entry_trailing_unavailable = false;
         for (request_entries, request_closes) in requests {
             if !request_entries && !request_closes {
                 continue;
@@ -3017,6 +3026,7 @@ mod core {
                     closes.extend(generated_closes);
                 }
                 Err(err) => {
+                    let trailing_missing = matches!(err, OrchestratorError::MissingTrailing { .. });
                     handle_strategy_input_error(
                         err,
                         symbol,
@@ -3025,10 +3035,13 @@ mod core {
                         diagnostics,
                     )?;
                     close_inputs_unavailable |= request_closes;
+                    entry_trailing_unavailable |= request_entries
+                        && trailing_missing
+                        && !symbol.allow_missing_strategy_inputs;
                 }
             }
         }
-        Ok((entries, closes, close_inputs_unavailable))
+        Ok((entries, closes, close_inputs_unavailable, entry_trailing_unavailable))
     }
 
     #[derive(Clone)]
@@ -3079,6 +3092,34 @@ mod core {
         runtime_budget_short: Vec<RuntimeBudgetState>,
         derived_long: Vec<CachedSideDerived>,
         derived_short: Vec<CachedSideDerived>,
+    }
+
+    /// Mirrors the early exits of `gate_entries_by_twel_deterministic` that
+    /// drop every entry of the side regardless of the candidate orders.
+    fn twel_entry_gate_blocks_all_entries(
+        balance: f64,
+        total_wallet_exposure_limit: f64,
+        positions: &[GateEntriesPosition],
+    ) -> bool {
+        const EXP_EPS: f64 = 1e-12;
+        if balance <= 0.0 || total_wallet_exposure_limit <= 0.0 {
+            return true;
+        }
+        let mut current_twe = 0.0_f64;
+        for pos in positions {
+            if !pos.position_price.is_finite()
+                || pos.position_price <= 0.0
+                || !pos.position_size.is_finite()
+            {
+                continue;
+            }
+            let exposure =
+                calc_wallet_exposure(pos.c_mult, balance, pos.position_size.abs(), pos.position_price);
+            if exposure.is_finite() {
+                current_twe += exposure;
+            }
+        }
+        current_twe >= total_wallet_exposure_limit - EXP_EPS
     }
 
     fn gate_entries_by_twel_deterministic(
@@ -3849,6 +3890,9 @@ mod core {
         let per_long = &mut workspace.per_long;
         let per_short = &mut workspace.per_short;
 
+        // RyLoS: sides whose entries are only pending trailing inputs; emitted
+        // after the TWEL entry gate so a gate that blocks all entries wins.
+        let mut entry_trailing_pending: Vec<(usize, PositionSide)> = Vec::new();
         for s in &input.symbols {
             // LONG
             {
@@ -3937,20 +3981,31 @@ mod core {
                     let wants_entries = should_generate_entries(mode, has_pos, allow_initial);
                     let wants_closes = should_generate_closes(mode, has_pos);
                     if wants_entries || wants_closes {
-                        let (generated_entries, generated_closes, close_inputs_unavailable) =
-                            generate_available_strategy_ideal_orders(
-                                input,
-                                s,
-                                PositionSide::Long,
-                                &mut workspace.derived_long,
-                                workspace.runtime_budget_long[s.symbol_idx],
-                                wants_entries,
-                                wants_closes,
-                                &mut diagnostics,
-                            )?;
+                        let (
+                            generated_entries,
+                            generated_closes,
+                            close_inputs_unavailable,
+                            entry_trailing_unavailable,
+                        ) = generate_available_strategy_ideal_orders(
+                            input,
+                            s,
+                            PositionSide::Long,
+                            &mut workspace.derived_long,
+                            workspace.runtime_budget_long[s.symbol_idx],
+                            wants_entries,
+                            wants_closes,
+                            &mut diagnostics,
+                        )?;
                         (entries, closes) = (generated_entries, generated_closes);
-                        if rylos_entries_paused(&s.long.bot_params, s.long.rylos_signal.as_ref()) {
+                        let entries_paused = rylos_entries_paused(
+                            &s.long.bot_params,
+                            s.long.rylos_signal.as_ref(),
+                        );
+                        if entries_paused {
                             entries.clear();
+                        }
+                        if entry_trailing_unavailable && has_pos && !entries_paused {
+                            entry_trailing_pending.push((s.symbol_idx, PositionSide::Long));
                         }
                         if close_inputs_unavailable {
                             if let Some(order) = calc_independent_wel_ideal_order(
@@ -4036,18 +4091,25 @@ mod core {
                     let wants_entries = should_generate_entries(mode, has_pos, allow_initial);
                     let wants_closes = should_generate_closes(mode, has_pos);
                     if wants_entries || wants_closes {
-                        let (generated_entries, generated_closes, close_inputs_unavailable) =
-                            generate_available_strategy_ideal_orders(
-                                input,
-                                s,
-                                PositionSide::Short,
-                                &mut workspace.derived_short,
-                                workspace.runtime_budget_short[s.symbol_idx],
-                                wants_entries,
-                                wants_closes,
-                                &mut diagnostics,
-                            )?;
+                        let (
+                            generated_entries,
+                            generated_closes,
+                            close_inputs_unavailable,
+                            entry_trailing_unavailable,
+                        ) = generate_available_strategy_ideal_orders(
+                            input,
+                            s,
+                            PositionSide::Short,
+                            &mut workspace.derived_short,
+                            workspace.runtime_budget_short[s.symbol_idx],
+                            wants_entries,
+                            wants_closes,
+                            &mut diagnostics,
+                        )?;
                         (entries, closes) = (generated_entries, generated_closes);
+                        if entry_trailing_unavailable && has_pos {
+                            entry_trailing_pending.push((s.symbol_idx, PositionSide::Short));
+                        }
                         if close_inputs_unavailable {
                             if let Some(order) = calc_independent_wel_ideal_order(
                                 input,
@@ -4451,6 +4513,8 @@ mod core {
             }
         }
 
+        let mut twel_blocks_all_entries_long = false;
+        let mut twel_blocks_all_entries_short = false;
         if enabled_long
             && input
                 .global
@@ -4478,6 +4542,11 @@ mod core {
             } else {
                 raw_twel
             };
+            twel_blocks_all_entries_long = twel_entry_gate_blocks_all_entries(
+                input.balance,
+                twel_entry_cap,
+                &workspace.gate_positions_long,
+            );
             gate_entries_by_twel_deterministic(
                 PositionSide::Long,
                 input.balance,
@@ -4530,6 +4599,11 @@ mod core {
             } else {
                 raw_twel
             };
+            twel_blocks_all_entries_short = twel_entry_gate_blocks_all_entries(
+                input.balance,
+                twel_entry_cap,
+                &workspace.gate_positions_short,
+            );
             gate_entries_by_twel_deterministic(
                 PositionSide::Short,
                 input.balance,
@@ -4557,6 +4631,18 @@ mod core {
         } else if !enabled_short {
             for s in per_short.iter_mut().filter_map(|v| v.as_mut()) {
                 s.entries.clear();
+            }
+        }
+
+        for (symbol_idx, pside) in entry_trailing_pending {
+            let blocked = match pside {
+                PositionSide::Long => twel_blocks_all_entries_long,
+                PositionSide::Short => twel_blocks_all_entries_short,
+            };
+            if !blocked {
+                diagnostics
+                    .warnings
+                    .push(OrchestratorWarning::EntryTrailingPendingWithPosition { symbol_idx, pside });
             }
         }
 
