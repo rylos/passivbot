@@ -1808,6 +1808,10 @@ class HyperliquidBot(CCXTBot):
     # cancel-first path waited for a full account read (~11 s with 9 HIP-3 dexes)
     # plus a replan, ~25 s between the taker cap and the IOC (live 02/10 01:36).
     _maker_exit_taker_via_modify = True
+    # rylos: HL refuses the modify of an Alo exit into an Ioc ("Attempted to
+    # modify to invalid new order", live 06/10 and 09/10): the paired exit is
+    # cancelled and the Ioc sent in the same write, no failed modify first.
+    _maker_exit_taker_ioc_via_edit = False
 
     def _maker_exit_retry_price(self, symbol: str, price: float) -> float:
         price = round_dynamic(round(price, self.n_decimal_places), self.n_significant_figures)

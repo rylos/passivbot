@@ -22516,13 +22516,22 @@ class Passivbot:
     # rylos: the venue can turn the resting maker exit into the IOC with one
     # modify (cancel + place atomically); otherwise cancel, confirm, then IOC.
     _maker_exit_taker_via_modify = False
+    # rylos: the venue accepts a modify of the resting exit into the IOC; when
+    # False the paired exit is cancelled and the IOC sent in the same write.
+    _maker_exit_taker_ioc_via_edit = True
+    # rylos: the IOC limit sits this far under the bid read just before, never
+    # under the exit floor: the IOC still fills at the best bids, but a bid
+    # that ticks down between the read and the order no longer leaves it
+    # unfilled (09/10 HL: four IOCs at the bid missed, 1m43s to exit).
+    _taker_ioc_slippage = 0.0005
 
     async def _maker_exit_taker_ioc(self, order: dict, params: dict, amend_from: dict | None = None):
         """Sell the 4RSI exit IOC at the bid read now; never below the exit
         floor pprice * (1 + exit_min_gain). An unfilled IOC is not an error:
         the next cycle plans the exit again. With `amend_from` the resting
-        maker exit is modified into the IOC (HL modify: cancel + place in one
-        action, so two exits never rest together)."""
+        maker exit is modified into the IOC, or cancelled and then replaced by
+        the IOC in this same write where the venue refuses that modify (HL), so
+        two exits never rest together."""
         symbol = order["symbol"]
         coin = symbol_to_coin(symbol, verbose=False) or symbol
         book = await self.cca.fetch_order_book(symbol, 5)
@@ -22536,48 +22545,53 @@ class Passivbot:
             )
             return {}
         maker_price = order["price"]
-        order["price"] = bid
+        price = self._maker_exit_retry_price(symbol, bid * (1.0 - float(self._taker_ioc_slippage)))
+        if not (floor < price <= bid):
+            price = bid
+        order["price"] = price
         ioc_params = dict(params)
-        ioc_params["price"] = bid
+        ioc_params["price"] = price
         ioc_params["params"] = dict(params.get("params") or {})
         ioc_params["params"]["timeInForce"] = self._taker_ioc_time_in_force
+        via_edit = bool(amend_from) and self._maker_exit_taker_ioc_via_edit
         logging.info(
-            "[order] maker exit taker IOC %s | sell %s @ %s (maker price was %s)%s",
-            coin, abs(order["qty"]), bid, maker_price,
-            " via modify" if amend_from else "",
+            "[order] maker exit taker IOC %s | sell %s @ %s (maker price was %s) bid %s%s",
+            coin, abs(order["qty"]), price, maker_price, bid,
+            " via modify" if via_edit else (" cancel then IOC" if amend_from else ""),
         )
         if amend_from:
             args = self._maker_exit_amend_args(order)
-            args["price"] = bid
+            args["price"] = price
             args["params"] = dict(args.get("params") or {})
             args["params"]["timeInForce"] = self._taker_ioc_time_in_force
-            try:
-                return await self.cca.edit_order(
-                    amend_from["id"], symbol, "limit", order["side"], **args
-                )
-            except Exception as exc:
-                if "could not immediately match" in str(exc):
-                    logging.info("[order] maker exit taker IOC not filled %s, next cycle", coin)
-                    return {}
-                # 06/10 HL: the modify into IOC was refused six times in a row
-                # (ExchangeError, text not logged) while the exit kept resting.
-                # Fall back to cancel + IOC in this same write.
-                logging.warning(
-                    "[order] maker exit taker IOC via modify refused %s, cancel then IOC | %s: %s",
-                    coin, type(exc).__name__, str(exc)[:300],
-                )
-                cancel_params = {
-                    k: v for k, v in args["params"].items() if k == "vaultAddress"
-                }
+            if via_edit:
                 try:
-                    await self.cca.cancel_order(amend_from["id"], symbol=symbol, params=cancel_params)
-                except Exception as cancel_exc:
-                    # Filled or already gone: the next cycle re-plans from a fresh read.
-                    logging.info(
-                        "[order] maker exit taker cancel failed %s, next cycle | %s",
-                        coin, str(cancel_exc)[:200],
+                    return await self.cca.edit_order(
+                        amend_from["id"], symbol, "limit", order["side"], **args
                     )
-                    return {}
+                except Exception as exc:
+                    if "could not immediately match" in str(exc):
+                        logging.info("[order] maker exit taker IOC not filled %s, next cycle", coin)
+                        return {}
+                    # 06/10 HL: the modify into IOC was refused six times in a row
+                    # while the exit kept resting. Fall back to cancel + IOC in
+                    # this same write.
+                    logging.warning(
+                        "[order] maker exit taker IOC via modify refused %s, cancel then IOC | %s: %s",
+                        coin, type(exc).__name__, str(exc)[:300],
+                    )
+            cancel_params = {
+                k: v for k, v in args["params"].items() if k == "vaultAddress"
+            }
+            try:
+                await self.cca.cancel_order(amend_from["id"], symbol=symbol, params=cancel_params)
+            except Exception as cancel_exc:
+                # Filled or already gone: the next cycle re-plans from a fresh read.
+                logging.info(
+                    "[order] maker exit taker cancel failed %s, next cycle | %s",
+                    coin, str(cancel_exc)[:200],
+                )
+                return {}
         try:
             return await self.cca.create_order(**ioc_params)
         except Exception as exc:

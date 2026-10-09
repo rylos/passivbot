@@ -604,6 +604,9 @@ def _ioc_connector(cls, monkeypatch, *, bid, pprice=95.0, fail=None):
     bot.positions = {SYMBOL: {"long": {"size": 1.0, "price": pprice}}}
     bot.bp = lambda pside, key, symbol: {"rylos_4rsi_enabled": True, "rylos_exit_min_gain": 0.0026}[key]
     bot.market_snapshot_provider = type("P", (), {"invalidate": lambda self, s: None})()
+    bot.n_decimal_places = 6
+    bot.n_significant_figures = 5
+    bot.price_steps = {SYMBOL: 0.01}
     return bot, creates
 
 
@@ -619,9 +622,9 @@ def test_hl_taker_cap_sends_an_ioc_at_the_bid(monkeypatch):
     order = _taker_exit()
     assert asyncio.run(hl.execute_order(order))["id"] == "ioc-1"
     (call,) = creates
-    assert call["price"] == 99.9 and call["params"]["timeInForce"] == "Ioc"
+    assert call["price"] == 99.85 and call["params"]["timeInForce"] == "Ioc"
     assert call["params"]["reduceOnly"] is True
-    assert order["price"] == 99.9
+    assert order["price"] == 99.85
 
 
 def test_bybit_taker_cap_sends_an_ioc_at_the_bid(monkeypatch):
@@ -631,7 +634,7 @@ def test_bybit_taker_cap_sends_an_ioc_at_the_bid(monkeypatch):
     by, creates = _ioc_connector(BybitBot, monkeypatch, bid=99.9)
     assert asyncio.run(by.execute_order(_taker_exit()))["id"] == "ioc-1"
     (call,) = creates
-    assert call["price"] == 99.9 and call["params"]["timeInForce"] == "IOC"
+    assert call["price"] == 99.85 and call["params"]["timeInForce"] == "IOC"
     assert call["params"]["positionIdx"] == 1
 
 
@@ -679,7 +682,11 @@ def test_taker_cap_via_modify_turns_the_resting_exit_into_the_ioc(monkeypatch):
 def _modify_ioc_connector(monkeypatch, *, bid, pprice=95.0, fail=None):
     from exchanges.hyperliquid import HyperliquidBot
 
-    hl, creates = _ioc_connector(HyperliquidBot, monkeypatch, bid=bid, pprice=pprice)
+    class _EditBot(HyperliquidBot):
+        # a venue that accepts the modify into IOC (HL refuses it)
+        _maker_exit_taker_ioc_via_edit = True
+
+    hl, creates = _ioc_connector(_EditBot, monkeypatch, bid=bid, pprice=pprice)
     edits = []
 
     async def edit_order(self, id, symbol, type, side, amount=None, price=None, params=None):
@@ -703,7 +710,7 @@ def test_hl_taker_cap_via_modify_sends_one_ioc_modify(monkeypatch):
     assert asyncio.run(hl.execute_order(_modify_taker_exit()))["id"] == "ioc-mod"
     assert creates == []
     (call,) = edits
-    assert call["id"] == "old-1" and call["price"] == 99.9 and call["side"] == "sell"
+    assert call["id"] == "old-1" and call["price"] == 99.85 and call["side"] == "sell"
     assert call["params"]["timeInForce"] == "Ioc" and call["params"]["reduceOnly"] is True
 
 
@@ -738,7 +745,7 @@ def test_hl_refused_modify_falls_back_to_cancel_then_ioc(monkeypatch, caplog):
     assert len(edits) == 1
     assert [c["id"] for c in cancels] == ["old-1"]
     (create,) = creates
-    assert create["price"] == 99.9
+    assert create["price"] == 99.85
     assert "via modify refused" in caplog.text and "hyperliquid boom" in caplog.text
 
 
@@ -799,3 +806,74 @@ def test_taker_cap_via_modify_falls_back_with_two_exits(monkeypatch, caplog):
     assert "_amend_from" not in new and new["_rylos_taker"] is True
     assert {o["id"] for o in to_cancel} == {"a", "b"}
     assert any("modify not possible (2 exits with id)" in r.getMessage() for r in caplog.records)
+
+
+def _hl_cancel_then_ioc(monkeypatch, *, bid, pprice=95.0, fail=None, cancel_fail=None):
+    from exchanges.hyperliquid import HyperliquidBot
+
+    hl, creates = _ioc_connector(HyperliquidBot, monkeypatch, bid=bid, pprice=pprice, fail=fail)
+    edits, cancels = [], []
+
+    async def edit_order(self, *args, **kwargs):
+        edits.append(args)
+        return {"id": "never"}
+
+    async def cancel_order(self, id, symbol=None, params=None):
+        cancels.append({"id": id, "symbol": symbol, "params": params})
+        if cancel_fail:
+            raise Exception(cancel_fail)
+        return {"id": id}
+
+    hl.cca.__class__.edit_order = edit_order
+    hl.cca.__class__.cancel_order = cancel_order
+    return hl, creates, edits, cancels
+
+
+def test_hl_paired_exit_is_cancelled_then_ioc_without_a_modify(monkeypatch, caplog):
+    # 09/10 HL: "Attempted to modify to invalid new order" on the modify into Ioc
+    import asyncio
+    import logging
+
+    hl, creates, edits, cancels = _hl_cancel_then_ioc(monkeypatch, bid=99.9)
+    with caplog.at_level(logging.INFO):
+        assert asyncio.run(hl.execute_order(_modify_taker_exit()))["id"] == "ioc-1"
+    assert edits == []
+    assert cancels == [{"id": "old-1", "symbol": SYMBOL, "params": {"vaultAddress": "0xvault"}}]
+    (create,) = creates
+    assert create["price"] == 99.85 and create["params"]["timeInForce"] == "Ioc"
+    assert create["params"]["reduceOnly"] is True
+    assert "cancel then IOC" in caplog.text and "via modify" not in caplog.text
+
+
+def test_hl_cancel_then_ioc_on_a_gone_exit_waits_next_cycle(monkeypatch):
+    import asyncio
+
+    hl, creates, edits, cancels = _hl_cancel_then_ioc(
+        monkeypatch, bid=99.9, cancel_fail="Order was never placed, already canceled, or filled."
+    )
+    assert asyncio.run(hl.execute_order(_modify_taker_exit())) == {}
+    assert edits == [] and creates == [] and len(cancels) == 1
+
+
+def test_ioc_limit_sits_under_the_bid_but_never_under_the_floor(monkeypatch):
+    import asyncio
+    from exchanges.hyperliquid import HyperliquidBot
+
+    # bid 95.27, floor 95 * 1.0026 = 95.247: 0.05% under the bid (95.22) would
+    # cross the floor, so the IOC goes out at the bid
+    hl, creates = _ioc_connector(HyperliquidBot, monkeypatch, bid=95.27, pprice=95.0)
+    asyncio.run(hl.execute_order(_taker_exit()))
+    assert creates[-1]["price"] == 95.27
+    # with room above the floor the limit is 0.05% under the bid
+    hl, creates = _ioc_connector(HyperliquidBot, monkeypatch, bid=97.0, pprice=95.0)
+    asyncio.run(hl.execute_order(_taker_exit()))
+    assert creates[-1]["price"] == 96.95
+
+
+def test_bybit_ioc_limit_sits_under_the_bid(monkeypatch):
+    import asyncio
+    from exchanges.bybit import BybitBot
+
+    by, creates = _ioc_connector(BybitBot, monkeypatch, bid=86.0, pprice=80.0)
+    asyncio.run(by.execute_order(_taker_exit()))
+    assert creates[-1]["price"] == 85.96
