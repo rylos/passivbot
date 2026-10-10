@@ -692,3 +692,43 @@ async def test_account_invalidation_rechecked_inside_each_connector_task(
         )
         == 2 - expected_calls
     )
+
+
+class _RylosPlanBot(_PlanBot):
+    def bp(self, pside, key, symbol):
+        return {"rylos_4rsi_enabled": True}.get(key)
+
+    def order_was_recently_updated(self, _order):
+        return 1_000
+
+
+@pytest.mark.asyncio
+async def test_rylos_exit_amend_is_not_throttled_as_a_recent_duplicate(execution_shell):
+    # 10/10 Bybit: the amend 84.44 -> 84.43 matched the exit posted 11 s before
+    # and was deferred twice, never sent
+    bot = _RylosPlanBot()
+    amend = dict(_order("amend", panic=True), _amend_from={"id": "old-1", "price": 100.1})
+    taker = dict(_order("taker", panic=True), _rylos_taker=True)
+
+    await executor.execute_order_plan(bot, [], [amend])
+    assert bot.created == [amend]
+    bot.created = []
+    await executor.execute_order_plan(bot, [], [taker])
+    assert bot.created == [taker]
+
+
+@pytest.mark.asyncio
+async def test_plain_exit_and_entries_keep_the_recent_execution_throttle(execution_shell):
+    bot = _RylosPlanBot()
+    await executor.execute_order_plan(bot, [], [_order("exit", panic=True)])
+    assert bot.created == []
+    entry = dict(_order("entry"), _amend_from={"id": "old-1", "price": 100.1})
+    await executor.execute_order_plan(bot, [], [entry])
+    assert bot.created == []
+    # without 4RSI the amend keeps the upstream throttle
+    plain = _PlanBot()
+    plain.order_was_recently_updated = lambda _order: 1_000
+    await executor.execute_order_plan(
+        plain, [], [dict(_order("amend", panic=True), _amend_from={"id": "old-1"})]
+    )
+    assert plain.created == []

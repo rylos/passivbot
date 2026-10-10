@@ -1002,6 +1002,16 @@ async def execute_order_plan(
                 f"{passivbot_cls._log_symbol(order['symbol'])} {order['side']} "
                 f"{order['position_side']} {order['qty']} @ {order['price']}"
             )
+            # rylos: an amend of the resting 4RSI exit (or its taker IOC) matches
+            # that very exit just posted, not a duplicate: throttling it for
+            # 15 s left the amend logged but never sent (HL 08/10 and 10/10,
+            # Bybit 09/10 and 10/10). The amend replaces the order in one write
+            # and the IOC goes out only after the maker exit is cancelled.
+            if (order.get("_amend_from") or order.get("_rylos_taker")) and _is_rylos_maker_exit(
+                bot, order
+            ):
+                to_create_mod.append(order)
+                continue
             if delay_time_ms := bot.order_was_recently_updated(order):
                 recent_execution_deferred.append((order, float(delay_time_ms)))
                 logging.info(
