@@ -11902,10 +11902,12 @@ class Passivbot:
         symbols: Iterable[str] | None = None,
         source: str = "unknown",
         level: int = logging.DEBUG,
+        surfaces: Iterable[str] | None = None,
     ) -> None:
         """Force a coherent account-state refresh before the next execution cycle."""
+        kwargs = {} if surfaces is None else {"surfaces": surfaces}
         return reconciler.mark_account_critical_state_dirty(
-            self, reason=reason, symbols=symbols, source=source, level=level
+            self, reason=reason, symbols=symbols, source=source, level=level, **kwargs
         )
 
     def _staged_planner_required_surfaces(
@@ -12439,10 +12441,22 @@ class Passivbot:
                     (logging.debug if presentation_echo else logging.info)(_log_msg)
                     self._ws_order_update_last_log_key = _log_key
                     self._ws_order_update_last_log_ts = now
+                surfaces = None
+                if _cause == "cancel_hint" and all(
+                    isinstance(o, dict)
+                    and o.get("filled") is not None
+                    and float(o.get("filled") or 0.0) == 0.0
+                    for o in upd_list
+                ):
+                    # rylos: a cancel with nothing filled cannot change the fills;
+                    # waiting for the next fills refresh kept planning off for
+                    # ~10 s after Bybit cancelled a post-only 4RSI exit (13/10).
+                    surfaces = {"balance", "positions", "open_orders"}
                 self._mark_account_critical_state_dirty(
                     reason=f"order_ws_{_cause or 'update'}",
                     symbols=_symbols,
                     source="order_ws",
+                    surfaces=surfaces,
                 )
             else:
                 self.execution_scheduled = True

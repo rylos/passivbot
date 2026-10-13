@@ -625,6 +625,19 @@ class Owner:
             for wave in reports:
                 self.report(wave)
 
+    # rylos: a plan still being prepared after the delay (13/10 HL: the plan at
+    # the 5m close needed ~3.4 s for the new candles) was only serviced two
+    # cycles later, +11 s from the close. Waiting a bounded extra moment for it
+    # adds no remote call: cycles only get rarer, never more frequent.
+    PENDING_PLAN_GRACE_SECONDS = 2.0
+
+    async def _await_pending_plan(self):
+        import asyncio
+        task = self._ordinary
+        if task is None or task.done() or self._shutdown_requested():
+            return
+        await asyncio.wait((task,), timeout=self.PENDING_PLAN_GRACE_SECONDS)
+
     async def run(self):
         """Serialized writes with periodic protection while preparation is pending."""
         from utils import utc_ms
@@ -648,6 +661,7 @@ class Owner:
                 await bot._sleep_unless_shutdown(
                     max(.05, float(bot.live_value('execution_delay_seconds'))),
                     stage='revised_execution_delay')
+                await self._await_pending_plan()
         finally:
             self._running = False
             self.cancel_inputs()

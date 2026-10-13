@@ -3641,6 +3641,45 @@ def test_handle_order_update_cancel_hint_requests_full_confirmation(
     )
 
 
+def test_handle_order_update_zero_fill_cancel_skips_fills_confirmation(monkeypatch):
+    # rylos 13/10 Bybit: the venue cancelled a post-only 4RSI exit (nothing
+    # filled) and planning waited ~10 s for a fills refresh it did not need
+    bot = Passivbot.__new__(Passivbot)
+    bot.execution_scheduled = False
+    _set_authoritative_epoch_state(bot, epoch=7)
+    bot.state_change_detected_by_symbol = set()
+    bot.recent_order_cancellations = []
+    monkeypatch.setattr(time, "time", lambda: 1000.0)
+    monkeypatch.setattr(passivbot_module, "utc_ms", lambda: 1_000_000)
+
+    bot.handle_order_update(
+        [{"symbol": "HYPE/USDT:USDT", "status": "canceled", "id": "x", "filled": 0.0}]
+    )
+
+    assert bot.execution_scheduled is True
+    assert bot._authoritative_pending_confirmations == {
+        "balance": 8,
+        "positions": 8,
+        "open_orders": 8,
+    }
+
+
+def test_handle_order_update_partly_filled_cancel_keeps_fills_confirmation(monkeypatch):
+    bot = Passivbot.__new__(Passivbot)
+    bot.execution_scheduled = False
+    _set_authoritative_epoch_state(bot, epoch=7)
+    bot.state_change_detected_by_symbol = set()
+    bot.recent_order_cancellations = []
+    monkeypatch.setattr(time, "time", lambda: 1000.0)
+    monkeypatch.setattr(passivbot_module, "utc_ms", lambda: 1_000_000)
+
+    bot.handle_order_update(
+        [{"symbol": "HYPE/USDT:USDT", "status": "canceled", "id": "x", "filled": 2.5}]
+    )
+
+    assert bot._authoritative_pending_confirmations["fills"] == 8
+
+
 def test_handle_order_update_fill_hint_requests_full_confirmation(caplog, monkeypatch):
     bot = Passivbot.__new__(Passivbot)
     bot.execution_scheduled = False

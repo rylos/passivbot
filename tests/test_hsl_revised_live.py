@@ -1652,3 +1652,30 @@ async def test_revised_trailing_console_failure_does_not_stop_execution():
     bot.live_value = lambda key: .05
     await instance.run()
     assert calls == ['cycle', 'console'] and not instance._running
+
+
+def test_pending_plan_grace_waits_for_a_plan_finishing_soon_and_is_bounded(monkeypatch):
+    # rylos 13/10 HL: the 5m-close plan needed ~3.4 s and was serviced only
+    # two cycles later (+11 s). The grace wait lets the next cycle service it.
+    import asyncio
+    import time as _time
+    from live import hsl_revised_live
+
+    owner = object.__new__(hsl_revised_live.Owner)
+    owner._shutdown_requested = lambda: False
+    monkeypatch.setattr(hsl_revised_live.Owner, "PENDING_PLAN_GRACE_SECONDS", 0.2)
+
+    async def scenario():
+        owner._ordinary = asyncio.create_task(asyncio.sleep(0.05, result="plan"))
+        await owner._await_pending_plan()
+        assert owner._ordinary.done()
+        slow = asyncio.create_task(asyncio.sleep(5))
+        owner._ordinary = slow
+        t0 = _time.monotonic()
+        await owner._await_pending_plan()
+        assert _time.monotonic() - t0 < 1.0 and not slow.done()
+        slow.cancel()
+        owner._ordinary = None
+        await owner._await_pending_plan()
+
+    asyncio.run(scenario())
