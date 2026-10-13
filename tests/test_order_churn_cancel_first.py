@@ -720,6 +720,8 @@ async def test_rylos_exit_amend_is_not_throttled_as_a_recent_duplicate(execution
 @pytest.mark.asyncio
 async def test_plain_exit_and_entries_keep_the_recent_execution_throttle(execution_shell):
     bot = _RylosPlanBot()
+    # exit posted 2 s ago: still inside the 5 s window of the 4RSI exit
+    bot.order_was_recently_updated = lambda _order: 13_000
     await executor.execute_order_plan(bot, [], [_order("exit", panic=True)])
     assert bot.created == []
     entry = dict(_order("entry"), _amend_from={"id": "old-1", "price": 100.1})
@@ -732,3 +734,17 @@ async def test_plain_exit_and_entries_keep_the_recent_execution_throttle(executi
         plain, [], [dict(_order("amend", panic=True), _amend_from={"id": "old-1"})]
     )
     assert plain.created == []
+
+
+@pytest.mark.asyncio
+async def test_rylos_exit_waits_5_s_not_15_after_a_recent_execution(execution_shell):
+    # 13/10 Bybit: the venue cancelled the post-only exit and the new one
+    # waited 10-15 s with no exit on the book
+    bot = _RylosPlanBot()  # matching execution 14 s ago
+    exit_ = _order("exit", panic=True)
+    await executor.execute_order_plan(bot, [], [exit_])
+    assert bot.created == [exit_]
+    bot.created = []
+    entry = _order("entry")
+    await executor.execute_order_plan(bot, [], [entry])
+    assert bot.created == []

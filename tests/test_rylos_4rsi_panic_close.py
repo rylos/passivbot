@@ -333,7 +333,14 @@ def _amend_connector(cls, monkeypatch, edit):
     bot.config = {"live": {"time_in_force": "good_till_cancelled"}}
     bot.user_info = {"is_vault": True, "wallet_address": "0xvault"}
     bot._emit_execution_connector_call_started_event = lambda **kw: None
-    bot.cca = type("C", (), {"edit_order": edit})()
+
+    async def fetch_order_book(self, symbol, limit=None):
+        return {"bids": [[bot._book_bid, 5.0]], "asks": [[bot._book_bid + 0.01, 5.0]]}
+
+    bot._book_bid = 99.0
+    bot.cca = type("C", (), {"edit_order": edit, "fetch_order_book": fetch_order_book})()
+    bot.bp = lambda pside, key, symbol: {"rylos_4rsi_enabled": True, "rylos_exit_min_gain": 0.0026}[key]
+    bot.price_steps = {SYMBOL: 0.001}
     return bot
 
 
@@ -385,6 +392,23 @@ def test_bybit_amend_sends_only_the_price_and_keeps_the_client_id(monkeypatch):
     assert args == ("old-1", SYMBOL, "limit", "sell")
     assert kwargs == {"amount": None, "price": 101.0, "params": {}}
     assert order["custom_id"] == "cid-old"
+
+
+def test_bybit_amend_under_the_bid_is_raised_to_bid_plus_tick(monkeypatch):
+    import asyncio
+    from exchanges.bybit import BybitBot
+
+    calls = []
+
+    async def edit(self, *args, **kwargs):
+        calls.append((args, kwargs))
+        return {"id": "old-1"}
+
+    by = _amend_connector(BybitBot, monkeypatch, edit)
+    by._book_bid = 101.2
+    asyncio.run(by.execute_order(_new_exit()))
+    (args, kwargs), = calls
+    assert kwargs["price"] == 101.201
 
 
 def test_failed_amend_backs_off_to_cancel_create(monkeypatch):
@@ -877,3 +901,39 @@ def test_bybit_ioc_limit_sits_under_the_bid(monkeypatch):
     by, creates = _ioc_connector(BybitBot, monkeypatch, bid=86.0, pprice=80.0)
     asyncio.run(by.execute_order(_taker_exit()))
     assert creates[-1]["price"] == 85.96
+
+
+def _guard_connector(cls, monkeypatch, *, bid):
+    by, creates = _ioc_connector(cls, monkeypatch, bid=bid)
+    by.price_steps = {SYMBOL: 0.001}
+    return by, creates
+
+
+def test_bybit_maker_exit_at_or_under_the_bid_is_raised_to_bid_plus_tick(monkeypatch):
+    # 13/10 Bybit: four exits priced under a rising bid were cancelled by the
+    # venue (EC_PostOnlyWillTakeLiquidity), exit as taker after 77 s
+    import asyncio
+    from exchanges.bybit import BybitBot
+
+    by, creates = _guard_connector(BybitBot, monkeypatch, bid=100.05)
+    order = dict(_cap_exit(100.0), custom_id="0x0a1b" + "c" * 28)
+    asyncio.run(by.execute_order(order))
+    (call,) = creates
+    assert call["price"] == 100.051 and order["price"] == 100.051
+    assert call["params"]["timeInForce"] == "postOnly"
+
+
+def test_bybit_maker_exit_above_the_bid_is_left_alone(monkeypatch):
+    import asyncio
+    from exchanges.bybit import BybitBot
+
+    by, creates = _guard_connector(BybitBot, monkeypatch, bid=99.9)
+    asyncio.run(by.execute_order(dict(_cap_exit(100.0), custom_id="0x0a1b" + "c" * 28)))
+    (call,) = creates
+    assert call["price"] == 100.0
+
+
+def test_hl_has_no_fresh_book_guard(monkeypatch):
+    from exchanges.hyperliquid import HyperliquidBot
+
+    assert HyperliquidBot._maker_exit_fresh_book_guard_enabled is False

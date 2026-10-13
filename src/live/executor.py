@@ -240,6 +240,7 @@ def _is_rylos_maker_exit(bot, order: dict) -> bool:
 # the first exit price by more than the fee gap (or after a time cap) the
 # exit becomes an IOC sell at the bid, bounded by the 4RSI exit floor.
 MAKER_EXIT_TAKER_CAP_MS = 60_000
+MAKER_EXIT_RECENT_EXECUTION_MS = 5_000
 
 
 def _apply_maker_exit_taker_cap(bot, to_cancel: list[dict], to_create: list[dict]) -> list[dict]:
@@ -1012,7 +1013,15 @@ async def execute_order_plan(
             ):
                 to_create_mod.append(order)
                 continue
-            if delay_time_ms := bot.order_was_recently_updated(order):
+            # rylos: a new 4RSI exit after the venue cancelled the last one
+            # (Bybit post-only refusal) waited the full 15 s (13/10: 10-15 s
+            # with no exit on the book, three times). Exits are reduce-only,
+            # so a shorter guard against duplicates is enough.
+            delay_time_ms = bot.order_was_recently_updated(order)
+            if delay_time_ms and _is_rylos_maker_exit(bot, order):
+                # the 15 s window counted down to MAKER_EXIT_RECENT_EXECUTION_MS
+                delay_time_ms = max(0.0, delay_time_ms - (15_000 - MAKER_EXIT_RECENT_EXECUTION_MS))
+            if delay_time_ms:
                 recent_execution_deferred.append((order, float(delay_time_ms)))
                 logging.info(
                     "[order] recent execution found; delaying for up to %.1f secs: %s",

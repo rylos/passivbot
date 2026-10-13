@@ -22453,6 +22453,10 @@ class Passivbot:
             and not order.get("_dedicated_protective_market_panic", False)
         ):
             return executor.DeferredOrderCreation()
+        if getattr(self, "_maker_exit_fresh_book_guard_enabled", False) and not order.get(
+            "_rylos_taker"
+        ):
+            await self._maker_exit_fresh_book_guard(order, params)
         amend_from = order.get("_amend_from")
         if amend_from and self._maker_exit_amend_keeps_custom_id:
             # rylos: the amended order keeps its exchange client id (Bybit).
@@ -22604,6 +22608,47 @@ class Passivbot:
     # stale is re-placed at once on a book read now, inside the same connector
     # admission (the refused write had no effect), instead of a cycle later.
     _supports_maker_exit_fresh_book_retry = False
+    # rylos: the venue refuses a crossing post-only exit only afterwards, by
+    # cancelling it (Bybit EC_PostOnlyWillTakeLiquidity, create and amend), so
+    # the refusal cannot be retried in the same write: the exit price is
+    # checked against a book read just before sending it instead.
+    _maker_exit_fresh_book_guard_enabled = False
+
+    async def _maker_exit_fresh_book_guard(self, order: dict, params: dict) -> None:
+        """Raise a 4RSI maker exit priced at or under the bid read now to
+        bid + tick, so it rests instead of being cancelled (13/10 Bybit: four
+        exits cancelled by the venue in a rising book, then a taker IOC after
+        77 s). Only raises the price, so the exit floor still holds."""
+        if not self._maker_exit_fresh_book_guard_enabled:
+            return
+        symbol = order["symbol"]
+        if not (
+            order.get("position_side") == "long"
+            and order.get("side") == "sell"
+            and is_maker_panic_close(order)
+            and bool(self.bp("long", "rylos_4rsi_enabled", symbol))
+        ):
+            return
+        coin = symbol_to_coin(symbol, verbose=False) or symbol
+        try:
+            book = await self.cca.fetch_order_book(symbol, 5)
+            bid = float(book["bids"][0][0])
+        except Exception as exc:
+            logging.info("[order] maker exit book check skipped %s | %s", coin, str(exc)[:120])
+            return
+        if not bid > 0.0 or order["price"] > bid:
+            return
+        step = float(self.price_steps[symbol])
+        price = self._maker_exit_retry_price(symbol, bid + step)
+        if price <= bid:
+            return
+        logging.info(
+            "[order] maker exit raised on fresh book %s | %s -> %s (bid %s)",
+            coin, order["price"], price, bid,
+        )
+        # the executor records the order dict it passed in: keep it truthful
+        order["price"] = price
+        params["price"] = price
 
     def _maker_exit_retry_price(self, symbol: str, price: float) -> float:
         """Hook: round a re-placed maker exit price to the venue's rules."""
