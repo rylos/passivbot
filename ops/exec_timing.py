@@ -31,6 +31,9 @@ PROFILES = {
 KINDS = {"entry_initial_normal_long": "entrata", "close_panic_long": "uscita 4RSI"}
 POST_RE = re.compile(r"\[order\]\s+post \S+ \| (?:buy|sell) long [\d.]+@([\d.]+) (entry_initial_normal_long|close_panic_long)")
 REJ_RE = re.compile(r"post-only (entry_initial_normal_long|close_panic_long) rejected")
+# HL: l'uscita rifiutata e' ripiazzata subito sul book fresco, senza la riga
+# "rejected": ogni ripiazzamento e' un rifiuto in piu'
+RETRY_RE = re.compile(r"maker exit re-placed on fresh book")
 AMEND_RE = re.compile(r"maker exit amend ")
 AMEND_FAIL_RE = re.compile(r"maker exit amend failed")
 CAP_RE = re.compile(r"maker exit taker cap \S+ \| (price moved|time cap)")
@@ -103,7 +106,7 @@ def episodes(fills):
     return eps
 
 
-def analyse(ep, lines, maker_fee):
+def analyse(ep, lines, maker_fee, venue_cancels=False):
     kind = ep[0]["pb_order_type"]
     if kind not in KINDS:
         f = ep[0]
@@ -139,8 +142,10 @@ def analyse(ep, lines, maker_fee):
     signal = first_t.replace(second=0) - timedelta(minutes=first_t.minute % 5)
     win = [ln for ln in lines if signal <= utc(ln) <= end + timedelta(seconds=5)]
     n_rej = sum(1 for ln in win if (m := REJ_RE.search(ln)) and m.group(1) == kind)
+    if kind == "close_panic_long":
+        n_rej += sum(1 for ln in win if RETRY_RE.search(ln))
     n_hint = sum(int(m.group(1)) for ln in win if (m := CANCEL_HINT_RE.search(ln)))
-    n_venue = max(0, n_hint - sum(1 for ln in win if BOT_CANCEL_RE.search(ln)))
+    n_venue = max(0, n_hint - sum(1 for ln in win if BOT_CANCEL_RE.search(ln))) if venue_cancels else 0
     n_amend = sum(1 for ln in win if AMEND_RE.search(ln) and not AMEND_FAIL_RE.search(ln))
     n_amend_fail = sum(1 for ln in win if AMEND_FAIL_RE.search(ln))
     cap = next((m.group(1) for ln in win if (m := CAP_RE.search(ln))), None)
@@ -181,7 +186,9 @@ def main():
     since = utc(eps[0][0]["datetime"]) - timedelta(hours=1)
     lines = load_log(log_glob, since)
     for ep in eps:
-        res = analyse(ep, lines, maker_fee)
+        # solo Bybit rifiuta annullando dopo l'invio; su HL l'annullamento
+        # segnalato e' quello del modify rifiutato, gia' contato dal ripiazzamento
+        res = analyse(ep, lines, maker_fee, venue_cancels=inst == "bybit")
         if res is None:
             continue
         key, text = res
