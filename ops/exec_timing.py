@@ -35,6 +35,12 @@ AMEND_RE = re.compile(r"maker exit amend ")
 AMEND_FAIL_RE = re.compile(r"maker exit amend failed")
 CAP_RE = re.compile(r"maker exit taker cap \S+ \| (price moved|time cap)")
 IOC_RE = re.compile(r"maker exit taker IOC ")
+# Bybit rifiuta il post-only che incrocerebbe dopo l'invio, annullandolo
+# (EC_PostOnlyWillTakeLiquidity): nel log c'è solo l'annullamento segnalato dal
+# websocket. Annullamenti dell'exchange = annullamenti segnalati meno quelli
+# chiesti dal bot.
+CANCEL_HINT_RE = re.compile(r"cause=cancel_hint events=(\d+) .*statuses=\S*canceled")
+BOT_CANCEL_RE = re.compile(r"\[order\] cancel |cancel then IOC")
 ROME = ZoneInfo("Europe/Rome")
 MAX_GAP = timedelta(minutes=6)  # fra un ordine e il successivo dello stesso episodio
 MAX_REST = timedelta(minutes=60)  # ordine rimasto fermo sul book fino al fill
@@ -133,6 +139,8 @@ def analyse(ep, lines, maker_fee):
     signal = first_t.replace(second=0) - timedelta(minutes=first_t.minute % 5)
     win = [ln for ln in lines if signal <= utc(ln) <= end + timedelta(seconds=5)]
     n_rej = sum(1 for ln in win if (m := REJ_RE.search(ln)) and m.group(1) == kind)
+    n_hint = sum(int(m.group(1)) for ln in win if (m := CANCEL_HINT_RE.search(ln)))
+    n_venue = max(0, n_hint - sum(1 for ln in win if BOT_CANCEL_RE.search(ln)))
     n_amend = sum(1 for ln in win if AMEND_RE.search(ln) and not AMEND_FAIL_RE.search(ln))
     n_amend_fail = sum(1 for ln in win if AMEND_FAIL_RE.search(ln))
     cap = next((m.group(1) for ln in win if (m := CAP_RE.search(ln))), None)
@@ -150,7 +158,8 @@ def analyse(ep, lines, maker_fee):
         f"{KINDS[kind]} {rome(end, '%d/%m')} | segnale {rome(signal, '%H:%M')}"
         f" → 1° ordine +{dur(first_t - signal)} → fill +{dur(end - signal)}"
         f" ({len(ep)} fill) | {len(chain)} ordini, {n_amend} amend"
-        f"{f' ({n_amend_fail} falliti)' if n_amend_fail else ''}, {n_rej} rifiuti post-only"
+        f"{f' ({n_amend_fail} falliti)' if n_amend_fail else ''}, {n_rej + n_venue} rifiuti post-only"
+        f"{f' ({n_venue} annullati dall’exchange)' if n_venue else ''}"
         f"{f', tetto taker ({cap}, {n_ioc} IOC)' if cap else ''}"
         f" | 1° prezzo {first_p:g} → fill {vwap:.5g} ({slip:+.3f}% a favore)"
         f" | fee {', '.join(f'{x*100:.3f}%' for x in fees)} {'maker' if maker else 'NON maker'}"
