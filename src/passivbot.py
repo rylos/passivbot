@@ -63,6 +63,7 @@ from live.order_churn_gate import (
     OrderChurnGateState,
     connector_supports_order_churn_gate,
     is_maker_panic_close,
+    is_post_only_limit,
 )
 from live.balance_composition import (
     balance_composition_signature,
@@ -22471,6 +22472,8 @@ class Passivbot:
             "_rylos_taker"
         ):
             await self._maker_exit_fresh_book_guard(order, params)
+        if getattr(self, "_maker_entry_fresh_book_guard_enabled", False):
+            await self._maker_entry_fresh_book_guard(order, params)
         amend_from = order.get("_amend_from")
         if amend_from and self._maker_exit_amend_keeps_custom_id:
             # rylos: the amended order keeps its exchange client id (Bybit).
@@ -22659,6 +22662,48 @@ class Passivbot:
         logging.info(
             "[order] maker exit raised on fresh book %s | %s -> %s (bid %s)",
             coin, order["price"], price, bid,
+        )
+        # the executor records the order dict it passed in: keep it truthful
+        order["price"] = price
+        params["price"] = price
+
+    # rylos: same venue behaviour for a post-only entry: a long entry priced at
+    # or over the ask is cancelled after the send and waits the 15 s recent
+    # execution window before the next try (16/10 Bybit 17:05: eight entries
+    # cancelled in a row, each 0.005-0.03 over the ask).
+    _maker_entry_fresh_book_guard_enabled = False
+
+    async def _maker_entry_fresh_book_guard(self, order: dict, params: dict) -> None:
+        """Lower a 4RSI long entry priced at or over the ask read now to
+        ask - tick, so it rests as maker instead of being cancelled. Only
+        lowers the price: the entry never chases."""
+        if not self._maker_entry_fresh_book_guard_enabled:
+            return
+        symbol = order["symbol"]
+        if not (
+            order.get("position_side") == "long"
+            and order.get("side") == "buy"
+            and str(order.get("pb_order_type") or "").startswith("entry_")
+            and is_post_only_limit(order)
+            and bool(self.bp("long", "rylos_4rsi_enabled", symbol))
+        ):
+            return
+        coin = symbol_to_coin(symbol, verbose=False) or symbol
+        try:
+            book = await self.cca.fetch_order_book(symbol, 5)
+            ask = float(book["asks"][0][0])
+        except Exception as exc:
+            logging.info("[order] maker entry book check skipped %s | %s", coin, str(exc)[:120])
+            return
+        if not ask > 0.0 or order["price"] < ask:
+            return
+        step = float(self.price_steps[symbol])
+        price = float(pbr.round_(ask - step, step))
+        if not 0.0 < price < ask:
+            return
+        logging.info(
+            "[order] maker entry lowered on fresh book %s | %s -> %s (ask %s)",
+            coin, order["price"], price, ask,
         )
         # the executor records the order dict it passed in: keep it truthful
         order["price"] = price

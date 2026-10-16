@@ -937,3 +937,48 @@ def test_hl_has_no_fresh_book_guard(monkeypatch):
     from exchanges.hyperliquid import HyperliquidBot
 
     assert HyperliquidBot._maker_exit_fresh_book_guard_enabled is False
+
+
+def _entry_guard_bot(monkeypatch, ask):
+    from exchanges.bybit import BybitBot
+
+    async def edit(self, *args, **kwargs):
+        raise AssertionError("no amend expected")
+
+    by = _amend_connector(BybitBot, monkeypatch, edit)
+    by._book_bid = ask - 0.01
+    return by
+
+
+@pytest.mark.parametrize(
+    "price, ask, expected",
+    [
+        (79.71, 79.705, 79.704),  # 16/10 17:05: over the ask -> ask - tick
+        (79.705, 79.705, 79.704),  # at the ask
+        (79.70, 79.705, 79.70),  # under the ask: unchanged
+    ],
+)
+def test_bybit_entry_at_or_over_the_ask_is_lowered_to_ask_minus_tick(monkeypatch, price, ask, expected):
+    import asyncio
+
+    by = _entry_guard_bot(monkeypatch, ask)
+    order = _live_order("entry_initial_normal_long", "buy", False, price)
+    params = {"price": price}
+    asyncio.run(by._maker_entry_fresh_book_guard(order, params))
+    assert order["price"] == pytest.approx(expected)
+    assert params["price"] == pytest.approx(expected)
+
+
+def test_entry_guard_never_raises_and_skips_exits(monkeypatch):
+    import asyncio
+
+    by = _entry_guard_bot(monkeypatch, 79.705)
+    exit_ = _live_order("close_panic_long", "sell", True, 79.0)
+    asyncio.run(by._maker_entry_fresh_book_guard(exit_, {"price": 79.0}))
+    assert exit_["price"] == 79.0
+
+
+def test_entry_guard_is_off_outside_bybit():
+    from exchanges.hyperliquid import HyperliquidBot
+
+    assert HyperliquidBot._maker_entry_fresh_book_guard_enabled is False

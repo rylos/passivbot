@@ -560,6 +560,7 @@ class BybitBot(CCXTBot):
     _supports_maker_exit_amend = True
     _maker_exit_amend_keeps_custom_id = True
     _maker_exit_fresh_book_guard_enabled = True
+    _maker_entry_fresh_book_guard_enabled = True
     # rylos: fees from the bybit_02 fills (maker 0.02%, taker 0.055%)
     _maker_exit_taker_fee_gap = 0.00035
 
