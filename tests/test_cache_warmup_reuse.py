@@ -233,11 +233,11 @@ class TestWarmupSufficiencyGate:
     def test_sufficient_warmup_returns_cache(self, tmp_path, monkeypatch):
         """Cache with warmup >= needed returns data."""
         cfg = _allow_legacy_cache(_base_config())
+        monkeypatch.chdir(tmp_path)  # hash depends on cwd market caches
         cache_hash = get_cache_hash(cfg, "binance")
         cache_dir = tmp_path / "caches" / "hlcvs_data" / cache_hash[:16]
         _write_fake_cache(str(cache_dir), warmup_minutes=5000)
 
-        monkeypatch.chdir(tmp_path)
         result = load_coins_hlcvs_from_cache(cfg, "binance", warmup_minutes=3000)
 
         assert result is not None
@@ -245,11 +245,11 @@ class TestWarmupSufficiencyGate:
     def test_insufficient_warmup_returns_none(self, tmp_path, monkeypatch):
         """Cache with warmup < needed returns None."""
         cfg = _allow_legacy_cache(_base_config())
+        monkeypatch.chdir(tmp_path)  # hash depends on cwd market caches
         cache_hash = get_cache_hash(cfg, "binance")
         cache_dir = tmp_path / "caches" / "hlcvs_data" / cache_hash[:16]
         _write_fake_cache(str(cache_dir), warmup_minutes=1000)
 
-        monkeypatch.chdir(tmp_path)
         result = load_coins_hlcvs_from_cache(cfg, "binance", warmup_minutes=5000)
 
         assert result is None
@@ -257,11 +257,11 @@ class TestWarmupSufficiencyGate:
     def test_exact_warmup_match_returns_cache(self, tmp_path, monkeypatch):
         """Cache with warmup == needed returns data (boundary condition)."""
         cfg = _allow_legacy_cache(_base_config())
+        monkeypatch.chdir(tmp_path)  # hash depends on cwd market caches
         cache_hash = get_cache_hash(cfg, "binance")
         cache_dir = tmp_path / "caches" / "hlcvs_data" / cache_hash[:16]
         _write_fake_cache(str(cache_dir), warmup_minutes=5000)
 
-        monkeypatch.chdir(tmp_path)
         result = load_coins_hlcvs_from_cache(cfg, "binance", warmup_minutes=5000)
 
         assert result is not None
@@ -269,11 +269,11 @@ class TestWarmupSufficiencyGate:
     def test_zero_needed_warmup_always_hits(self, tmp_path, monkeypatch):
         """When needed warmup is 0, any cache is sufficient."""
         cfg = _allow_legacy_cache(_base_config())
+        monkeypatch.chdir(tmp_path)  # hash depends on cwd market caches
         cache_hash = get_cache_hash(cfg, "binance")
         cache_dir = tmp_path / "caches" / "hlcvs_data" / cache_hash[:16]
         _write_fake_cache(str(cache_dir), warmup_minutes=0)
 
-        monkeypatch.chdir(tmp_path)
         result = load_coins_hlcvs_from_cache(cfg, "binance", warmup_minutes=0)
 
         assert result is not None
@@ -281,11 +281,11 @@ class TestWarmupSufficiencyGate:
     def test_default_warmup_param_is_zero(self, tmp_path, monkeypatch):
         """Calling without warmup_minutes defaults to 0 (always hits)."""
         cfg = _allow_legacy_cache(_base_config())
+        monkeypatch.chdir(tmp_path)  # hash depends on cwd market caches
         cache_hash = get_cache_hash(cfg, "binance")
         cache_dir = tmp_path / "caches" / "hlcvs_data" / cache_hash[:16]
         _write_fake_cache(str(cache_dir), warmup_minutes=0)
 
-        monkeypatch.chdir(tmp_path)
         result = load_coins_hlcvs_from_cache(cfg, "binance")
 
         assert result is not None
@@ -302,11 +302,11 @@ class TestLegacyCacheCompatibility:
     def test_manifest_missing_cache_rejected_by_default(self, tmp_path, monkeypatch):
         """Manifest-missing final caches are rebuilt."""
         cfg = _base_config()
+        monkeypatch.chdir(tmp_path)  # hash depends on cwd market caches
         cache_hash = get_cache_hash(cfg, "binance")
         cache_dir = tmp_path / "caches" / "hlcvs_data" / cache_hash[:16]
         _write_fake_cache(str(cache_dir), warmup_minutes=5000, write_manifest=False)
 
-        monkeypatch.chdir(tmp_path)
 
         result = load_coins_hlcvs_from_cache(cfg, "binance", warmup_minutes=0)
         assert result is None
@@ -314,11 +314,11 @@ class TestLegacyCacheCompatibility:
     def test_missing_cache_meta_treated_as_zero_warmup(self, tmp_path, monkeypatch):
         """Legacy cache without cache_meta.json has cached_warmup=0."""
         cfg = _allow_legacy_cache(_base_config())
+        monkeypatch.chdir(tmp_path)  # hash depends on cwd market caches
         cache_hash = get_cache_hash(cfg, "binance")
         cache_dir = tmp_path / "caches" / "hlcvs_data" / cache_hash[:16]
         _write_fake_cache(str(cache_dir), warmup_minutes=None)
 
-        monkeypatch.chdir(tmp_path)
 
         # Needed warmup > 0 → miss (legacy cache has no warmup metadata)
         result = load_coins_hlcvs_from_cache(cfg, "binance", warmup_minutes=100)
@@ -327,11 +327,11 @@ class TestLegacyCacheCompatibility:
     def test_missing_cache_meta_hits_when_zero_needed(self, tmp_path, monkeypatch):
         """Legacy cache still works when needed warmup is 0."""
         cfg = _allow_legacy_cache(_base_config())
+        monkeypatch.chdir(tmp_path)  # hash depends on cwd market caches
         cache_hash = get_cache_hash(cfg, "binance")
         cache_dir = tmp_path / "caches" / "hlcvs_data" / cache_hash[:16]
         _write_fake_cache(str(cache_dir), warmup_minutes=None)
 
-        monkeypatch.chdir(tmp_path)
 
         result = load_coins_hlcvs_from_cache(cfg, "binance", warmup_minutes=0)
         assert result is not None
@@ -339,6 +339,7 @@ class TestLegacyCacheCompatibility:
     def test_corrupt_cache_meta_treated_as_zero(self, tmp_path, monkeypatch):
         """Corrupt cache_meta.json falls back to cached_warmup=0."""
         cfg = _allow_legacy_cache(_base_config())
+        monkeypatch.chdir(tmp_path)  # hash depends on cwd market caches
         cache_hash = get_cache_hash(cfg, "binance")
         cache_dir = tmp_path / "caches" / "hlcvs_data" / cache_hash[:16]
         _write_fake_cache(str(cache_dir), warmup_minutes=5000)
@@ -348,7 +349,6 @@ class TestLegacyCacheCompatibility:
         with open(meta_path, "w") as f:
             f.write("not valid json{{{")
 
-        monkeypatch.chdir(tmp_path)
         result = load_coins_hlcvs_from_cache(cfg, "binance", warmup_minutes=100)
         assert result is None
 
@@ -826,6 +826,7 @@ class TestDescriptiveDirResolution:
 
     def test_load_resolves_descriptive_dir_by_hash_suffix(self, tmp_path, monkeypatch):
         cfg = _allow_legacy_cache(_base_config())
+        monkeypatch.chdir(tmp_path)  # hash depends on cwd market caches
         cache_hash = get_cache_hash(cfg, "binance")
         coins = ["BTC/USDT:USDT"]
         dir_name = _build_hlcvs_cache_dir_name(
@@ -838,7 +839,6 @@ class TestDescriptiveDirResolution:
         cache_dir = tmp_path / "caches" / "hlcvs_data" / dir_name
         _write_fake_cache(str(cache_dir), warmup_minutes=100)
 
-        monkeypatch.chdir(tmp_path)
         result = load_coins_hlcvs_from_cache(cfg, "binance", warmup_minutes=50)
 
         assert result is not None
@@ -848,6 +848,7 @@ class TestDescriptiveDirResolution:
 
     def test_multiple_descriptive_dirs_for_same_hash_raise(self, tmp_path, monkeypatch):
         cfg = _base_config()
+        monkeypatch.chdir(tmp_path)  # hash depends on cwd market caches
         cache_hash = get_cache_hash(cfg, "binance")
         root = tmp_path / "caches" / "hlcvs_data"
         cache_dir_a = root / f"binance__BTC__2024_01_01_to_2025_06_01__{cache_hash[:16]}"
@@ -855,7 +856,6 @@ class TestDescriptiveDirResolution:
         _write_fake_cache(str(cache_dir_a), warmup_minutes=100)
         _write_fake_cache(str(cache_dir_b), warmup_minutes=100)
 
-        monkeypatch.chdir(tmp_path)
         with pytest.raises(RuntimeError) as exc:
             load_coins_hlcvs_from_cache(cfg, "binance", warmup_minutes=50)
         assert cache_hash[:16] in str(exc.value)
