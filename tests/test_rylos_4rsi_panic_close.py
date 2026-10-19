@@ -978,7 +978,43 @@ def test_entry_guard_never_raises_and_skips_exits(monkeypatch):
     assert exit_["price"] == 79.0
 
 
-def test_entry_guard_is_off_outside_bybit():
+@pytest.mark.parametrize(
+    "price, ask, expected",
+    [
+        (78.198, 78.15, 78.149),  # 19/10 16:05: Alo refused in a falling book
+        (78.15, 78.15, 78.149),  # at the ask
+        (78.10, 78.15, 78.10),  # under the ask: unchanged
+    ],
+)
+def test_hl_entry_at_or_over_the_ask_is_lowered_to_ask_minus_tick(monkeypatch, price, ask, expected):
+    import asyncio
     from exchanges.hyperliquid import HyperliquidBot
 
-    assert HyperliquidBot._maker_entry_fresh_book_guard_enabled is False
+    async def edit(self, *args, **kwargs):
+        raise AssertionError("no amend expected")
+
+    hl = _amend_connector(HyperliquidBot, monkeypatch, edit)
+    hl._book_bid = ask - 0.01
+    hl.n_decimal_places = 6
+    hl.n_significant_figures = 5
+    order = _live_order("entry_initial_normal_long", "buy", False, price)
+    params = {"price": price}
+    asyncio.run(hl._maker_entry_fresh_book_guard(order, params))
+    assert order["price"] == pytest.approx(expected)
+    assert params["price"] == pytest.approx(expected)
+
+
+def test_hl_entry_guard_keeps_five_significant_figures(monkeypatch):
+    import asyncio
+    from exchanges.hyperliquid import HyperliquidBot
+
+    hl = _amend_connector(HyperliquidBot, monkeypatch, None)
+    hl._book_bid = 99.99
+    hl.price_steps = {SYMBOL: 0.0001}
+    hl.n_decimal_places = 6
+    hl.n_significant_figures = 5
+    order = _live_order("entry_initial_normal_long", "buy", False, 100.5)
+    asyncio.run(hl._maker_entry_fresh_book_guard(order, {"price": 100.5}))
+    # ask 100.0 - tick 0.0001 = 99.9999 -> 5 significant figures: 100.0, not
+    # under the ask: left unchanged instead of sending an invalid price
+    assert order["price"] == 100.5

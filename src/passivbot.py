@@ -22670,7 +22670,9 @@ class Passivbot:
     # rylos: same venue behaviour for a post-only entry: a long entry priced at
     # or over the ask is cancelled after the send and waits the 15 s recent
     # execution window before the next try (16/10 Bybit 17:05: eight entries
-    # cancelled in a row, each 0.005-0.03 over the ask).
+    # cancelled in a row, each 0.005-0.03 over the ask). HL refuses it at once
+    # but the retry waits a whole cycle on a new strategy price (19/10 16:05:
+    # two Alo refusals in a falling book, no fill while Bybit filled).
     _maker_entry_fresh_book_guard_enabled = False
 
     async def _maker_entry_fresh_book_guard(self, order: dict, params: dict) -> None:
@@ -22698,7 +22700,7 @@ class Passivbot:
         if not ask > 0.0 or order["price"] < ask:
             return
         step = float(self.price_steps[symbol])
-        price = float(pbr.round_(ask - step, step))
+        price = self._maker_exit_retry_price(symbol, ask - step)
         if not 0.0 < price < ask:
             return
         logging.info(

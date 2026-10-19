@@ -1801,6 +1801,9 @@ class HyperliquidBot(CCXTBot):
     # rylos: an Alo refusal ("would have immediately matched") is synchronous,
     # so the exit can be re-placed at once on a fresh l2Book (weight 2).
     _supports_maker_exit_fresh_book_retry = True
+    # rylos: a 4RSI entry over the ask is refused (Alo) and re-placed only a cycle
+    # later: lower it to ask - tick on a fresh l2Book (weight 2) before sending.
+    _maker_entry_fresh_book_guard_enabled = True
     # rylos: fees from the vault fills (maker 0.015%, taker 0.045%)
     _maker_exit_taker_fee_gap = 0.0003
     _taker_ioc_time_in_force = "Ioc"
