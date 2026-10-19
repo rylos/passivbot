@@ -30,6 +30,9 @@ PROFILES = {
 }
 KINDS = {"entry_initial_normal_long": "entrata", "close_panic_long": "uscita 4RSI"}
 POST_RE = re.compile(r"\[order\]\s+post \S+ \| (?:buy|sell) long [\d.]+@([\d.]+) (entry_initial_normal_long|close_panic_long)")
+# Bybit: l'entrata che toccherebbe l'ask viene abbassata ad ask-tick prima
+# dell'invio; il prezzo davvero inviato è quello abbassato
+LOWER_RE = re.compile(r"maker entry lowered on fresh book \S+ \| ([\d.]+) -> ([\d.]+)")
 REJ_RE = re.compile(r"post-only (entry_initial_normal_long|close_panic_long) rejected")
 # HL: l'uscita rifiutata e' ripiazzata subito sul book fresco, senza la riga
 # "rejected": ogni ripiazzamento e' un rifiuto in piu'
@@ -121,12 +124,18 @@ def analyse(ep, lines, maker_fee, venue_cancels=False):
     end = utc(ep[-1]["datetime"])
     first_fill = utc(ep[0]["datetime"])
     posts = []
+    lowered = {}  # istante ordine -> prezzo della strategia prima dell'abbassamento
     for ln in lines:
         m = POST_RE.search(ln)
         if m and m.group(2) == kind:
             t = utc(ln)
             if t <= first_fill + timedelta(seconds=5):
                 posts.append((t, float(m.group(1))))
+        elif (m := LOWER_RE.search(ln)) and kind == "entry_initial_normal_long" and posts:
+            t, p = posts[-1]
+            if p == float(m.group(1)) and utc(ln) - t <= timedelta(seconds=5):
+                posts[-1] = (t, float(m.group(2)))
+                lowered[t] = p
     # risale finché gli ordini sono vicini fra loro: l'inizio dell'episodio
     chain = []
     for t, p in reversed(posts):
@@ -166,7 +175,9 @@ def analyse(ep, lines, maker_fee, venue_cancels=False):
         f"{f' ({n_amend_fail} falliti)' if n_amend_fail else ''}, {n_rej + n_venue} rifiuti post-only"
         f"{f' ({n_venue} annullati dall’exchange)' if n_venue else ''}"
         f"{f', tetto taker ({cap}, {n_ioc} IOC)' if cap else ''}"
-        f" | 1° prezzo {first_p:g} → fill {vwap:.5g} ({slip:+.3f}% a favore)"
+        f" | 1° prezzo {first_p:g}"
+        f"{f' (strategia {lowered[first_t]:g}, abbassato su book)' if first_t in lowered else ''}"
+        f" → fill {vwap:.5g} ({slip:+.3f}% a favore)"
         f" | fee {', '.join(f'{x*100:.3f}%' for x in fees)} {'maker' if maker else 'NON maker'}"
     )
     return key, text

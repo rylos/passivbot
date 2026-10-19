@@ -7,6 +7,10 @@ sopravvivere a una ricostruzione del server e a versionare le modifiche.
 |---|---|---|
 | `watchdog_ry_hl.py` | amazon, `~/watchdog/watchdog.py` | `*/10 * * * *` (ry-hl) e `3-59/10 * * * *` con argomento `bybit` (ry-bybit) |
 | `trade_report.py` | amazon, `~/watchdog/trade_report.py` | `*/2 * * * *` (ry-hl) e `*/2 * * * *` con argomento `bybit` (ry-bybit) |
+| `exec_timing.py` | amazon, `~/watchdog/exec_timing.py` | — (chiamato da `nightwatch.sh`) |
+| `deploy_one.sh` | amazon, `~/watchdog/deploy_one.sh` | — (deploy a mano, solo Python) |
+| `deploy_rust.sh` | amazon, `~/watchdog/deploy_rust.sh` | — (deploy a mano con cambio Rust: prebuild, stop, ricompila con stamp, avvio) |
+| `nightwatch.sh` + `tg.py` | **PC**, servizio utente `passivbot-nightwatch` | sempre attivo, `Restart=always` |
 
 Dopo ogni modifica qui, ricopiare sul server e verificare che l'md5 combaci:
 
@@ -163,3 +167,18 @@ Pagina di 4e066c8d (live su entrambi i bot dal 2026-09-28): https://claude.ai/ar
 Con lo stop sull'equity: backtest con `bot.long.hsl.enabled` nei run `<nome>_*`, più `--hsl-windows FILE` (finestre di partenza a freddo in cui lo stop scatta: serie di equity con e senza stop ed evento di stop, estratte dalle suite `configs/robust/hsl2_*` e `starts_n4e_*` su debian) e `--hsl-summary FILE` (testo e tabella dell'esito su 224 partenze, esempio in `ops/report/data/hsl_summary_4e066c8d.json`). La sezione "Stop sull'equity: dove scatta" mostra per ogni finestra l'equity con e senza stop e una linea al momento dello stop.
 
 Aggiornamento solo dei dati (nuove candele) senza i file delle finestre: `--keep-hsl` lascia com'è la sezione dello stop già presente nel template (le finestre a freddo non dipendono dalla data di fine). Config dei backtest del 07/10/2026 su debian in `~/passivbot-up/configs/art7/` (`bot.long` live + `live.hsl_engine: revised`), risultati in `backtests_art7/`.
+
+## nightwatch.sh (sul PC)
+
+Sorveglianza continua di ry-hl e ry-bybit via ssh, una riga per evento in
+`~/.local/state/passivbot-nightwatch/nightwatch.log`: processo assente, `[health]`
+fermo da >35 min, ERROR/Traceback, ordini e fill di entrata/uscita, righe TEMPI di
+`exec_timing.py`. Gli allarmi vanno anche su Telegram (Claude RyLoS Bot) con `tg.py`,
+che usa le credenziali presenti su amazon: nel repo nessun segreto.
+
+Gira come servizio utente systemd (linger attivo, quindi parte al boot):
+
+```bash
+ln -s ~/dev/passivbot/ops/passivbot-nightwatch.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now passivbot-nightwatch
+```

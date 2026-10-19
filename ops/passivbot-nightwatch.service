@@ -1,0 +1,18 @@
+# Servizio utente sul PC: sorveglianza ry-hl / ry-bybit.
+# Installazione: ln -s ~/dev/passivbot/ops/passivbot-nightwatch.service ~/.config/systemd/user/
+#                systemctl --user daemon-reload && systemctl --user enable --now passivbot-nightwatch
+# Log eventi: ~/.local/state/passivbot-nightwatch/nightwatch.log
+[Unit]
+Description=Sorveglianza passivbot ry-hl / ry-bybit
+After=network-online.target
+
+[Service]
+ExecStartPre=/usr/bin/mkdir -p %h/.local/state/passivbot-nightwatch
+ExecStart=/bin/bash %h/dev/passivbot/ops/nightwatch.sh
+StandardOutput=append:%h/.local/state/passivbot-nightwatch/nightwatch.log
+StandardError=append:%h/.local/state/passivbot-nightwatch/nightwatch.log
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target
