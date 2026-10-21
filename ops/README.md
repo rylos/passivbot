@@ -174,7 +174,9 @@ Sorveglianza continua di ry-hl e ry-bybit via ssh, una riga per evento in
 `~/.local/state/passivbot-nightwatch/nightwatch.log`: processo assente, `[health]`
 fermo da >35 min, ERROR/Traceback, ordini e fill di entrata/uscita, righe TEMPI di
 `exec_timing.py`. Gli allarmi vanno anche su Telegram (Claude RyLoS Bot) con `tg.py`,
-che usa le credenziali presenti su amazon: nel repo nessun segreto.
+che usa le credenziali presenti su amazon: nel repo nessun segreto. Gli avvisi di
+correzioni e deploy si mandano con `tg.py --gruppo "msg"`: stesso testo anche al gruppo
+RyLoS-Trading (`group_chat_id` in `telegram.json`).
 
 Gira come servizio utente systemd (linger attivo, quindi parte al boot):
 

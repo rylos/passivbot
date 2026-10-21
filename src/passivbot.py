@@ -22490,6 +22490,19 @@ class Passivbot:
             # the IOC in one write, no cancel-first wait.
             return await self._maker_exit_taker_ioc(order, params, amend_from=amend_from)
         if amend_from:
+            if amend_from.get("price") is not None and float(amend_from["price"]) == float(
+                order["price"]
+            ):
+                # rylos: the fresh-book guard put the exit back at the price it
+                # already rests at: nothing to amend (19/10 HL 23:45: a modify
+                # 1 tick under the bid, refused, re-placed at the ask, and again
+                # every cycle: three cancel + place in a minute).
+                logging.info(
+                    "[order] maker exit amend skipped %s | already resting at %s",
+                    symbol_to_coin(order["symbol"], verbose=False) or order["symbol"],
+                    order["price"],
+                )
+                return {}
             # rylos: re-price the resting maker exit in one write (HL modify,
             # Bybit amend) instead of cancel + create over two cycles.
             try:
@@ -22628,7 +22641,8 @@ class Passivbot:
     # rylos: the venue refuses a crossing post-only exit only afterwards, by
     # cancelling it (Bybit EC_PostOnlyWillTakeLiquidity, create and amend), so
     # the refusal cannot be retried in the same write: the exit price is
-    # checked against a book read just before sending it instead.
+    # checked against a book read just before sending it instead. HL refuses
+    # at once, but a refused modify has already cancelled the resting exit.
     _maker_exit_fresh_book_guard_enabled = False
 
     async def _maker_exit_fresh_book_guard(self, order: dict, params: dict) -> None:

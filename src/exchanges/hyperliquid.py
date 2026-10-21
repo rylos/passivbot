@@ -1801,6 +1801,10 @@ class HyperliquidBot(CCXTBot):
     # rylos: an Alo refusal ("would have immediately matched") is synchronous,
     # so the exit can be re-placed at once on a fresh l2Book (weight 2).
     _supports_maker_exit_fresh_book_retry = True
+    # rylos: a modify of the exit at or under the bid is refused after the old
+    # exit is cancelled, then re-placed at the ask, every cycle (19/10 23:45):
+    # raise it to bid + tick on a fresh l2Book (weight 2) before the modify.
+    _maker_exit_fresh_book_guard_enabled = True
     # rylos: a 4RSI entry over the ask is refused (Alo) and re-placed only a cycle
     # later: lower it to ask - tick on a fresh l2Book (weight 2) before sending.
     _maker_entry_fresh_book_guard_enabled = True

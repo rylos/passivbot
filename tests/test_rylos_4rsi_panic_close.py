@@ -933,10 +933,45 @@ def test_bybit_maker_exit_above_the_bid_is_left_alone(monkeypatch):
     assert call["price"] == 100.0
 
 
-def test_hl_has_no_fresh_book_guard(monkeypatch):
+def _hl_guard_amend(monkeypatch, *, bid, resting):
     from exchanges.hyperliquid import HyperliquidBot
 
-    assert HyperliquidBot._maker_exit_fresh_book_guard_enabled is False
+    calls = []
+
+    async def edit(self, *args, **kwargs):
+        calls.append(kwargs)
+        return {"id": "new-oid"}
+
+    hl = _amend_connector(HyperliquidBot, monkeypatch, edit)
+    hl._book_bid = bid
+    hl.n_decimal_places = 6
+    hl.n_significant_figures = 5
+    order = dict(
+        _live_order("close_panic_long", "sell", True, 78.707),
+        custom_id="cid-new",
+        _amend_from={"id": "old-1", "custom_id": "cid-old", "price": resting},
+    )
+    return hl, order, calls
+
+
+def test_hl_amend_under_the_bid_is_raised_to_bid_plus_tick(monkeypatch):
+    # 19/10 23:45: modify 78.712 -> 78.707 with bid 78.708, refused
+    import asyncio
+
+    hl, order, calls = _hl_guard_amend(monkeypatch, bid=78.708, resting=78.712)
+    asyncio.run(hl.execute_order(order))
+    (kwargs,) = calls
+    assert kwargs["price"] == 78.709 and order["price"] == 78.709
+
+
+def test_amend_to_the_resting_price_is_skipped(monkeypatch):
+    # 19/10 23:45: the exit re-placed at 78.709, the next cycle amended it to
+    # 78.707 again; raised to 78.709 there is nothing left to modify
+    import asyncio
+
+    hl, order, calls = _hl_guard_amend(monkeypatch, bid=78.708, resting=78.709)
+    assert asyncio.run(hl.execute_order(order)) == {}
+    assert calls == []
 
 
 def _entry_guard_bot(monkeypatch, ask):
