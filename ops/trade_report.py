@@ -177,6 +177,7 @@ def _fill_order(fl: dict) -> tuple:
 # 02/10). Quantita' dell'ordine: Bybit la scrive nel fill (orderQty); per HL
 # si prende dall'ultima riga "[order] post" del log con stesso tipo e prezzo.
 POST_RE = re.compile(r"(buy|sell) (long|short) ([\d.]+)@([\d.]+) (\S+)")
+LOWERED_RE = re.compile(r"maker entry lowered on fresh book \S+ \| ([\d.]+) -> ([\d.]+)")
 
 
 def _order_qty_raw(fl: dict) -> float | None:
@@ -265,17 +266,34 @@ def _order_qty_log(lines: list, pb_type: str, price: float, ts: str, since: str 
     """Quantita' dall'ultima riga "post" con stesso tipo e prezzo fra `since`
     (chiusura precedente: un ordine di ingresso non puo' essere piu' vecchio)
     e il fill."""
-    qty = None
+    def same(a: float, b: float) -> bool:
+        return abs(a - b) <= 1e-9 * max(b, 1.0)
+
+    qty, last = None, {}  # last: prezzo postato -> quantita' (ultimo post del tipo)
     for ln in lines:
+        if not ln[:4].isdigit():
+            continue  # riga senza orario (es. tagliata o traceback): non ferma la ricerca
         if ln[:19] > ts:
             break
-        if ln[:19] < since:
+        if ln[:19] < since or "[order]" not in ln:
             continue
-        if "[order]" not in ln or " post " not in ln or pb_type not in ln:
+        # HL: entrata postata al prezzo della strategia e abbassata ad ask-tick
+        # sul book appena letto ("maker entry lowered on fresh book HYPE |
+        # 86.659 -> 86.644"): il fill arriva al prezzo abbassato.
+        m = LOWERED_RE.search(ln)
+        if m:
+            old, new = float(m.group(1)), float(m.group(2))
+            q = next((v for k, v in last.items() if same(k, old)), None)
+            if q is not None and same(new, price):
+                qty = q
+            continue
+        if " post " not in ln or pb_type not in ln:
             continue
         for m in POST_RE.finditer(ln):
-            if m.group(5) == pb_type and abs(float(m.group(4)) - price) <= 1e-9 * max(price, 1.0):
-                qty = float(m.group(3))
+            if m.group(5) == pb_type:
+                last[float(m.group(4))] = float(m.group(3))
+                if same(float(m.group(4)), price):
+                    qty = float(m.group(3))
     return qty
 
 
@@ -297,8 +315,11 @@ def main() -> None:
     # Bastano gli ultimi MB: il log cresce ~300 KB/giorno e qui interessa
     # solo cosa e' successo dall'ultimo giro.
     with open(path, "rb") as f:
-        f.seek(max(0, os.path.getsize(path) - 2_000_000))
+        start = max(0, os.path.getsize(path) - 2_000_000)
+        f.seek(start)
         lines = f.read().decode(errors="replace").splitlines()
+    if start and lines:
+        lines = lines[1:]  # riga tagliata a meta' dal seek
 
     # Eventi dalla cache dei fill del bot (`caches/fill_events/...`): ogni
     # fill porta la posizione DOPO il fill (psize/pprice), pnl e fee. Fino al
