@@ -11,6 +11,9 @@ sopravvivere a una ricostruzione del server e a versionare le modifiche.
 | `deploy_one.sh` | amazon, `~/watchdog/deploy_one.sh` | — (deploy a mano, solo Python) |
 | `deploy_rust.sh` | amazon, `~/watchdog/deploy_rust.sh` | — (deploy a mano con cambio Rust: prebuild, stop, ricompila con stamp, avvio) |
 | `nightwatch.sh` + `tg.py` | **PC**, servizio utente `passivbot-nightwatch` | sempre attivo, `Restart=always` |
+| `stats/collect_stats.py` | server docker, `/opt/passivbot-stats/` | `7 * * * *` (`collect`), `12 8 * * *` (`summary`) |
+| `stats/setup_metabase.py` | server docker, `/opt/passivbot-stats/` | — (configura a mano dashboard e permessi) |
+| `stats/bybit_ledger.py` | amazon, `~/watchdog/bybit_ledger.py` | — (chiamato da `collect_stats.py`, sola lettura) |
 
 Dopo ogni modifica qui, ricopiare sul server e verificare che l'md5 combaci:
 
