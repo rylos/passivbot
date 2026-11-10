@@ -124,6 +124,16 @@ BALANCE = ("SELECT giorno, bot, saldo FROM ("
            "UNION ALL "
            "SELECT substr(ts_rome, 1, 10), 'ry-bybit', cash_balance, MAX(ts_ms) FROM bybit_ledger WHERE ts_rome >= '2026-08-01' GROUP BY 1"
            ") ORDER BY 1, 2")
+# titolare -> bot interamente suoi da sommare alla sua quota del vault (in config.json, fuori dal repo)
+TOTAL_CAPITAL = CONFIG.get("total_capital", {})
+
+
+def total_capital_sql(name, bots):
+    parts = [f"COALESCE((SELECT valore FROM vault_shares WHERE titolare = '{name}'), 0)"]
+    parts += [f"COALESCE((SELECT equity FROM equity WHERE bot = '{bot}' ORDER BY ts_ms DESC LIMIT 1), 0)" for bot in bots]
+    return "SELECT ROUND(" + " + ".join(parts) + ", 0) AS v"
+
+
 PIE = {"pie.dimension": "titolare", "pie.metric": "valore", "pie.show_legend": True, "pie.percent_visibility": "both", "pie.decimal_places": 2, "pie.slice_threshold": 0, "pie.colors": OWNER_COLORS}
 
 CARDS = [
@@ -134,17 +144,19 @@ CARDS = [
     tile("Mese in corso · ry-hl", MONTH.format("ry-hl"), 0, 4, "%", 2),
     tile("Mese in corso · ry-bybit", MONTH.format("ry-bybit"), 8, 4, "%", 2),
     tile("Capitale · ry-bybit", CAPITAL.format("ry-bybit"), 16, 4, " USDT", 0),
-    heading("Quote del vault e guadagno mensile", TAB_CHARTS, 7),
-    graph("Quote vault ry-hl", "pie", PIE, "SELECT titolare, valore FROM vault_shares ORDER BY valore DESC", 0, 8, 10, 9),
-    graph("Guadagno mensile %", "bar", chart("mese", "pct", "%"), "SELECT mese, bot, pct FROM monthly_return ORDER BY 1, 2", 10, 8, 14, 9),
-    *[{**tile(f"{name} · quota vault", f"SELECT pct AS v FROM vault_shares WHERE titolare = '{name}'", index * 6, 17, "%", 2), "w": 6}
+    *[{**tile(f"Capitale totale · {name}", total_capital_sql(name, bots), index * 24 // len(TOTAL_CAPITAL), 7, " USD", 0),
+       "w": 24 // len(TOTAL_CAPITAL)} for index, (name, bots) in enumerate(TOTAL_CAPITAL.items())],
+    heading("Quote del vault e guadagno mensile", TAB_CHARTS, 10),
+    graph("Quote vault ry-hl", "pie", PIE, "SELECT titolare, valore FROM vault_shares ORDER BY valore DESC", 0, 11, 10, 9),
+    graph("Guadagno mensile %", "bar", chart("mese", "pct", "%"), "SELECT mese, bot, pct FROM monthly_return ORDER BY 1, 2", 10, 11, 14, 9),
+    *[{**tile(f"{name} · quota vault", f"SELECT pct AS v FROM vault_shares WHERE titolare = '{name}'", index * 6, 20, "%", 2), "w": 6}
       for index, name in enumerate(OWNERS)],
-    heading("Andamento", TAB_CHARTS, 20),
-    graph("PnL netto cumulato (fee incluse)", "line", chart("giorno", "cumulato", "USD"), CUMULATED, 0, 21, 24, 8),
-    graph("Drawdown del PnL realizzato", "area", chart("giorno", "drawdown", "USD"), DRAWDOWN, 0, 29, 12, 7),
-    graph("Saldo reale (con depositi e prelievi)", "line", chart("giorno", "saldo", "USD"), BALANCE, 12, 29, 12, 7),
+    heading("Andamento", TAB_CHARTS, 23),
+    graph("PnL netto cumulato (fee incluse)", "line", chart("giorno", "cumulato", "USD"), CUMULATED, 0, 24, 24, 8),
+    graph("Drawdown del PnL realizzato", "area", chart("giorno", "drawdown", "USD"), DRAWDOWN, 0, 32, 12, 7),
+    graph("Saldo reale (con depositi e prelievi)", "line", chart("giorno", "saldo", "USD"), BALANCE, 12, 32, 12, 7),
     graph("PnL netto giornaliero (30 giorni)", "bar", chart("giorno", "pnl_netto", "USD"),
-          "SELECT period AS giorno, bot, pnl_netto FROM daily_stats WHERE period >= date('now','-30 days') ORDER BY 1, 2", 0, 36, 24, 7),
+          "SELECT period AS giorno, bot, pnl_netto FROM daily_stats WHERE period >= date('now','-30 days') ORDER BY 1, 2", 0, 39, 24, 7),
     table("Quote vault: dettaglio", "SELECT titolare, valore, pct, aggiornato FROM vault_shares ORDER BY valore DESC", 0, 5),
     table("Base di calcolo % mensili", "SELECT mese, bot, saldo_base, data_saldo, fonte, pnl_netto, funding, guadagno, pct FROM monthly_return ORDER BY mese DESC, bot", 5, 8),
     table("APR: dettaglio", "SELECT * FROM apr_stats ORDER BY anno DESC, bot", 13, 4),
