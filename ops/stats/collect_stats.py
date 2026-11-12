@@ -363,12 +363,13 @@ def collect():
     os.chmod(DB_PATH, 0o660)
 
 
-def send_telegram(text):
+def send_telegram(text, chat_key="chat_id"):
+    """Invia con Claude RyLoS Bot: chat_key 'chat_id' = privato, 'group_chat_id' = gruppo RyLoS-Trading."""
     b64 = base64.b64encode(text.encode()).decode()
     prog = f"""
 import base64, json, urllib.parse, urllib.request
 c = json.load(open("/home/admin/watchdog/telegram.json"))
-data = urllib.parse.urlencode({{"chat_id": c["chat_id"], "text": base64.b64decode("{b64}").decode()}}).encode()
+data = urllib.parse.urlencode({{"chat_id": c["{chat_key}"], "text": base64.b64decode("{b64}").decode()}}).encode()
 urllib.request.urlopen("https://api.telegram.org/bot%s/sendMessage" % c["token"], data, timeout=20)
 """
     subprocess.run(["ssh", "-o", "BatchMode=yes", AMAZON, "python3", "-"], input=prog, check=True, text=True, timeout=60)
@@ -380,21 +381,24 @@ def summary(dry_run):
     yesterday = now - timedelta(days=1)
     day, month, year = yesterday.strftime("%Y-%m-%d"), yesterday.strftime("%Y-%m"), yesterday.strftime("%Y")
     last_ok = db.execute("SELECT value FROM meta WHERE name = 'last_ok'").fetchone()[0]
-    lines = [f"📊 Statistiche {yesterday.strftime('%d/%m')} · PnL netto fee"]
+    header = f"📊 Statistiche {yesterday.strftime('%d/%m')} · PnL netto fee"
+    bot_lines = {}
     for bot, cfg in BOTS.items():
         sums = {}
         for view, period in (("daily_stats", day), ("monthly_stats", month), ("yearly_stats", year)):
             row = db.execute(f"SELECT pnl_netto, trade_chiusi FROM {view} WHERE bot = ? AND period = ?", (bot, period)).fetchone()
             sums[view] = row or (0.0, 0)
-        lines.append(f"{bot}: giorno {sums['daily_stats'][0]:+.2f} ({sums['daily_stats'][1]} trade) · "
-                     f"mese {sums['monthly_stats'][0]:+.2f} · anno {sums['yearly_stats'][0]:+.2f} {cfg['ccy']}")
+        bot_lines[bot] = (f"{bot}: giorno {sums['daily_stats'][0]:+.2f} ({sums['daily_stats'][1]} trade) · "
+                          f"mese {sums['monthly_stats'][0]:+.2f} · anno {sums['yearly_stats'][0]:+.2f} {cfg['ccy']}")
     age = now - datetime.strptime(last_ok, "%Y-%m-%d %H:%M:%S").replace(tzinfo=ROME)
-    if age > timedelta(hours=3):
-        lines.append(f"⚠️ dati fermi al {last_ok}")
-    text = "\n".join(lines)
-    print(text)
-    if not dry_run:
-        send_telegram(text)
+    footer = [f"⚠️ dati fermi al {last_ok}"] if age > timedelta(hours=3) else []
+    # privato: tutti i bot; gruppo RyLoS-Trading: solo ry-hl
+    messages = [("chat_id", "\n".join([header, *bot_lines.values(), *footer])),
+                ("group_chat_id", "\n".join([header, bot_lines["ry-hl"], *footer]))]
+    for chat_key, text in messages:
+        print(f"[{chat_key}]\n{text}")
+        if not dry_run:
+            send_telegram(text, chat_key)
 
 
 def main():
