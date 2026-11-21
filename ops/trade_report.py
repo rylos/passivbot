@@ -31,19 +31,33 @@ from pathlib import Path
 # Istanza dal primo argomento (`trade_report.py bybit`); default "hl" per non
 # toccare il cron storico. Stato separato per istanza.
 PROFILES = {
-    "hl": dict(name="ry-hl", logdir="/opt/passivbot-hl/logs", config="config_hl_4rsi.json", fills="/opt/passivbot-hl/caches/fill_events/hyperliquid/hyperliquid_vault", monitor="/opt/passivbot-hl/monitor/hyperliquid/hyperliquid_vault", state="trades_state.json", ccy="USDC", extra_creds=["telegram_rylos_group.json"]),
-    "bybit": dict(name="ry-bybit", logdir="/opt/passivbot-bybit/logs", config="config_bybit_4rsi.json", fills="/opt/passivbot-bybit/caches/fill_events/bybit/bybit_02", monitor="/opt/passivbot-bybit/monitor/bybit/bybit_02", state="trades_state_bybit.json", ccy="USDT", extra_creds=[]),
+    "hl": dict(name="ry-hl", logdir="/opt/passivbot-hl/logs", config="config_hl_4rsi.json", fills="/opt/passivbot-hl/caches/fill_events/hyperliquid/hyperliquid_vault", monitor="/opt/passivbot-hl/monitor/hyperliquid/hyperliquid_vault", state="trades_state.json", ccy="USDC", extra_creds=["telegram_rylos_group.json"], maker_fee=0.00015),
+    "bybit": dict(name="ry-bybit", logdir="/opt/passivbot-bybit/logs", config="config_bybit_4rsi.json", fills="/opt/passivbot-bybit/caches/fill_events/bybit/bybit_02", monitor="/opt/passivbot-bybit/monitor/bybit/bybit_02", state="trades_state_bybit.json", ccy="USDT", extra_creds=[], maker_fee=0.0002),
 }
 INSTANCE = sys.argv[1] if len(sys.argv) > 1 else "hl"
 P = PROFILES[INSTANCE]
 NAME = P["name"]
 CCY = P["ccy"]
+MAKER_FEE = P["maker_fee"]
 # Coin letto dalla config live (approved_coins.long[0]): cambiare coin sul bot
 # (es. HYPE -> POPCAT del 25/09) non richiede di toccare questo script.
 try:
     COIN = json.load(open(Path(P["logdir"]).parent / "configs/live" / P["config"]))["live"]["approved_coins"]["long"][0]
 except Exception:
     COIN = "HYPE"
+
+
+def _exec_kind(qty_maker: float, qty_taker: float) -> str:
+    """Come sono state eseguite le vendite della posizione: limit (maker),
+    market (taker) o miste, con la quota per quantita'."""
+    tot = qty_maker + qty_taker
+    if tot <= 0:
+        return ""
+    if qty_taker <= tot * 1e-6:
+        return "limit (maker)"
+    if qty_maker <= tot * 1e-6:
+        return "market (taker)"
+    return f"misto: {qty_maker / tot * 100:.0f}% limit, {qty_taker / tot * 100:.0f}% market"
 
 
 def rome(day: str, hhmm: str) -> str:
@@ -571,6 +585,8 @@ def main() -> None:
             cost = 0.0
             n_fills = 0
             n_manual = 0
+            qty_maker = 0.0
+            qty_taker = 0.0
             for fl in fills:
                 ts = fl["datetime"][:19]
                 if not (start <= ts <= end):
@@ -585,6 +601,12 @@ def main() -> None:
                     n_fills += 1
                     if not str(fl.get("pb_order_type") or "").startswith("close"):
                         n_manual += 1
+                    # maker o taker dalla fee reale del fill, stessa regola di
+                    # exec_timing (Marco, 21/11: dire se e' uscita limit o market)
+                    if abs(float(fl.get("fee_ratio") or 0.0)) <= MAKER_FEE * 1.05:
+                        qty_maker += -float(fl["qty"])
+                    else:
+                        qty_taker += -float(fl["qty"])
             opened_at = None
             now = datetime.now(timezone.utc).replace(tzinfo=None)
             close_at = datetime.strptime(end, "%Y-%m-%dT%H:%M:%S")
@@ -613,6 +635,9 @@ def main() -> None:
             sold = exit_.get("sold", 0.0) + ev["filled"]
             value = exit_.get("value", 0.0) + ev["value"]
             exit_line = f"Uscita {_q(sold)} {COIN} @ {_px(value / sold)} · {_m(value)} {CCY}" if sold > 0 else "Uscita"
+            exec_kind = _exec_kind(qty_maker, qty_taker)
+            if exec_kind:
+                exit_line += f" · {exec_kind}"
             when = rome(ev["day"], ev["time"])
             pct = f" ({_s(pnl / cost * 100)}%)" if cost > 0 else ""
             final = "\n".join([

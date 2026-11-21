@@ -409,6 +409,12 @@ mod core {
         /// `rylos_crash_window_minutes` closed candles (0 = no drop/unknown).
         #[serde(default)]
         pub drop_from_high_1m: f64,
+        /// Live only: the 4RSI exit started at least 60 s ago and the position
+        /// is still open. Close it in full at market, whatever the signal and
+        /// the price (Marco, 21/11: a maker exit that never fills must not keep
+        /// the position open down to the HSL). Always false in backtests.
+        #[serde(default)]
+        pub exit_force_market: bool,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2696,6 +2702,18 @@ mod core {
             && ob.bid < pos.price * (1.0 - bp.rylos_crash_stop_pct)
     }
 
+    /// RyLoS forced exit (long only): the live 4RSI exit did not fill within
+    /// its deadline; full market close regardless of signal and price.
+    fn rylos_forced_exit_triggered(
+        bp: &BotParams,
+        sig: Option<&RylosSignalInput>,
+        pos: &Position,
+    ) -> bool {
+        bp.rylos_4rsi_enabled
+            && pos.size > 0.0
+            && sig.is_some_and(|s| s.exit_force_market)
+    }
+
     fn should_generate_closes(mode: TradingMode, has_pos: bool) -> bool {
         match mode {
             TradingMode::Manual => false,
@@ -3965,11 +3983,15 @@ mod core {
 
                 let rylos_crash_stop = has_pos
                     && mode != TradingMode::Manual
-                    && rylos_crash_stop_triggered(
+                    && (rylos_crash_stop_triggered(
                         &s.long.bot_params,
                         &s.long.position,
                         &s.order_book,
-                    );
+                    ) || rylos_forced_exit_triggered(
+                        &s.long.bot_params,
+                        s.long.rylos_signal.as_ref(),
+                        &s.long.position,
+                    ));
 
                 if mode == TradingMode::Panic || rylos_exit || rylos_crash_stop {
                     if let Some(mut p) = calc_panic_close(
@@ -4751,7 +4773,12 @@ mod core {
                 let mode = side.mode.unwrap_or(TradingMode::Normal);
                 let crash_stop = order.pside == PositionSide::Long
                     && is_panic_close_order_type(order.order_type)
-                    && rylos_crash_stop_triggered(&side.bot_params, &side.position, &symbol.order_book);
+                    && (rylos_crash_stop_triggered(&side.bot_params, &side.position, &symbol.order_book)
+                        || rylos_forced_exit_triggered(
+                            &side.bot_params,
+                            side.rylos_signal.as_ref(),
+                            &side.position,
+                        ));
                 let mut executable = to_executable_order(
                     order,
                     &input.global,
@@ -5722,7 +5749,7 @@ mod core {
         fn rylos_crash_stop_and_entry_wait() {
             let mut bp = BotParams::default();
             bp.rylos_4rsi_enabled = true;
-            let sig = |drop| RylosSignalInput { osc_4rsi: 0.0, stoch_k: 0.0, candle_color: 0.0, drop_from_high_1m: drop };
+            let sig = |drop| RylosSignalInput { osc_4rsi: 0.0, stoch_k: 0.0, candle_color: 0.0, drop_from_high_1m: drop, exit_force_market: false };
             // spento: nessun effetto
             assert!(!rylos_entries_paused(&bp, Some(&sig(0.9))));
             let pos = Position { size: 1.0, price: 100.0 };
@@ -5737,6 +5764,37 @@ mod core {
             bp.rylos_4rsi_enabled = false;
             assert!(!rylos_crash_stop_triggered(&bp, &pos, &OrderBook { bid: 50.0, ask: 50.1 }));
             assert!(!rylos_entries_paused(&bp, Some(&sig(0.9))));
+        }
+
+        #[test]
+        fn rylos_forced_exit_only_with_flag_and_position() {
+            let mut bp = BotParams::default();
+            let forced = RylosSignalInput {
+                osc_4rsi: 0.0,
+                stoch_k: 0.0,
+                candle_color: 0.0,
+                drop_from_high_1m: 0.0,
+                exit_force_market: true,
+            };
+            let normal = RylosSignalInput { exit_force_market: false, ..forced };
+            let pos = Position { size: 1.0, price: 100.0 };
+            // 4RSI disabled: never
+            assert!(!rylos_forced_exit_triggered(&bp, Some(&forced), &pos));
+            bp.rylos_4rsi_enabled = true;
+            assert!(rylos_forced_exit_triggered(&bp, Some(&forced), &pos));
+            assert!(!rylos_forced_exit_triggered(&bp, Some(&normal), &pos));
+            assert!(!rylos_forced_exit_triggered(&bp, None, &pos));
+            assert!(!rylos_forced_exit_triggered(
+                &bp,
+                Some(&forced),
+                &Position { size: 0.0, price: 0.0 }
+            ));
+            // the flag defaults to false when absent from the JSON input
+            let parsed: RylosSignalInput = serde_json::from_str(
+                r#"{"osc_4rsi":1.0,"stoch_k":2.0,"candle_color":1.0}"#,
+            )
+            .unwrap();
+            assert!(!parsed.exit_force_market);
         }
 
         #[test]

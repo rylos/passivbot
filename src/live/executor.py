@@ -241,9 +241,34 @@ def _is_rylos_maker_exit(bot, order: dict) -> bool:
 # exit becomes an IOC sell at the bid, bounded by the 4RSI exit floor.
 MAKER_EXIT_TAKER_CAP_MS = 60_000
 MAKER_EXIT_RECENT_EXECUTION_MS = 5_000
+# rylos: deadline of the 4RSI exit (Marco, 21/11). Once the exit starts, the
+# position must be gone within this time: if it is still open, the next plan
+# closes it in full at market, whatever the signal and the price. The start
+# survives the exit being withdrawn (bid back under the exit floor), which is
+# how ry-hl stayed in on 20/11 06:53 and ran into the HSL.
+RYLOS_EXIT_FORCE_MARKET_MS = 60_000
+
+
+def _record_rylos_exit_start(bot, symbol: str, now: int) -> None:
+    starts = bot.__dict__.setdefault("_rylos_exit_started", {})
+    if symbol not in starts:
+        starts[symbol] = now
+        logging.info(
+            "[order] 4RSI exit started %s | market close in %.0fs if still open",
+            _pb_attr("Passivbot")._log_symbol(symbol),
+            RYLOS_EXIT_FORCE_MARKET_MS / 1000.0,
+        )
 
 
 def _apply_maker_exit_taker_cap(bot, to_cancel: list[dict], to_create: list[dict]) -> list[dict]:
+    started_at = _utc_ms()
+    for order in to_create:
+        if (
+            _is_rylos_maker_exit(bot, order)
+            and order.get("position_side") == "long"
+            and order.get("side") == "sell"
+        ):
+            _record_rylos_exit_start(bot, order["symbol"], started_at)
     gap = float(getattr(bot, "_maker_exit_taker_fee_gap", 0.0) or 0.0)
     if gap <= 0.0:
         return to_cancel

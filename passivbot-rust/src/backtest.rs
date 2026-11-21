@@ -1862,6 +1862,7 @@ impl<'a> Backtest<'a> {
             stoch_k,
             candle_color,
             drop_from_high_1m: self.rylos_drop_from_high_1m(row, coin_idx),
+            exit_force_market: false,
         })
     }
 

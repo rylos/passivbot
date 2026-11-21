@@ -17017,6 +17017,39 @@ class Passivbot:
         )
         return out
 
+    def _apply_rylos_exit_deadline(self, rylos_signals: dict) -> None:
+        """rylos: once the 4RSI exit started (executor records the time), a long
+        still open after RYLOS_EXIT_FORCE_MARKET_MS is closed in full at market
+        whatever the signal and price (Marco, 21/11). The start is forgotten
+        when the long is flat."""
+        from live.executor import RYLOS_EXIT_FORCE_MARKET_MS
+
+        starts = self.__dict__.setdefault("_rylos_exit_started", {})
+        if not starts:
+            return
+        now = int(utc_ms())
+        for symbol in list(starts):
+            size = float(
+                ((self.positions.get(symbol) or {}).get("long") or {}).get("size") or 0.0
+            )
+            if size <= 0.0:
+                del starts[symbol]
+                continue
+            elapsed = now - int(starts[symbol])
+            if elapsed < RYLOS_EXIT_FORCE_MARKET_MS:
+                continue
+            sig = rylos_signals.get(symbol)
+            if sig is None:
+                # no fresh signal: neutral values that open nothing new
+                sig = {"osc_4rsi": 0.0, "stoch_k": 100.0, "candle_color": 0.0}
+            rylos_signals[symbol] = {**sig, "exit_force_market": True}
+            logging.info(
+                "[order] 4RSI exit not filled after %.0fs %s | closing %s at market",
+                elapsed / 1000.0,
+                symbol_to_coin(symbol, verbose=False) or symbol,
+                size,
+            )
+
     async def _compute_rylos_signals(self, symbols: list[str]) -> dict[str, dict]:
         """Compute RyLoS 4RSI signal values (last closed 5m candle) per symbol
         from CandlestickManager 1m candles. Stateless: safe across restarts."""
@@ -20048,6 +20081,7 @@ class Passivbot:
         ]
         if rylos_symbols:
             rylos_signals = await self._compute_rylos_signals(rylos_symbols)
+            self._apply_rylos_exit_deadline(rylos_signals)
 
         for symbol in symbols:
             idx = symbol_to_idx[symbol]
