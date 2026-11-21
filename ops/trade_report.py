@@ -31,8 +31,8 @@ from pathlib import Path
 # Istanza dal primo argomento (`trade_report.py bybit`); default "hl" per non
 # toccare il cron storico. Stato separato per istanza.
 PROFILES = {
-    "hl": dict(name="ry-hl", logdir="/opt/passivbot-hl/logs", config="config_hl_4rsi.json", fills="/opt/passivbot-hl/caches/fill_events/hyperliquid/hyperliquid_vault", monitor="/opt/passivbot-hl/monitor/hyperliquid/hyperliquid_vault", state="trades_state.json", ccy="USDC", extra_creds=["telegram_rylos_group.json"], maker_fee=0.00015),
-    "bybit": dict(name="ry-bybit", logdir="/opt/passivbot-bybit/logs", config="config_bybit_4rsi.json", fills="/opt/passivbot-bybit/caches/fill_events/bybit/bybit_02", monitor="/opt/passivbot-bybit/monitor/bybit/bybit_02", state="trades_state_bybit.json", ccy="USDT", extra_creds=[], maker_fee=0.0002),
+    "hl": dict(name="ry-hl", logdir="/opt/passivbot-hl/logs", config="config_hl_4rsi.json", fills="/opt/passivbot-hl/caches/fill_events/hyperliquid/hyperliquid_vault", monitor="/opt/passivbot-hl/monitor/hyperliquid/hyperliquid_vault", state="trades_state.json", ccy="USDC", group=True, maker_fee=0.00015),
+    "bybit": dict(name="ry-bybit", logdir="/opt/passivbot-bybit/logs", config="config_bybit_4rsi.json", fills="/opt/passivbot-bybit/caches/fill_events/bybit/bybit_02", monitor="/opt/passivbot-bybit/monitor/bybit/bybit_02", state="trades_state_bybit.json", ccy="USDT", group=False, maker_fee=0.0002),
 }
 INSTANCE = sys.argv[1] if len(sys.argv) > 1 else "hl"
 P = PROFILES[INSTANCE]
@@ -91,32 +91,46 @@ def _tg(creds: dict, method: str, params: dict) -> dict:
         return json.loads(r.read() or b"{}")
 
 
+# Destinatari, tutti con Claude RyLoS Bot (telegram.json): "private" = Marco,
+# "group" = gruppo RyLoS-Trading (solo ry-hl, richiesto da Marco il 10/09).
+# Il 21/11 il gruppo passava ancora da @freqtradehl_bot (telegram_rylos_group.json,
+# 401 Unauthorized): mai il bot di freqtrade.
+TARGET_CHAT = {"private": "chat_id", "group": "group_chat_id"}
+# nomi salvati nello stato prima del 21/11 per i messaggi da riscrivere
+LEGACY_TARGET = {"telegram.json": "private"}
+
+
 def _targets() -> list:
-    # Destinatario principale (Claude RyLoS Bot -> Marco) + eventuali extra del
-    # profilo (per hl: @freqtradehl_bot -> gruppo RyLoS-Trading, richiesto da
-    # Marco il 2026-09-10). Un errore su un destinatario non blocca gli altri.
-    return [CREDS] + [BASE / f for f in P.get("extra_creds", [])]
+    return ["private"] + (["group"] if P.get("group") else [])
+
+
+def _creds(target: str) -> dict:
+    c = json.loads(CREDS.read_text())
+    return {"token": c["token"], "chat_id": c[TARGET_CHAT[target]]}
 
 
 def send(text: str) -> list:
     """Manda a tutti i destinatari; ritorna [[file credenziali, message_id]]."""
     sent = []
-    for path in _targets():
+    for target in _targets():
         try:
-            res = _tg(json.loads(path.read_text()), "sendMessage", {"text": text, "parse_mode": "HTML"})
+            res = _tg(_creds(target), "sendMessage", {"text": text, "parse_mode": "HTML"})
             mid = (res.get("result") or {}).get("message_id")
             if mid is not None:
-                sent.append([path.name, mid])
+                sent.append([target, mid])
         except Exception as e:  # noqa: BLE001
-            print(f"send fallito su {path.name}: {e}", file=sys.stderr)
+            print(f"send fallito su {target}: {e}", file=sys.stderr)
     return sent
 
 
 def edit(msgs: list, text: str) -> None:
     """Riscrive i messaggi gia' mandati (avanzamento del fill di un ordine)."""
     for name, mid in msgs or []:
+        target = LEGACY_TARGET.get(name, name)
+        if target not in TARGET_CHAT:
+            continue  # messaggio del vecchio bot del gruppo: non si riscrive
         try:
-            _tg(json.loads((BASE / name).read_text()), "editMessageText",
+            _tg(_creds(target), "editMessageText",
                 {"message_id": mid, "text": text, "parse_mode": "HTML"})
         except Exception as e:  # noqa: BLE001
             if "not modified" not in str(e):
