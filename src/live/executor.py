@@ -103,7 +103,12 @@ def _order_pb_type(order: dict) -> str:
     pb_type = str(order.get("pb_order_type") or "")
     if pb_type:
         return pb_type
-    custom_id = str(order.get("custom_id") or "")
+    # rylos 23/11: also the ccxt top-level clientOrderId and Bybit's raw
+    # orderLinkId / HL's cloid. A Bybit open order carries neither custom_id
+    # nor info.clientOrderId, so the resting 4RSI exit was not recognised in
+    # cycles without a new exit (entry cancels only): the taker-cap episode
+    # restarted from the current price and the cap never fired on Bybit.
+    custom_id = str(order.get("custom_id") or order.get("clientOrderId") or "")
     if not custom_id:
         info = order.get("info")
         if isinstance(info, dict):
@@ -111,6 +116,8 @@ def _order_pb_type(order: dict) -> str:
                 info.get("clientOrderId")
                 or info.get("clientOid")
                 or info.get("clOrdId")
+                or info.get("orderLinkId")
+                or info.get("cloid")
                 or ""
             )
     if not custom_id:

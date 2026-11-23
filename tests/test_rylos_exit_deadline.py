@@ -202,3 +202,62 @@ async def test_forced_market_waits_until_resting_limit_exit_is_cancelled(executi
     await executor.execute_order_plan(bot, [], [forced_market])
     assert bot.cancelled == []
     assert bot.created == [forced_market]
+
+
+# ---------------------------------------------------------------- Bybit resting exit (23/11)
+
+
+def _venue_cid(pb_type: str) -> str:
+    import passivbot_rust as pbr
+
+    return "0x%04x" % int(pbr.order_type_snake_to_id(pb_type)) + "a" * 26
+
+
+def _bybit_raw_open_order(price: float) -> dict:
+    """Shape of a Bybit open order as ccxt returns it: no custom_id, no
+    pb_order_type, the client id only as clientOrderId / info.orderLinkId."""
+    cid = _venue_cid("close_panic_long")
+    return {
+        "id": "bybit-1",
+        "symbol": SYMBOL,
+        "side": "sell",
+        "position_side": "long",
+        "qty": 1.0,
+        "price": price,
+        "reduceOnly": True,
+        "type": "limit",
+        "clientOrderId": cid,
+        "info": {"orderLinkId": cid},
+    }
+
+
+@pytest.mark.parametrize("where", ["top", "info"])
+def test_pb_type_read_from_bybit_client_id(where):
+    order = _bybit_raw_open_order(100.0)
+    if where == "info":
+        del order["clientOrderId"]
+    assert executor._order_pb_type(order) == "close_panic_long"
+
+
+def test_bybit_taker_cap_survives_a_cycle_without_new_exit(monkeypatch):
+    """23/11 04:25 ry-bybit: cycles that only cancel entries alternated with
+    exit amends; the resting exit was not recognised, the episode restarted
+    from the current price each time and the cap never fired."""
+    bot = SimpleNamespace(
+        bp=lambda pside, key, symbol=None: True,
+        open_orders={},
+        _maker_exit_taker_fee_gap=0.00035,
+    )
+    monkeypatch.setattr(executor, "_is_rylos_maker_exit", lambda b, o: o.get("pb_order_type") == "close_panic_long")
+    monkeypatch.setattr(executor, "_utc_ms", lambda: 1_000)
+    executor._apply_maker_exit_taker_cap(bot, [], [_exit_order(price=100.0)])
+    # entry-cancel-only cycle: only the resting (raw Bybit) exit is visible
+    bot.open_orders = {SYMBOL: [_bybit_raw_open_order(100.0)]}
+    monkeypatch.setattr(executor, "_utc_ms", lambda: 5_000)
+    executor._apply_maker_exit_taker_cap(bot, [], [])
+    assert bot._maker_exit_episodes[SYMBOL]["first"] == 100.0
+    # next exit 0.11% lower: the cap fires
+    new = _exit_order(price=99.89)
+    monkeypatch.setattr(executor, "_utc_ms", lambda: 13_000)
+    executor._apply_maker_exit_taker_cap(bot, [], [new])
+    assert new.get("_rylos_taker") is True
