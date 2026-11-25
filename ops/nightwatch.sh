@@ -39,12 +39,17 @@ while true; do
         | grep -v "errors_1h" | grep -vE "T[0-9]{2}:[0-9][05]:[0-9]{2}Z .*entry gate .* closed" | cut -c1-260 | sed "s/^/$d | /" | head -20
     fi
     echo "$f" > $ST/$d.f; echo "$n" > $ST/$d.n
-    t=$($SSH "python3 ~/watchdog/exec_timing.py $d last 1" 2>/dev/null | tail -1)
-    tk=$(echo "$t" | cut -d"|" -f1-2)
-    if [ -n "$t" ] && [ "$tk" != "$(cat $ST/$d.timing 2>/dev/null)" ]; then
-      [ -f $ST/$d.timing ] && echo "TEMPI $d | $(echo "$t" | cut -d"|" -f3-)"
-      echo "$tk" > $ST/$d.timing
-    fi
+    # tutti gli episodi nuovi dall'ultimo visto, non solo l'ultimo: due ordini
+    # della griglia nello stesso minuto davano una riga sola (25/11)
+    last_t=$(cut -d"|" -f2 $ST/$d.timing 2>/dev/null)
+    $SSH "python3 ~/watchdog/exec_timing.py $d recent 1" 2>/dev/null | while IFS= read -r t; do
+      tt=$(echo "$t" | cut -d"|" -f2)
+      [ -n "$tt" ] || continue
+      if [ -z "$last_t" ] || [[ "$tt" > "$last_t" ]]; then
+        [ -n "$last_t" ] && echo "TEMPI $d | $(echo "$t" | cut -d"|" -f3-)"
+        echo "$t" | cut -d"|" -f1-2 > $ST/$d.timing
+      fi
+    done
   done
   rm -f $ST/first
   sleep 60

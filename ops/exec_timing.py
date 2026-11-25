@@ -94,7 +94,18 @@ def episodes(fills):
         t = f.get("pb_order_type")
         if t not in KINDS:
             if t:  # griglia, trailing, unstuck...: solo maker sì/no
-                eps.append([f])
+                # fill parziali dello stesso ordine (stesso tipo, lato e prezzo,
+                # a pochi secondi): un solo episodio con la quantità totale
+                prev = eps[-1] if eps and eps[-1][0].get("pb_order_type") == t else None
+                if (
+                    prev
+                    and prev[-1]["side"] == f["side"]
+                    and abs(float(prev[-1]["price"]) - float(f["price"])) <= 1e-9 * float(f["price"])
+                    and utc(f["datetime"]) - utc(prev[-1]["datetime"]) <= timedelta(seconds=30)
+                ):
+                    prev.append(f)
+                else:
+                    eps.append([f])
             continue
         if cur and (cur[-1]["pb_order_type"] != t or utc(f["datetime"]) - utc(cur[-1]["datetime"]) > timedelta(minutes=10)):
             eps.append(cur)
@@ -113,11 +124,13 @@ def analyse(ep, lines, maker_fee, venue_cancels=False):
     kind = ep[0]["pb_order_type"]
     if kind not in KINDS:
         f = ep[0]
-        fr = round(abs(float(f.get("fee_ratio") or 0)), 6)
+        fr = max(round(abs(float(x.get("fee_ratio") or 0)), 6) for x in ep)
         maker = fr <= maker_fee * 1.05
-        key = f"{kind}|{f['datetime'][:19]}"
+        qty = sum(abs(float(x["qty"])) for x in ep)
+        key = f"{kind}|{ep[-1]['datetime'][:19]}"
         text = (
-            f"{kind} {rome(utc(f['datetime']), '%d/%m %H:%M:%S')} | {f['side']} {abs(float(f['qty'])):g} @ {float(f['price']):g}"
+            f"{kind} {rome(utc(f['datetime']), '%d/%m %H:%M:%S')} | {f['side']} {qty:g} @ {float(f['price']):g}"
+            f"{f' ({len(ep)} fill)' if len(ep) > 1 else ''}"
             f" | fee {fr*100:.3f}% {'maker' if maker else 'NON maker'}"
         )
         return key, text
@@ -153,8 +166,11 @@ def analyse(ep, lines, maker_fee, venue_cancels=False):
     n_rej = sum(1 for ln in win if (m := REJ_RE.search(ln)) and m.group(1) == kind)
     if kind == "close_panic_long":
         n_rej += sum(1 for ln in win if RETRY_RE.search(ln))
-    n_hint = sum(int(m.group(1)) for ln in win if (m := CANCEL_HINT_RE.search(ln)))
-    n_venue = max(0, n_hint - sum(1 for ln in win if BOT_CANCEL_RE.search(ln))) if venue_cancels else 0
+    # annullamenti dell'exchange solo da quando l'ordine esiste: prima del primo
+    # invio ci sono gli annullamenti del bot su altri ordini (25/11 bybit)
+    own = [ln for ln in win if utc(ln) >= first_t]
+    n_hint = sum(int(m.group(1)) for ln in own if (m := CANCEL_HINT_RE.search(ln)))
+    n_venue = max(0, n_hint - sum(1 for ln in own if BOT_CANCEL_RE.search(ln))) if venue_cancels else 0
     n_amend = sum(1 for ln in win if AMEND_RE.search(ln) and not AMEND_FAIL_RE.search(ln))
     n_amend_fail = sum(1 for ln in win if AMEND_FAIL_RE.search(ln))
     cap = next((m.group(1) for ln in win if (m := CAP_RE.search(ln))), None)
@@ -192,6 +208,8 @@ def main():
     eps = sorted(episodes(fills), key=lambda ep: ep[-1]["datetime"])
     if mode == "last":
         eps = eps[-1:]
+    elif mode == "recent":  # tutti gli episodi dei giorni chiesti, con chiave
+        eps = eps[-20:]
     if not eps:
         return
     since = utc(eps[0][0]["datetime"]) - timedelta(hours=1)
@@ -203,7 +221,7 @@ def main():
         if res is None:
             continue
         key, text = res
-        print(f"{key}|{text}" if mode == "last" else text)
+        print(f"{key}|{text}" if mode in ("last", "recent") else text)
 
 
 if __name__ == "__main__":
