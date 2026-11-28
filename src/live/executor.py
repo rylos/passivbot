@@ -201,11 +201,13 @@ def _hold_entry_cancels_behind_maker_exit(
     read, and the cancel-first barrier holds same-scope creates until every
     cancel is confirmed, so N resting grid entries used to delay the exit by N
     cycles. Entry cancels only reduce exposure and follow in later cycles;
-    reduce-only cancels (the previous exit price) still go first."""
+    reduce-only cancels (the previous exit price) still go first.
+    The same holds for the market close of the 60 s exit deadline: on 28/11
+    13:20 it waited 1-2 min behind 3-10 grid cancels sent one per cycle."""
     exit_scopes = {
         _cancel_first_scope(bot, order)
         for order in to_create
-        if is_maker_panic_close(order)
+        if _order_pb_type(order).startswith("close_panic_")
         and _order_is_reduce_only(order)
         and _rylos_4rsi_enabled(bot, order)
     }

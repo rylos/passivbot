@@ -262,13 +262,24 @@ def test_previous_exit_price_is_still_cancelled_first():
     assert kept == [old_exit]
 
 
+def test_forced_market_exit_goes_out_before_entry_cancels():
+    """28/11 13:20: the market close of the 60 s deadline waited behind the
+    grid cancels, sent one per cycle, and went out 1-2 min late."""
+    from live import executor
+
+    entries = [_live_order("entry_grid_normal_long", "buy", False, 90.0 - i) for i in range(10)]
+    market_panic = dict(_live_order("close_panic_long", "sell", True, 101.0), type="market")
+    assert executor._hold_entry_cancels_behind_maker_exit(
+        _HoldBot(), entries, [market_panic], None
+    ) == []
+
+
 def test_entry_cancels_untouched_without_maker_exit():
     from live import executor
 
     entries = [_live_order("entry_grid_normal_long", "buy", False, 90.0)]
-    market_panic = dict(_live_order("close_panic_long", "sell", True, 101.0), type="market")
     grid = _live_order("entry_grid_normal_long", "buy", False, 89.0)
-    for creates in ([], [grid], [market_panic]):
+    for creates in ([], [grid]):
         assert executor._hold_entry_cancels_behind_maker_exit(
             _HoldBot(), entries, creates, None
         ) == entries
